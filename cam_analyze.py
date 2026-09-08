@@ -33,8 +33,8 @@ VISION_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
 # 综合分析：DeepSeek 文本模型（不变）
 DEEPSEEK_CHAT = "deepseek-chat"
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-# AI 分析超时（qwen-vl-plus 处理多帧较久，给足）
-VISION_TIMEOUT = 180
+# AI 分析超时（qwen-vl-plus 处理多帧较久，250 帧给足 500s）
+VISION_TIMEOUT = 500
 CHAT_TIMEOUT = 120
 # 抽帧上限：超过该帧数则等间隔抽帧（qwen-vl-plus base64 硬上限 250 张，设满不抽帧）
 MAX_VISION_FRAMES = 250
@@ -219,7 +219,7 @@ def call_vision(key, image_paths):
     payload = {
         "model": VISION_MODEL,
         "messages": [{"role": "user", "content": content}],
-        "max_tokens": 1500,
+        "max_tokens": 8192,
         "temperature": 0.3,
     }
     log(f"调用 Qwen-VL-Plus 视觉模型，{len(image_paths)} 张图 ...")
