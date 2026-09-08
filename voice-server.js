@@ -513,6 +513,9 @@ const server = http.createServer(async (req, res) => {
         const batch = (device_id ? device_id + '_' : '') + (rawBatch || ('auto-' + Date.now()));
         const sopPart = parts.find(p => p.name === 'sop_id');
         const sop_id = sopPart ? sopPart.data.toString().trim() : '';
+        // 拍照间隔（41号文档，设备端传实际间隔，缺省兜底 5000ms）
+        const intervalPart = parts.find(p => p.name === 'interval_ms');
+        const interval_ms = intervalPart ? intervalPart.data.toString().trim() : '';
 
         // 建目录 CAM_DIR/<batch>/（先清空旧内容，防 batch 复用残留旧帧）
         const batchDir = path.join(CAM_DIR, batch);
@@ -522,7 +525,7 @@ const server = http.createServer(async (req, res) => {
         let fileCount = 0;
         for (const p of parts) {
           // 普通字段（batch/device_id 已处理）跳过；其余按 name 作为文件名保存
-          if (p.name === 'batch' || p.name === 'device_id' || p.name === 'sop_id') continue;
+          if (p.name === 'batch' || p.name === 'device_id' || p.name === 'sop_id' || p.name === 'interval_ms') continue;
           // upload_log 是纯文本元信息（37号文档），写到 _upload_log.txt 供 cam_analyze 解析入库，不计入文件数
           if (p.name === 'upload_log') {
             fs.writeFileSync(path.join(batchDir, '_upload_log.txt'), p.data);
@@ -541,7 +544,7 @@ const server = http.createServer(async (req, res) => {
         // 落盘后异步触发云端分析（图片视觉时序 + 录音 ASR + 综合分析 → 推送 S2 ingest）
         // 把 device_id 传给分析脚本，供它查 S2 current-binding 拿快照 + 推 ingest。
         const analyzer = path.join(__dirname, 'cam_analyze.py');
-        exec(`python3 "${analyzer}" "${batchDir}" "${device_id}" "${sop_id}" >> /tmp/cam-analyze.log 2>&1`, (err, stdout, stderr) => {
+        exec(`python3 "${analyzer}" "${batchDir}" "${device_id}" "${sop_id}" "${interval_ms}" >> /tmp/cam-analyze.log 2>&1`, (err, stdout, stderr) => {
           if (err) log(`cam 分析启动失败: ${err.message}`);
           else log(`cam 分析已启动: batch=${batch}, device_id=${device_id || '(无)'}`);
         });

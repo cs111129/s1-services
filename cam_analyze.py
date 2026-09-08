@@ -193,7 +193,7 @@ def http_json_post(url, key, payload, timeout=180):
     raise last_err
 
 
-def call_vision(key, image_paths):
+def call_vision(key, image_paths, interval_sec=5):
     """图片帧一次性给 Qwen-VL-Plus 做时序分析，返回文字。
 
     - 帧数 > MAX_VISION_FRAMES 时等间隔抽帧，控制 token 成本/耗时。
@@ -209,7 +209,7 @@ def call_vision(key, image_paths):
         log(f"抽帧降本: {len(image_paths)} 帧 → {len(sampled)} 帧（等间隔）")
         image_paths = sampled
 
-    content = [{"type": "text", "text": vision_prompt.format(n=len(image_paths))}]
+    content = [{"type": "text", "text": vision_prompt.format(n=len(image_paths), interval_sec=interval_sec)}]
     for p in image_paths:
         b64 = base64.b64encode(open(p, "rb").read()).decode()
         content.append({
@@ -464,7 +464,12 @@ def main():
     batch = os.path.basename(batch_dir.rstrip("/"))
     device_id = sys.argv[2] if len(sys.argv) > 2 else ""   # 可选：设备码（cam-upload 传入）
     sop_id = sys.argv[3] if len(sys.argv) > 3 else ""      # 可选：SOP 标准 id（33号）
-    log(f"开始分析 batch={batch} 目录 {batch_dir}, device_id={device_id or '(无)'}")
+    interval_ms = sys.argv[4] if len(sys.argv) > 4 else ""  # 可选：拍照间隔（41号文档）
+    interval_sec = 5
+    if interval_ms.isdigit() and int(interval_ms) > 0:
+        v = int(interval_ms) / 1000.0
+        interval_sec = int(v) if v == int(v) else v
+    log(f"开始分析 batch={batch} 目录 {batch_dir}, device_id={device_id or '(无)'}, interval={interval_sec}s")
 
     # 37号文档：上传日志入库（读 _upload_log.txt，无论分析成败都先记录）
     save_upload_log(batch_dir, batch, device_id)
@@ -510,7 +515,7 @@ def main():
         vision_prompt_text = "（本次未采集画面）"      # 综合/SOP prompt 里 {vision} 占位
     else:
         try:
-            vision = call_vision(vision_key, imgs)
+            vision = call_vision(vision_key, imgs, interval_sec)
         except Exception as e:
             log(f"视觉分析失败: {e}")
             vision = f"视觉分析失败: {e}"
