@@ -1,0 +1,7 @@
+cam-analysis.db
+cam-uploads/
+audio-files/
+node_modules/
+__pycache__/
+*.bak*
+*.pyc
