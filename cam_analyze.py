@@ -36,8 +36,8 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 # AI 分析超时（qwen-vl-plus 处理多帧较久，给足）
 VISION_TIMEOUT = 180
 CHAT_TIMEOUT = 120
-# 抽帧上限：超过该帧数则等间隔抽帧，控制 token 成本/耗时（60 帧抽 30 帧）
-MAX_VISION_FRAMES = 30
+# 抽帧上限：超过该帧数则等间隔抽帧（qwen-vl-plus base64 硬上限 250 张，设满不抽帧）
+MAX_VISION_FRAMES = 250
 
 # 本脚本与 voice-server.js / asr_recognition.py 同目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
