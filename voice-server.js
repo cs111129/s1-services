@@ -581,11 +581,11 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: '设备密钥错误' }));
       return;
     }
-    if (!hdrSecret && camSecrets().requireSecretOnUpload) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: '设备密钥错误（未携带凭据）' }));
-      return;
-    }
+    // ⚠️ 这里**不能**因为"没有请求头"就直接拒 —— 凭据还可以放在 multipart 的 secret 字段里
+    //    （docs/45 明确承诺了两种方式都支持）。第一版就是这么写的，结果
+    //    requireSecretOnUpload=true 之后 multipart 方式**必然 401** —— 文档说支持、实际不支持。
+    //    所以这道拦截挪到**解析完 multipart 之后**（见下面 effSecret 那里）。
+    //    代价：没带头的请求会先读进内存再拒 —— 和改造前的行为完全一样，没有变差。
 
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
@@ -604,6 +604,13 @@ const server = http.createServer(async (req, res) => {
         if (effSecret && !checkDeviceSecret(effSecret, effDev)) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: '设备密钥错误' }));
+          return;
+        }
+        // ★ requireSecretOnUpload 的拦截放在这里（解析之后），这样两种凭据方式都能被认到。
+        //   放前面会让 multipart 的 secret 字段永远走过不 —— 那是个假承诺。
+        if (!effSecret && camSecrets().requireSecretOnUpload) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: '设备密钥错误（未携带凭据）' }));
           return;
         }
         if (effSecret) {
