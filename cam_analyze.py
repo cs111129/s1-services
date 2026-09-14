@@ -18,6 +18,7 @@ cam_analyze.py - 视觉采集板云端分析脚本
 """
 import sys
 import os
+import re
 import requests
 import json
 import base64
@@ -39,6 +40,24 @@ CHAT_TIMEOUT = 120
 # 抽帧上限：超过该帧数则等间隔抽帧（qwen-vl-plus base64 硬上限 250 张，设满不抽帧）
 MAX_VISION_FRAMES = 250
 
+# ★★ 合并分析（2026-09-14 大哥定的方案）★★
+# 背景：原来要 3 次调用（qwen 画面分析 → deepseek 综合 → deepseek 做 SOP 比对），
+#      第 2、3 步其实看不到图片，只吃第 1 步输出的文字，等于"隔了一层"。
+# 改法：用 deepseek-flash 一次调用同时完成「画面时序 + 录音转写 + SOP 逐条比对」，全部表格输出。
+# 实测依据（S1 真机 + 真实采集帧）：
+#   - deepseek-flash 就是 deepseek-v4.1-flash，**能看图**
+#   - 图片硬上限 **600 张**（API 报错原文 `Too many images: max 600 images per request`），
+#     600 张 = 117,035 prompt token 能过；瓶颈是上下文窗口而不是张数
+#   - 每张图约 **195 token**（qwen 只要 82，所以换模型后 token 上升，不是"合并"造成的）
+#   - **默认开推理**：max_tokens 给小了 content 会变空串（实测 2000/4000 全被推理吃光）
+#     → 所以 max_tokens 必须给足；大哥定 100000（max_tokens 只是上限，按实际输出计费，不额外花钱）
+#   - 实测一次调用：17 帧 33.5s/11,054 token；80 帧 27.5s/22,054 token，finish=stop 未截断
+# 开关：S2 的 cam-config.json 里 **mergedPrompt 非空 → 走合并**；为空 → 回退原来的 3 步（可随时回滚）
+DEEPSEEK_FLASH = "deepseek-flash"
+MERGED_MAX_TOKENS = 100000   # 兜底值；实际以 cam-config.json 的 maxTokens 为准
+MAX_MERGED_FRAMES = 600      # deepseek-flash 平台硬上限，超过必须抽帧
+MERGED_TIMEOUT = 900         # 合并是一次大调用：实测 17 帧 33s / 80 帧 27s，给足余量
+
 # 本脚本与 voice-server.js / asr_recognition.py 同目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASR_SCRIPT = os.path.join(SCRIPT_DIR, "asr_recognition.py")
@@ -52,6 +71,9 @@ INGEST_PATH = "/api/cam-records/ingest"
 BINDING_PATH = "/api/cam-devices/current-binding"
 # CAM_INGEST_TOKEN：兄弟给的默认值；正式期可用环境变量覆盖。没有则跳过推送（仅本地落库）
 CAM_INGEST_TOKEN = os.environ.get("CAM_INGEST_TOKEN", "cam-ingest-token-2026")
+# CAM_DRYRUN=1：只分析、只写本地库，**不往 S2 推任何数据**。
+# 用途：在生产上安全复跑验证（比如改了提示词想拿真实批次试，又不想往生产库塞记录）。
+DRYRUN = os.environ.get("CAM_DRYRUN") == "1"
 # 参数配置化：cam-config 端点（兄弟 S2 已做，S1 分析前拉取提示词）
 CAM_CONFIG_PATH = "/api/cam-config"
 
@@ -93,13 +115,71 @@ SOP_PATH = "/api/cam-sop"
 # 34号问题4：DeepSeek 文本模型输出上限 + 失败重试次数（S2 cam-config 可配置，默认兜底）
 max_tokens = 2000
 retry_count = 1
+# ★ 合并分析提示词：非空则走「一次调用完成三段分析」；为空则回退原来的 3 步（回滚开关）
+merged_prompt = None
+
+# ============ 合并分析 prompt（默认值，S2 cam-config.json 的 mergedPrompt 可覆盖）============
+# ⚠️ 占位符用 {{key}} 而不是 {key}：prompt 末尾有 JSON 示例，里面就是 { }，
+#    用 str.format 会把这些大括号当成占位符直接抛异常。
+DEFAULT_MERGED_PROMPT = """你是「胤隆会」实操考核的评分分析员。视觉采集设备按时间顺序连续拍摄了 {{n}} 张画面（相邻约 {{interval_sec}} 秒），并有现场录音转写。请严格按顺序分三步完成分析。
+
+━━━ 第一步：画面时序分析 ━━━
+按时间顺序还原画面里**真实发生**了什么，输出表格：
+| 时间段 / 帧 | 画面里发生了什么 | 关键动作 / 变化 |
+|---|---|---|
+⚠️ 硬规则：只写你在这组图里**真实看到**的内容。不要因为第三步的 SOP 里出现了某个场景（前台 / 接待 / 客人 / 房卡等），就假设画面里发生了那个场景。若画面内容与 SOP 场景无关，必须在表格里如实写明「画面内容与 SOP 场景无关」。**编造画面里没有的内容属于严重错误。**
+
+━━━ 第二步：录音转写分析 ━━━
+【现场录音转写】
+{{audio}}
+
+对上面的录音转写做分析，输出表格：
+| 时间点 / 段落 | 录音内容要点 | 说明（是否含话术要求、语气、与画面是否对应） |
+|---|---|---|
+若录音为空或无有效内容，表格里如实写「本次无有效录音」，**不要编造对话**。
+
+━━━ 第三步：SOP 标准比对 ━━━
+{{sop_block}}
+
+━━━ 输出要求 ━━━
+只输出一个 JSON 对象（不要 markdown 代码围栏、不要任何额外解释），三个字段都是 Markdown 表格：
+{
+  "image_analysis": "第一步的表格（含表头行）",
+  "summary": "第二步的表格（含表头行）",
+  "sop_compare": "第三步的表格（含表头行），SOP 含话术要求时在后面接一段「话术评估」"
+}"""
+
+# 第三步的两种写法（有 SOP / 设备端没选 SOP）
+SOP_BLOCK_WITH = """流程名：{{sop_name}}
+SOP 标准：
+{{sop_content}}
+
+对 SOP 里**每一条**标准逐条判断，输出表格（表头固定，不要改）：
+| 序号 | 标准项 | 是否做到 | 说明 |
+|---|---|---|---|
+| 1 | （SOP 第 1 条标准原样照抄） | 做到 / 未做到 | （判断依据：要具体到画面或录音里的什么） |
+
+判断值只用「做到」或「未做到」两个。若 SOP 标准里包含话术要求，在表格后补一段「话术评估」；若 SOP 没有话术要求，则不写话术评估。不要打分、不要评分。"""
+
+SOP_BLOCK_NONE = """本次未指定 SOP 标准（设备端没选流程）。
+请在 sop_compare 字段里只写一句：「本次未选择 SOP 流程，未做标准比对。」不要编造标准。"""
+
+
+def fill_prompt(tpl, **kw):
+    """把 {{key}} 替换成实际值。
+    刻意不用 str.format：prompt 末尾的 JSON 示例含 { }，format 会把它们当占位符抛异常。"""
+    out = tpl
+    for k, v in kw.items():
+        out = out.replace('{{' + k + '}}', str(v))
+    return out
 
 
 def fetch_cam_config():
     """从 S2 拉取实操考核配置（提示词/参数）。失败用默认值，不阻塞分析。
     参数配置化（30/31 号）：后台配置提示词 + interval_ms/max_seconds，分析前拉取提示词。
-    34号问题4：新增 maxTokens（DeepSeek 输出上限）+ retryCount（失败重试次数）。"""
-    global vision_prompt, summary_prompt, sop_compare_prompt, max_tokens, retry_count
+    34号问题4：新增 maxTokens（DeepSeek 输出上限）+ retryCount（失败重试次数）。
+    2026-09-14：新增 mergedPrompt —— 非空则走「一次调用完成三段分析」的合并模式。"""
+    global vision_prompt, summary_prompt, sop_compare_prompt, max_tokens, retry_count, merged_prompt
     try:
         if not CAM_INGEST_TOKEN or not S2_DBAPI:
             return
@@ -108,6 +188,10 @@ def fetch_cam_config():
                          timeout=10)
         if r.status_code == 200:
             c = r.json()
+            if c.get("mergedPrompt"):
+                merged_prompt = c["mergedPrompt"]
+            else:
+                merged_prompt = None      # 显式置空 → 回退 3 步老流程（回滚开关）
             if c.get("visionPrompt"):
                 vision_prompt = c["visionPrompt"]
             if c.get("summaryPrompt"):
@@ -119,7 +203,9 @@ def fetch_cam_config():
                 max_tokens = int(c["maxTokens"])
             if c.get("retryCount") is not None:
                 retry_count = int(c["retryCount"])
-            log(f"已拉取 cam-config：visionPrompt={len(vision_prompt)}字, summaryPrompt={len(summary_prompt)}字, "
+            log(f"已拉取 cam-config：模式={'合并(1次调用)' if merged_prompt else '老流程(3次调用)'}, "
+                f"mergedPrompt={len(merged_prompt) if merged_prompt else 0}字, "
+                f"visionPrompt={len(vision_prompt)}字, summaryPrompt={len(summary_prompt)}字, "
                 f"sopComparePrompt={len(sop_compare_prompt)}字, maxTokens={max_tokens}, retryCount={retry_count}, "
                 f"intervalMs={c.get('intervalMs')}, maxSeconds={c.get('maxSeconds')}")
         else:
@@ -167,6 +253,34 @@ def load_key(env_name):
     except OSError:
         pass
     return ""
+
+
+# cam 分析专用的 DeepSeek key 文件（2026-09-14）。
+# 为什么需要它：这台机器上 DEEPSEEK_API_KEY 有多个来源且互相打架 ——
+#   ① voice-server 进程环境里是 sk-d05… ② /root/.bashrc 里是 sk-2d0… ③ 大哥另给了一把新 key
+# 而 load_key() 是「环境变量优先」，cam_analyze.py 又是 voice-server spawn 出来的、继承它的环境，
+# 所以光改 .bashrc 对这脚本**不生效**。为了不重启 voice-server（不影响语音服务）就能换 key，
+# 这里给 cam 分析留一个优先级最高的专用文件。
+CAM_DEEPSEEK_KEYFILE = os.environ.get("CAM_DEEPSEEK_KEYFILE", "/root/.deepseek-key")
+
+
+def load_deepseek_key():
+    """取 cam 分析用的 DeepSeek key。
+    顺序：① 专用文件（优先，改它即可换 key，无需重启任何服务）→ ② 环境变量 → ③ .bashrc。
+    只记录"来源"，不打印 key 明文。"""
+    p = CAM_DEEPSEEK_KEYFILE
+    try:
+        if os.path.exists(p):
+            v = open(p, encoding="utf-8").read().strip()
+            if v:
+                log(f"DeepSeek key 来源: 专用文件 {p}")
+                return v
+            log(f"专用文件 {p} 是空的，回退环境变量")
+    except OSError as e:
+        log(f"读专用文件 {p} 失败({e})，回退环境变量")
+    v = load_key("DEEPSEEK_API_KEY")
+    log("DeepSeek key 来源: " + ("环境变量 / .bashrc" if v else "未找到"))
+    return v
 
 
 def http_json_post(url, key, payload, timeout=180):
@@ -248,6 +362,91 @@ def call_chat(key, prompt, max_tokens=500):
     return j["choices"][0]["message"]["content"].strip()
 
 
+def call_merged(key, image_paths, audio_text, sop_doc, interval_sec=5):
+    """★ 合并分析：一次调用完成「画面时序 + 录音转写 + SOP 逐条比对」，三段都是 Markdown 表格。
+
+    返回 dict(image_analysis, summary, sop_compare)。
+    解析失败时**不丢内容**：原文塞进 image_analysis，另两个字段标注原因。
+
+    为什么用 deepseek-flash（= deepseek-v4.1-flash）：
+      - 能看图；图片硬上限 **600 张**（API 报错原文 `Too many images: max 600 images per request`）
+      - 每张图约 195 token（qwen 只要 82，所以换模型后 token 会涨，这不是"合并"造成的）
+      - **默认开推理**，max_tokens 给小了 content 会变空串（实测 2000/4000 全被推理吃光）
+        → max_tokens 取 cam-config 的 maxTokens（大哥定 100000；它只是上限，按实际输出计费）
+    """
+    # 抽帧到平台硬上限（600）
+    if len(image_paths) > MAX_MERGED_FRAMES:
+        step = (len(image_paths) + MAX_MERGED_FRAMES - 1) // MAX_MERGED_FRAMES
+        sampled = image_paths[::step]
+        if sampled[-1] != image_paths[-1]:
+            sampled.append(image_paths[-1])
+        log(f"抽帧降本: {len(image_paths)} 帧 → {len(sampled)} 帧（等间隔，上限 {MAX_MERGED_FRAMES}）")
+        image_paths = sampled
+
+    # 第三步：有 SOP 就逐条比对，没选就如实说明（不编造标准）
+    if sop_doc:
+        sop_block = fill_prompt(SOP_BLOCK_WITH,
+                                sop_name=sop_doc.get("name") or sop_doc.get("id") or "",
+                                sop_content=sop_doc.get("content") or "")
+    else:
+        sop_block = SOP_BLOCK_NONE
+
+    prompt = fill_prompt(
+        merged_prompt or DEFAULT_MERGED_PROMPT,
+        n=len(image_paths),
+        interval_sec=interval_sec,
+        audio=audio_text or "(无有效录音内容)",
+        sop_block=sop_block,
+    )
+    if not image_paths:
+        # audio 模式（只有录音没有图）：明确告诉模型别去"想象"画面
+        prompt = ("【注意】本次未采集到任何画面（audio 模式），第一步「画面时序分析」请如实写"
+                  "「本次未采集画面」，不要编造画面内容。\n\n" + prompt)
+
+    content = [{"type": "text", "text": prompt}]
+    for p in image_paths:
+        b64 = base64.b64encode(open(p, "rb").read()).decode()
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+
+    payload = {
+        "model": DEEPSEEK_FLASH,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": max_tokens or MERGED_MAX_TOKENS,
+        "temperature": 0.3,
+    }
+    log(f"调用 {DEEPSEEK_FLASH} 合并分析：{len(image_paths)} 张图，max_tokens={payload['max_tokens']} ...")
+    j = http_json_post(DEEPSEEK_URL, key, payload, timeout=MERGED_TIMEOUT)
+    choice = j["choices"][0]
+    msg = choice.get("message") or {}
+    text = (msg.get("content") or "").strip()
+    if not text:
+        # 推理型兜底：极少数情况下正文落在 reasoning_content
+        text = (msg.get("reasoning_content") or "").strip()
+    usage = j.get("usage") or {}
+    rt = ((usage.get("completion_tokens_details") or {}).get("reasoning_tokens")) or 0
+    log(f"合并分析 token: prompt={usage.get('prompt_tokens')}, completion={usage.get('completion_tokens')}"
+        f"(推理{rt}), total={usage.get('total_tokens')}, finish={choice.get('finish_reason')}")
+
+    # 解析 JSON（容错去掉 ```json 围栏）
+    body = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
+    try:
+        d = json.loads(body)
+        if not isinstance(d, dict):
+            raise ValueError("返回的不是 JSON 对象")
+    except Exception as e:
+        log(f"合并分析 JSON 解析失败({e})，原文存进 image_analysis 以免丢内容")
+        return {
+            "image_analysis": text or "(合并分析返回空)",
+            "summary": f"（合并分析未返回合法 JSON，无法拆分字段：{e}）",
+            "sop_compare": "",
+        }
+    return {
+        "image_analysis": (d.get("image_analysis") or "").strip(),
+        "summary": (d.get("summary") or "").strip(),
+        "sop_compare": (d.get("sop_compare") or "").strip(),
+    }
+
+
 def call_asr(wav_path):
     """复用 asr_recognition.py 转文字；失败/无内容返回空串。
     ASR 前先 ffmpeg 预处理：高通(去80Hz低频噪声) + afftdn降噪 + dynaudnorm动态归一化增益，
@@ -319,6 +518,9 @@ def push_ingest(record):
     """把分析结果推送到 S2 的 ingest 端点（UPSERT 幂等）。
     成功返回 True；无 token / 失败（含重试一次）返回 False。
     """
+    if DRYRUN:
+        log("CAM_DRYRUN=1，跳过推 S2（本地库已写）")
+        return False
     if not CAM_INGEST_TOKEN:
         log("无 CAM_INGEST_TOKEN，跳过推 S2（仅本地落库）")
         return False
@@ -441,6 +643,9 @@ def save_upload_log(batch_dir, batch, device_id):
 
 def push_upload_log(rec):
     """把上传日志推到 S2 的 cam-upload-log ingest 端点（追加，管理后台查 S2）。"""
+    if DRYRUN:
+        log("CAM_DRYRUN=1，跳过推 S2 上传日志")
+        return
     if not CAM_INGEST_TOKEN:
         log("无 CAM_INGEST_TOKEN，跳过推 S2 上传日志")
         return
@@ -496,68 +701,88 @@ def main():
             sys.exit(1)
         log("本次无图片（audio 模式），跳过视觉分析，仅基于录音分析")
 
-    # 图片视觉分析用 DashScope key（qwen-vl-plus / 与 ASR 同平台）；无图片时不要求该 key
-    vision_key = ""
-    if not no_image:
-        vision_key = load_key("DASHSCOPE_API_KEY")
-        if not vision_key:
-            log("缺少 DASHSCOPE_API_KEY")
-            sys.exit(1)
-    # 综合分析用 DeepSeek key（无论有无图片都需要，用于综合/SOP 比对）
-    chat_key = load_key("DEEPSEEK_API_KEY")
+    # 录音 ASR —— ★ 提前到分析之前：合并模式需要"录音转写"作为同一次调用的输入
+    audio_text = call_asr(wav) if os.path.exists(wav) else ""
+    log(f"录音转写: {audio_text or '(空)'}")
+
+    # SOP 标准内容（合并模式 / 老流程都要用，提前拉）
+    sop_doc = fetch_sop(sop_id) if sop_id else None
+    if sop_id and not sop_doc:
+        log(f"未找到 SOP（sop_id={sop_id}）")
+
+    # DeepSeek key：两种模式都要用（优先用 /root/.deepseek-key 专用文件）
+    chat_key = load_deepseek_key()
     if not chat_key:
         log("缺少 DEEPSEEK_API_KEY")
         sys.exit(1)
 
-    # 2. 图片视觉时序分析（Qwen-VL-Plus）；audio 模式无图跳过
-    if no_image:
-        vision = ""                                  # image_analysis 字段置空（无图片）
-        vision_prompt_text = "（本次未采集画面）"      # 综合/SOP prompt 里 {vision} 占位
-    else:
+    if merged_prompt:
+        # ★★ 合并模式（2026-09-14 起）：deepseek-flash 一次调用出「画面时序 + 录音转写 + SOP 比对」
         try:
-            vision = call_vision(vision_key, imgs, interval_sec)
+            r = call_merged(chat_key, imgs, audio_text, sop_doc, interval_sec)
+            vision = r["image_analysis"]
+            summary = r["summary"]
+            sop_compare = r["sop_compare"]
+            log(f"合并分析完成：画面 {len(vision)} 字 / 录音分析 {len(summary)} 字 / SOP 比对 {len(sop_compare)} 字")
         except Exception as e:
-            log(f"视觉分析失败: {e}")
-            vision = f"视觉分析失败: {e}"
-        vision_prompt_text = vision
-        log(f"视觉分析结果:\n{vision}")
-
-    # 3. 录音 ASR
-    audio_text = call_asr(wav) if os.path.exists(wav) else ""
-    log(f"录音转写: {audio_text or '(空)'}")
-
-    # 4. 综合分析（DeepSeek）
-    try:
-        summary = call_chat(chat_key, summary_prompt.format(
-            vision=vision_prompt_text,
-            audio=audio_text or "(无有效录音内容)",
-        ), max_tokens=max_tokens)
-    except Exception as e:
-        log(f"综合分析失败: {e}")
-        # 降级：有视觉结论用视觉，无视觉（audio 模式）用录音文字兜底
-        summary = vision if vision else (audio_text or "（无有效内容）")
-    log(f"综合分析:\n{summary}")
-
-    # 4b. SOP 标准比对（33号：选了 SOP 后，用 deepseek 比对画面+话术是否符合 SOP 标准）
-    sop_compare = ""
-    if sop_id:
-        sop_doc = fetch_sop(sop_id)
-        if sop_doc:
-            try:
-                sop_compare = call_chat(chat_key, sop_compare_prompt.format(
-                    sop_name=sop_doc.get("name") or sop_id,
-                    sop_content=sop_doc.get("content") or "",
-                    vision=vision_prompt_text,
-                    audio=audio_text or "(无有效录音内容)",
-                ), max_tokens=max_tokens)
-                log(f"SOP 比对:\n{sop_compare}")
-            except Exception as e:
-                log(f"SOP 比对失败: {e}")
-                sop_compare = f"SOP 比对失败: {e}"
-        else:
-            sop_compare = f"(未找到 SOP，sop_id={sop_id})"
+            log(f"合并分析失败: {e}")
+            vision = f"合并分析失败: {e}"
+            summary = ""
+            sop_compare = ""
     else:
-        log("本次无 SOP（未选流程标准），不做比对")
+        # ===== 老流程（3 次调用：qwen 画面 + deepseek 综合 + deepseek SOP）=====
+        # 保留此路径作为回滚：把 S2 cam-config.json 的 mergedPrompt 清空即回到这里
+        vision_key = ""
+        if not no_image:
+            vision_key = load_key("DASHSCOPE_API_KEY")
+            if not vision_key:
+                log("缺少 DASHSCOPE_API_KEY")
+                sys.exit(1)
+
+        # 2. 图片视觉时序分析（Qwen-VL-Plus）；audio 模式无图跳过
+        if no_image:
+            vision = ""                                  # image_analysis 字段置空（无图片）
+            vision_prompt_text = "（本次未采集画面）"      # 综合/SOP prompt 里 {vision} 占位
+        else:
+            try:
+                vision = call_vision(vision_key, imgs, interval_sec)
+            except Exception as e:
+                log(f"视觉分析失败: {e}")
+                vision = f"视觉分析失败: {e}"
+            vision_prompt_text = vision
+            log(f"视觉分析结果:\n{vision}")
+
+        # 4. 综合分析（DeepSeek）
+        try:
+            summary = call_chat(chat_key, summary_prompt.format(
+                vision=vision_prompt_text,
+                audio=audio_text or "(无有效录音内容)",
+            ), max_tokens=max_tokens)
+        except Exception as e:
+            log(f"综合分析失败: {e}")
+            # 降级：有视觉结论用视觉，无视觉（audio 模式）用录音文字兜底
+            summary = vision if vision else (audio_text or "（无有效内容）")
+        log(f"综合分析:\n{summary}")
+
+        # 4b. SOP 标准比对（33号：选了 SOP 后，用 deepseek 比对画面+话术是否符合 SOP 标准）
+        sop_compare = ""
+        if sop_id:
+            if sop_doc:
+                try:
+                    sop_compare = call_chat(chat_key, sop_compare_prompt.format(
+                        sop_name=sop_doc.get("name") or sop_id,
+                        sop_content=sop_doc.get("content") or "",
+                        vision=vision_prompt_text,
+                        audio=audio_text or "(无有效录音内容)",
+                    ), max_tokens=max_tokens)
+                    log(f"SOP 比对:\n{sop_compare}")
+                except Exception as e:
+                    log(f"SOP 比对失败: {e}")
+                    sop_compare = f"SOP 比对失败: {e}"
+            else:
+                sop_compare = f"(未找到 SOP，sop_id={sop_id})"
+        else:
+            log("本次无 SOP（未选流程标准），不做比对")
 
     # 5. 组装完整 record（含设备码、帧数、状态、绑定快照）
     binding = get_binding(device_id)   # 查 S2 当前绑定快照
