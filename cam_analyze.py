@@ -493,12 +493,6 @@ def call_asr(wav_path):
     except Exception as e:
         log(f"ASR 失败: {e}")
         return ""
-    finally:
-        if os.path.exists(proc_path):
-            try:
-                os.remove(proc_path)
-            except OSError:
-                pass
 
 
 def get_binding(device_id):
