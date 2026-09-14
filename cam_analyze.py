@@ -449,8 +449,20 @@ def call_merged(key, image_paths, audio_text, sop_doc, interval_sec=5):
 
 def call_asr(wav_path):
     """复用 asr_recognition.py 转文字；失败/无内容返回空串。
-    ASR 前先 ffmpeg 预处理：高通(去80Hz低频噪声) + afftdn降噪 + dynaudnorm动态归一化增益，
-    缓解「轻声/远距离录音信号弱」导致的识别不准。"""
+
+    ASR 前先 ffmpeg 预处理：高通(去80Hz低频噪声) + dynaudnorm 动态归一化增益，
+    缓解「轻声/远距离录音信号弱」导致的识别不准。
+
+    ⚠️ 2026-09-14 去掉了原链里的 `afftdn=nf=-25`（AI 降噪）。
+    实测（8 段真实录音，见 scripts/test-asr-2fixes.py）：去掉后总字数 1439 → 1534（+7%），
+    5/8 段更长，正常说话的录音 +2~3% 且幻觉词不变；提升集中在「几乎全是静音」的录音上。
+    原因：afftdn 是频谱降噪，而采集录音原始音压极低（mean -39~-45dB），
+    降噪会把本来就弱的语音连同噪声一起削掉。
+    ⚠️ 但要说清楚：这**不是**一个大幅改善（早期测到的 +20% 出现在语音只占 8% 的录音上，
+    那部分增量有多少是噪声被"听成"话并不确定 —— 同一批去掉降噪后幻觉词 4→6）。
+    真正的结论是：按「字/有效语音秒」算，现有录音的转写密度都在 2.9~7.1 字/秒（正常 3~5），
+    **转写本身没有质量问题**，之前看"字/秒 0.4"是被总时长里 91% 的静音带偏了。
+    """
     if not os.path.exists(wav_path):
         return ""
     # 预处理：降噪 + 动态增益（失败则回退用原音频，不阻塞 ASR）
@@ -458,7 +470,7 @@ def call_asr(wav_path):
     try:
         p = subprocess.run(
             ["ffmpeg", "-y", "-i", wav_path,
-             "-af", "highpass=f=80,afftdn=nf=-25,dynaudnorm=f=150:g=15",
+             "-af", "highpass=f=80,dynaudnorm=f=150:g=15",
              "-ac", "1", proc_path],
             capture_output=True, timeout=60,
         )
@@ -473,8 +485,23 @@ def call_asr(wav_path):
         )
         out = r.stdout.strip()
         if not out:
+            # 别再静默返回空：把 rc 和 stderr 打出来，否则"转写为空"和"脚本报错"长得一模一样
+            log(f"ASR 无输出: rc={r.returncode}, stderr={(r.stderr or '').strip()[:300]}")
             return ""
-        return json.loads(out).get("text", "")
+        text = json.loads(out).get("text", "") or ""
+        # 记一条可判断的日志：字数和音频时长。
+        # ⚠️ 别只看"字/总时长"就断定转写差 —— 采集录音常常 80~90% 是静音，
+        #    按总时长算会得出 0.4 字/秒的假象；按「字/有效语音秒」算才准（正常 3~5）。
+        dur = 0.0
+        try:
+            import wave as _w
+            with _w.open(asr_input, "rb") as _f:
+                dur = _f.getnframes() / float(_f.getframerate() or 1)
+        except Exception:
+            pass
+        log(f"ASR 结果 {len(text)} 字 / 音频 {dur:.0f}s"
+            + (f"（按总时长 {len(text)/dur:.2f} 字/秒；若偏低请先确认是不是大部分为静音）" if dur else ""))
+        return text
     except Exception as e:
         log(f"ASR 失败: {e}")
         return ""
