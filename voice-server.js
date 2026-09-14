@@ -241,9 +241,10 @@ function handleVoiceWS(ws) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // CORS（docs/44 阶段2：允许设备用 X-Device-Secret / X-Device-Id 请求头）
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Device-Secret, X-Device-Id');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
@@ -265,10 +266,59 @@ const server = http.createServer(async (req, res) => {
     return q;
   }
 
-  // 校验设备密钥
-  function checkDeviceSecret(secret) {
-    return secret === CAM_DEVICE_SECRET;
+  // ===== 设备鉴权（docs/44 通信安全升级）=====
+  // 阶段2：**优先读请求头 X-Device-Secret / X-Device-Id**，回退读 URL query 或 JSON body。
+  //        过渡期三处都认，老固件行为完全不变；观察一周后再删 URL 参数。
+  // 阶段3：一机一密 —— 密钥表在 /root/cam-device-secrets.json，
+  //        表里没有的 device_id 用公共兜底密钥（兼容未出厂烧写的设备）。
+  // 为什么密钥不能留在 URL：URL 会被 nginx/反代/主机商 access log 原样记录，
+  //        上了 HTTPS 也照样泄漏（TLS 在反代处就终结了）。
+  const CAM_SECRET_FILE = process.env.CAM_SECRET_FILE || '/root/cam-device-secrets.json';
+  let _secCache = null, _secMtime = -1;
+  function camSecrets() {
+    try {
+      const st = fs.statSync(CAM_SECRET_FILE);
+      if (_secCache && st.mtimeMs === _secMtime) return _secCache;   // 热加载：文件没变就用缓存
+      _secCache = JSON.parse(fs.readFileSync(CAM_SECRET_FILE, 'utf8'));
+      _secMtime = st.mtimeMs;
+      log(`cam 密钥表已加载: ${Object.keys(_secCache.devices || {}).length} 台设备, `
+        + `requireSecretOnUpload=${!!_secCache.requireSecretOnUpload}`);
+    } catch (e) {
+      if (!_secCache) {
+        // 文件不存在/坏了 → 退回旧行为（公共密钥、上传不强制），不能因此让设备全断
+        _secCache = { devices: {}, fallbackSecret: CAM_DEVICE_SECRET, requireSecretOnUpload: false };
+        log(`cam 密钥表读取失败(${e.message})，用公共密钥兜底`);
+      }
+    }
+    return _secCache;
   }
+  // 某台设备应该用的密钥：表里有就用表里的，没有就用公共兜底
+  function deviceSecretOf(deviceId) {
+    const c = camSecrets();
+    return ((c.devices || {})[deviceId]) || c.fallbackSecret || CAM_DEVICE_SECRET;
+  }
+  function checkDeviceSecret(secret, deviceId) {
+    if (!secret) return false;
+    return secret === deviceSecretOf(deviceId);
+  }
+  // 从 请求头 / query / body 三处取凭据（阶段2 过渡期三处都认）
+  function pickSecret(req, q, o) {
+    return String(req.headers['x-device-secret'] || (q && q.secret) || (o && o.secret) || '').trim();
+  }
+  function pickDeviceId(req, q, o) {
+    return String(req.headers['x-device-id'] || (q && q.device_id) || (o && o.device_id) || '').trim();
+  }
+  // 鉴权来源只记一次，便于观察设备侧有没有切到请求头
+  const _authSrcSeen = {};
+  function logAuthSource(req, deviceId) {
+    const src = req.headers['x-device-secret'] ? 'header' : 'url/body';
+    if (!_authSrcSeen[src]) {
+      _authSrcSeen[src] = 1;
+      log(`cam 鉴权来源首次出现: ${src}（设备 ${deviceId || '?'}）`);
+    }
+  }
+  // cam-upload 缺凭据的告警只打一次，别刷屏
+  let _uploadNoSecretWarned = false;
 
   // POST /api/cam/register - 设备联网注册（A 验证期：登记状态，不强制持久化）
   if (req.method === 'POST' && req.url === '/api/cam/register') {
@@ -277,18 +327,20 @@ const server = http.createServer(async (req, res) => {
     req.on('end', () => {
       try {
         const o = JSON.parse(body || '{}');
-        if (!checkDeviceSecret(o.secret)) {
+        const dev = pickDeviceId(req, null, o);
+        if (!checkDeviceSecret(pickSecret(req, null, o), dev)) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: '设备密钥错误' }));
           return;
         }
-        if (!o.device_id) {
+        if (!dev) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: '缺少 device_id' }));
           return;
         }
-        camDeviceState[o.device_id] = { status: o.status || 'idle', last_seen: Date.now() };
-        log(`cam 设备注册: ${o.device_id} (mac=${o.mac || '?'})`);
+        logAuthSource(req, dev);
+        camDeviceState[dev] = { status: o.status || 'idle', last_seen: Date.now() };
+        log(`cam 设备注册: ${dev} (mac=${o.mac || '?'})`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true }));
       } catch (e) {
@@ -303,11 +355,13 @@ const server = http.createServer(async (req, res) => {
   // GET /api/cam-sop - 设备端拉 SOP 列表（40号文档，S1 转发 S2 db-api）
   if (req.method === 'GET' && req.url.startsWith('/api/cam-sop')) {
     const q = getQuery(req.url);
-    if (!checkDeviceSecret(q.secret)) {
+    const dev = pickDeviceId(req, q, null);
+    if (!checkDeviceSecret(pickSecret(req, q, null), dev)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: '设备密钥错误' }));
       return;
     }
+    logAuthSource(req, dev);
     fetch(CAM_S2_DBAPI + '/api/cam-sop', {
       headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN }
     }).then(function(r) { return r.json(); }).then(function(data) {
@@ -324,17 +378,18 @@ const server = http.createServer(async (req, res) => {
   // GET /api/cam/cmd - 设备轮询待执行指令（设备每 3 秒调用）
   if (req.method === 'GET' && req.url.startsWith('/api/cam/cmd')) {
     const q = getQuery(req.url);
-    if (!checkDeviceSecret(q.secret)) {
+    const dev = pickDeviceId(req, q, null);
+    if (!checkDeviceSecret(pickSecret(req, q, null), dev)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: '设备密钥错误' }));
       return;
     }
-    const dev = q.device_id;
     if (!dev) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: '缺少 device_id' }));
       return;
     }
+    logAuthSource(req, dev);
     // 设备轮询 = 心跳，更新 last_seen（保持 status 不变，只刷新心跳）
     if (!camDeviceState[dev]) {
       camDeviceState[dev] = { status: 'idle', last_seen: Date.now() };
@@ -361,18 +416,20 @@ const server = http.createServer(async (req, res) => {
     req.on('end', () => {
       try {
         const o = JSON.parse(body || '{}');
-        if (!checkDeviceSecret(o.secret)) {
+        const dev = pickDeviceId(req, null, o);
+        if (!checkDeviceSecret(pickSecret(req, null, o), dev)) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: '设备密钥错误' }));
           return;
         }
-        if (!o.device_id) {
+        if (!dev) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: '缺少 device_id' }));
           return;
         }
-        camDeviceState[o.device_id] = { status: o.status || 'idle', last_seen: Date.now() };
-        log(`cam 状态上报: ${o.device_id} = ${o.status}`);
+        logAuthSource(req, dev);
+        camDeviceState[dev] = { status: o.status || 'idle', last_seen: Date.now() };
+        log(`cam 状态上报: ${dev} = ${o.status}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true }));
       } catch (e) {
@@ -488,12 +545,30 @@ const server = http.createServer(async (req, res) => {
 
   // POST /api/cam-upload - 视觉采集板整组上传（multipart：batch + 多张 jpg + rec.wav）
   if (req.method === 'POST' && req.url === '/api/cam-upload') {
+    // ★ docs/44：这个端点原来是**完全无鉴权**的 —— 谁能连上 18790 就能塞文件、
+    //   并触发一次付费的 AI 分析。这里补上，但要兼容现状：
+    //   当前固件上传时**不发任何凭据**（upload.c 里没有 secret 字段），直接强制会让设备全断。
+    //   所以分两步：① 带了凭据就校验，错的直接拒 ② 没带凭据时由密钥表的
+    //   requireSecretOnUpload 决定（默认 false=放行+告警）。设备侧加上
+    //   X-Device-Secret 或 multipart 里的 secret 字段后，把那个开关置 true 收紧。
+    const hdrSecret = String(req.headers['x-device-secret'] || '').trim();
+    const hdrDev = String(req.headers['x-device-id'] || '').trim();
     const contentType = req.headers['content-type'] || '';
     const boundaryMatch = contentType.match(/boundary=(.+)/);
 
     if (!boundaryMatch) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: '缺少 boundary' }));
+      return;
+    }
+    if (hdrSecret && !checkDeviceSecret(hdrSecret, hdrDev)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: '设备密钥错误' }));
+      return;
+    }
+    if (!hdrSecret && camSecrets().requireSecretOnUpload) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: '设备密钥错误（未携带凭据）' }));
       return;
     }
 
@@ -507,6 +582,22 @@ const server = http.createServer(async (req, res) => {
         // 先取 device_id（拼进 batch 前缀，保证跨设备 batch 号不撞）
         const devPart = parts.find(p => p.name === 'device_id');
         const device_id = devPart ? devPart.data.toString().trim() : '';
+        // 设备凭据：请求头优先，其次 multipart 里的 secret 字段（两种都支持，便于设备侧二选一）
+        const secPart = parts.find(p => p.name === 'secret');
+        const effSecret = hdrSecret || (secPart ? secPart.data.toString().trim() : '');
+        const effDev = hdrDev || device_id;
+        if (effSecret && !checkDeviceSecret(effSecret, effDev)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: '设备密钥错误' }));
+          return;
+        }
+        if (effSecret) {
+          logAuthSource(req, effDev);
+        } else if (!_uploadNoSecretWarned) {
+          _uploadNoSecretWarned = true;
+          log('⚠️ cam-upload 未携带任何设备凭据（当前固件如此）—— 过渡期放行。'
+            + '设备侧加上 X-Device-Secret 后，把密钥表的 requireSecretOnUpload 置 true 即可收紧。');
+        }
         // 取出 batch（无则用时间戳）；拼 device_id 前缀使其全局唯一
         const batchPart = parts.find(p => p.name === 'batch');
         const rawBatch = batchPart ? batchPart.data.toString().trim() : '';
@@ -525,7 +616,7 @@ const server = http.createServer(async (req, res) => {
         let fileCount = 0;
         for (const p of parts) {
           // 普通字段（batch/device_id 已处理）跳过；其余按 name 作为文件名保存
-          if (p.name === 'batch' || p.name === 'device_id' || p.name === 'sop_id' || p.name === 'interval_ms') continue;
+          if (p.name === 'batch' || p.name === 'device_id' || p.name === 'sop_id' || p.name === 'interval_ms' || p.name === 'secret') continue;
           // upload_log 是纯文本元信息（37号文档），写到 _upload_log.txt 供 cam_analyze 解析入库，不计入文件数
           if (p.name === 'upload_log') {
             fs.writeFileSync(path.join(batchDir, '_upload_log.txt'), p.data);
