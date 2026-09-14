@@ -118,6 +118,26 @@ retry_count = 1
 # ★ 合并分析提示词：非空则走「一次调用完成三段分析」；为空则回退原来的 3 步（回滚开关）
 merged_prompt = None
 
+# ★ ASR 元信息（call_asr 填充）：情绪/语种标注、用的引擎、分了几段
+#   qwen3-asr-flash 会返回 annotations: [{"emotion":"happy","language":"zh"}]，
+#   一段录音一个标注；超长分段后会有多个 → 取主导值（见 dominant_of）
+asr_meta = {"annotations": [], "engine": "", "segments": 0}
+
+
+def dominant_of(anns, field):
+    """从（可能多段的）标注里取主导值：出现次数最多的；并列时取先出现的。"""
+    vals = [a.get(field) for a in (anns or []) if isinstance(a, dict) and a.get(field)]
+    if not vals:
+        return ""
+    counts = {}
+    for v in vals:
+        counts[v] = counts.get(v, 0) + 1
+    best = max(counts.values())
+    for v in vals:          # 保持原始顺序，并列时取先出现的
+        if counts[v] == best:
+            return v
+    return ""
+
 # ============ 合并分析 prompt（默认值，S2 cam-config.json 的 mergedPrompt 可覆盖）============
 # ⚠️ 占位符用 {{key}} 而不是 {key}：prompt 末尾有 JSON 示例，里面就是 { }，
 #    用 str.format 会把这些大括号当成占位符直接抛异常。
@@ -403,6 +423,17 @@ def call_merged(key, image_paths, audio_text, sop_doc, interval_sec=5):
         prompt = ("【注意】本次未采集到任何画面（audio 模式），第一步「画面时序分析」请如实写"
                   "「本次未采集画面」，不要编造画面内容。\n\n" + prompt)
 
+    # ★ 把语音情绪作为**辅助**信息给模型（写在提示词最前面，这样不必改已保存的模板）
+    emo_now = dominant_of(asr_meta.get("annotations"), "emotion")
+    if emo_now:
+        prompt = (
+            "【系统附带的语音情绪识别（机器判断，仅供参考）】\n"
+            f"主导情绪：{emo_now}\n"
+            "⚠️ 这是对**整段录音**的判断，录音里可能有多人说话，不一定是该学员本人的情绪；\n"
+            "   只有当 SOP 标准本身涉及服务态度/精神面貌时，才把它作为辅助依据，"
+            "**不得据此单独判定不合格**。\n\n"
+        ) + prompt
+
     content = [{"type": "text", "text": prompt}]
     for p in image_paths:
         b64 = base64.b64encode(open(p, "rb").read()).decode()
@@ -460,6 +491,7 @@ def call_asr(wav_path):
     """
     if not os.path.exists(wav_path):
         return ""
+    global asr_meta
     try:
         r = subprocess.run(
             ["python3", ASR_SCRIPT, wav_path],
@@ -475,6 +507,8 @@ def call_asr(wav_path):
         eng = j.get("engine", "?")
         segs = j.get("segments", 1)
         anns = j.get("annotations") or []
+        # 情绪/语种标注记进 asr_meta，后面写进 record 推给 S2（考核要看）
+        asr_meta = {"annotations": anns, "engine": eng, "segments": segs}
         # 记一条可判断的日志：字数 / 时长 / 用了哪个引擎 / 分了几段。
         # ⚠️ 别只看"字/总时长"就断定转写差 —— 采集录音常常 80~90% 是静音，
         #    按总时长算会得出 0.4 字/秒的假象；按「字/有效语音秒」算才准（正常 3~5）。
@@ -810,7 +844,18 @@ def main():
         "sop_id": sop_id,
         "sop_compare": sop_compare,
         "status": "analyzed",
-        "raw_json": json.dumps({"device_id": device_id, "frame_count": len(imgs)}, ensure_ascii=False),
+        # ★ 语音情绪/语种（qwen3-asr-flash 的 annotations）—— 写进考核记录，管理端会展示
+        # ⚠️ 这是对**整段录音**的机器判断：录音里可能有多人说话（实录里就出现过同事闲聊），
+        #    所以它不等于"该学员本人的情绪"，只作服务态度的**辅助**参考，不能单独当评分依据。
+        "emotion": dominant_of(asr_meta.get("annotations"), "emotion"),
+        "language": dominant_of(asr_meta.get("annotations"), "language"),
+        "asr_engine": asr_meta.get("engine") or "",
+        "raw_json": json.dumps({
+            "device_id": device_id, "frame_count": len(imgs),
+            # 多段录音会有多条标注，原始列表留在 raw_json 里便于追溯
+            "asr": {"engine": asr_meta.get("engine"), "segments": asr_meta.get("segments"),
+                    "annotations": asr_meta.get("annotations") or []},
+        }, ensure_ascii=False),
     }
 
     # 5b. 写本地 SQLite（A 验证期过渡库，正式期以 S2 为准）
