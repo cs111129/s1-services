@@ -376,7 +376,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: '设备密钥错误' }));
       return;
     }
-    logAuthSource(req, dev, 'cmd');
+    logAuthSource(req, dev, 'sop');
     fetch(CAM_S2_DBAPI + '/api/cam-sop', {
       headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN }
     }).then(function(r) { return r.json(); }).then(function(data) {
@@ -404,7 +404,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: '缺少 device_id' }));
       return;
     }
-    logAuthSource(req, dev, 'sop');
+    logAuthSource(req, dev, 'cmd');
     // 设备轮询 = 心跳，更新 last_seen（保持 status 不变，只刷新心跳）
     if (!camDeviceState[dev]) {
       camDeviceState[dev] = { status: 'idle', last_seen: Date.now() };
