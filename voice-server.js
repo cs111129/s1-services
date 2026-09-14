@@ -51,6 +51,72 @@ const camCmdQueue = {};
 // 设备状态缓存：device_id -> { status, last_seen }
 const camDeviceState = {};
 
+/* ============ 设备鉴权（docs/44 通信安全升级）============ */
+// 阶段2：**优先读请求头 X-Device-Secret / X-Device-Id**，回退 URL query 或 JSON body。
+//        过渡期三处都认，老固件行为完全不变；观察一周后再删 URL 参数。
+// 阶段3：一机一密 —— 密钥表 /root/cam-device-secrets.json，
+//        表里没有的 device_id 用公共兜底密钥（兼容未出厂烧写的设备）。
+// 为什么密钥不能留在 URL：URL 会被 nginx/反代/主机商 access log 原样记录，
+//        上了 HTTPS 也照样泄漏（TLS 在反代处就终结了）。
+//
+// ⚠️ 下面这些状态必须放**模块作用域**。第一版我写在请求回调里（因为 getQuery 在那儿），
+//    结果每个请求都重新初始化：
+//      · 密钥表缓存永远失效 → 每次请求都读盘 + 打一行日志
+//      · "只记一次"的日志变成刷屏 —— 设备每 3 秒轮询，200 台就是每秒 60 多行
+//    "看起来日志在打"不等于"逻辑在跑"，尤其当状态被意外重置时。
+const CAM_SECRET_FILE = process.env.CAM_SECRET_FILE || '/root/cam-device-secrets.json';
+let _secCache = null, _secMtime = -1;
+function camSecrets() {
+  try {
+    const st = fs.statSync(CAM_SECRET_FILE);
+    if (_secCache && st.mtimeMs === _secMtime) return _secCache;   // 热加载：文件没变就用缓存
+    _secCache = JSON.parse(fs.readFileSync(CAM_SECRET_FILE, 'utf8'));
+    _secMtime = st.mtimeMs;
+    log(`cam 密钥表已加载: ${Object.keys(_secCache.devices || {}).length} 台设备, `
+      + `requireSecretOnUpload=${!!_secCache.requireSecretOnUpload}`);
+  } catch (e) {
+    if (!_secCache) {
+      // 文件不存在/坏了 → 退回旧行为（公共密钥、上传不强制），不能因此让设备全断
+      _secCache = { devices: {}, fallbackSecret: CAM_DEVICE_SECRET, requireSecretOnUpload: false };
+      log(`cam 密钥表读取失败(${e.message})，用公共密钥兜底`);
+    }
+  }
+  return _secCache;
+}
+// 某台设备应该用的密钥：表里有就用表里的，没有就用公共兜底
+function deviceSecretOf(deviceId) {
+  const c = camSecrets();
+  return ((c.devices || {})[deviceId]) || c.fallbackSecret || CAM_DEVICE_SECRET;
+}
+function checkDeviceSecret(secret, deviceId) {
+  if (!secret) return false;
+  return secret === deviceSecretOf(deviceId);
+}
+// 从 请求头 / query / body 三处取凭据（阶段2 过渡期三处都认）
+function pickSecret(req, q, o) {
+  return String(req.headers['x-device-secret'] || (q && q.secret) || (o && o.secret) || '').trim();
+}
+function pickDeviceId(req, q, o) {
+  return String(req.headers['x-device-id'] || (q && q.device_id) || (o && o.device_id) || '').trim();
+}
+// 鉴权来源按【端点 + 来源】各记一次。
+// ★ 只看"有没有出现过 header"是不够的：设备可能只在 /api/cam/cmd 上加了头、
+//   而 /api/cam-upload 还没加 —— 那种情况下把 requireSecretOnUpload 置 true 会把上传全打断。
+//   所以日志必须能区分端点。
+const _authSrcSeen = {};
+function logAuthSource(req, deviceId, endpoint) {
+  const src = req.headers['x-device-secret'] ? 'header' : 'url/body';
+  const key = endpoint + '|' + src;
+  if (!_authSrcSeen[key]) {
+    _authSrcSeen[key] = 1;
+    log(`cam 鉴权来源首次出现: [${endpoint}] ${src}（设备 ${deviceId || '?'}）`);
+  }
+}
+// cam-upload 缺凭据的告警只打一次，别刷屏
+let _uploadNoSecretWarned = false;
+// cam-upload 首次带上凭据时高亮提示一次 —— 这是"可以置 requireSecretOnUpload=true"的唯一可靠信号
+let _uploadSecretOkLogged = false;
+
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
@@ -266,59 +332,8 @@ const server = http.createServer(async (req, res) => {
     return q;
   }
 
-  // ===== 设备鉴权（docs/44 通信安全升级）=====
-  // 阶段2：**优先读请求头 X-Device-Secret / X-Device-Id**，回退读 URL query 或 JSON body。
-  //        过渡期三处都认，老固件行为完全不变；观察一周后再删 URL 参数。
-  // 阶段3：一机一密 —— 密钥表在 /root/cam-device-secrets.json，
-  //        表里没有的 device_id 用公共兜底密钥（兼容未出厂烧写的设备）。
-  // 为什么密钥不能留在 URL：URL 会被 nginx/反代/主机商 access log 原样记录，
-  //        上了 HTTPS 也照样泄漏（TLS 在反代处就终结了）。
-  const CAM_SECRET_FILE = process.env.CAM_SECRET_FILE || '/root/cam-device-secrets.json';
-  let _secCache = null, _secMtime = -1;
-  function camSecrets() {
-    try {
-      const st = fs.statSync(CAM_SECRET_FILE);
-      if (_secCache && st.mtimeMs === _secMtime) return _secCache;   // 热加载：文件没变就用缓存
-      _secCache = JSON.parse(fs.readFileSync(CAM_SECRET_FILE, 'utf8'));
-      _secMtime = st.mtimeMs;
-      log(`cam 密钥表已加载: ${Object.keys(_secCache.devices || {}).length} 台设备, `
-        + `requireSecretOnUpload=${!!_secCache.requireSecretOnUpload}`);
-    } catch (e) {
-      if (!_secCache) {
-        // 文件不存在/坏了 → 退回旧行为（公共密钥、上传不强制），不能因此让设备全断
-        _secCache = { devices: {}, fallbackSecret: CAM_DEVICE_SECRET, requireSecretOnUpload: false };
-        log(`cam 密钥表读取失败(${e.message})，用公共密钥兜底`);
-      }
-    }
-    return _secCache;
-  }
-  // 某台设备应该用的密钥：表里有就用表里的，没有就用公共兜底
-  function deviceSecretOf(deviceId) {
-    const c = camSecrets();
-    return ((c.devices || {})[deviceId]) || c.fallbackSecret || CAM_DEVICE_SECRET;
-  }
-  function checkDeviceSecret(secret, deviceId) {
-    if (!secret) return false;
-    return secret === deviceSecretOf(deviceId);
-  }
-  // 从 请求头 / query / body 三处取凭据（阶段2 过渡期三处都认）
-  function pickSecret(req, q, o) {
-    return String(req.headers['x-device-secret'] || (q && q.secret) || (o && o.secret) || '').trim();
-  }
-  function pickDeviceId(req, q, o) {
-    return String(req.headers['x-device-id'] || (q && q.device_id) || (o && o.device_id) || '').trim();
-  }
-  // 鉴权来源只记一次，便于观察设备侧有没有切到请求头
-  const _authSrcSeen = {};
-  function logAuthSource(req, deviceId) {
-    const src = req.headers['x-device-secret'] ? 'header' : 'url/body';
-    if (!_authSrcSeen[src]) {
-      _authSrcSeen[src] = 1;
-      log(`cam 鉴权来源首次出现: ${src}（设备 ${deviceId || '?'}）`);
-    }
-  }
-  // cam-upload 缺凭据的告警只打一次，别刷屏
-  let _uploadNoSecretWarned = false;
+  // 设备鉴权相关函数与状态已挪到**模块作用域**（见文件上方 CAM_SECRET_FILE 那一段）。
+  // 原先写在这里会被每个请求重新初始化 → 缓存失效 + 日志刷屏。
 
   // POST /api/cam/register - 设备联网注册（A 验证期：登记状态，不强制持久化）
   if (req.method === 'POST' && req.url === '/api/cam/register') {
@@ -338,7 +353,7 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: '缺少 device_id' }));
           return;
         }
-        logAuthSource(req, dev);
+        logAuthSource(req, dev, 'register');
         camDeviceState[dev] = { status: o.status || 'idle', last_seen: Date.now() };
         log(`cam 设备注册: ${dev} (mac=${o.mac || '?'})`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -361,7 +376,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: '设备密钥错误' }));
       return;
     }
-    logAuthSource(req, dev);
+    logAuthSource(req, dev, 'cmd');
     fetch(CAM_S2_DBAPI + '/api/cam-sop', {
       headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN }
     }).then(function(r) { return r.json(); }).then(function(data) {
@@ -389,7 +404,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: '缺少 device_id' }));
       return;
     }
-    logAuthSource(req, dev);
+    logAuthSource(req, dev, 'sop');
     // 设备轮询 = 心跳，更新 last_seen（保持 status 不变，只刷新心跳）
     if (!camDeviceState[dev]) {
       camDeviceState[dev] = { status: 'idle', last_seen: Date.now() };
@@ -427,7 +442,7 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: '缺少 device_id' }));
           return;
         }
-        logAuthSource(req, dev);
+        logAuthSource(req, dev, 'status');
         camDeviceState[dev] = { status: o.status || 'idle', last_seen: Date.now() };
         log(`cam 状态上报: ${dev} = ${o.status}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -592,11 +607,19 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         if (effSecret) {
-          logAuthSource(req, effDev);
+          logAuthSource(req, effDev, 'upload');
+          // ★ 这是"可以把 requireSecretOnUpload 置 true"的唯一可靠信号：
+          //   必须看到 **upload 这个端点** 已经带上凭据，而不是别的端点带了头。
+          if (!_uploadSecretOkLogged) {
+            _uploadSecretOkLogged = true;
+            log('✅ cam-upload 已开始携带设备凭据 —— 此时才可以把 requireSecretOnUpload 置 true '
+              + '（关掉"无凭据也能上传"的口子）。改 /root/cam-device-secrets.json 即刻生效，无需重启。');
+          }
         } else if (!_uploadNoSecretWarned) {
           _uploadNoSecretWarned = true;
           log('⚠️ cam-upload 未携带任何设备凭据（当前固件如此）—— 过渡期放行。'
-            + '设备侧加上 X-Device-Secret 后，把密钥表的 requireSecretOnUpload 置 true 即可收紧。');
+            + '设备侧给上传加上 X-Device-Secret（或 multipart 的 secret 字段）后，'
+            + '看到上面那条 ✅ 日志，再把 requireSecretOnUpload 置 true。');
         }
         // 取出 batch（无则用时间戳）；拼 device_id 前缀使其全局唯一
         const batchPart = parts.find(p => p.name === 'batch');
