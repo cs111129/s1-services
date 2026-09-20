@@ -48,8 +48,23 @@ const CAM_INGEST_TOKEN = 'cam-ingest-token-2026';
 const CAM_OFFLINE_MS = 15000;
 // 待下发指令缓存：device_id -> { cmd, ts }
 const camCmdQueue = {};
-// 设备状态缓存：device_id -> { status, last_seen }
+// 设备状态缓存：device_id -> { status, last_seen, vbat?, batt_pct?, batt_at? }
+// ★ 2026-09-19 起新增电量：vbat(电池电压 V) / batt_pct(电量 0~100)，随 /api/cam/status 上报
+//   （固件 v0.5+ 已实测会带：`上报状态 idle -> ok（电量 84% / 4.05V）`；空闲时每 5 分钟自动报一次）
+//   老固件不带这两个字段 → 保持 null，前端显示"未上报"，不会显示成 0%
 const camDeviceState = {};
+
+// 把设备上报的电量写进状态缓存。
+// ★ 只在**确实带了合法值**时才覆盖 —— 老固件/心跳包不带这两个字段，
+//   不能把缓存里已有的电量冲成 undefined（否则一次 cmd 轮询就把电量弄没了）。
+function setCamBattery(dev, o) {
+  const st = camDeviceState[dev];
+  if (!st || !o) return;
+  const v = Number(o.vbat), p = Number(o.batt_pct);
+  if (isFinite(v) && v > 0) st.vbat = Math.round(v * 100) / 100;   // 保留 2 位，如 4.05
+  if (isFinite(p) && p >= 0 && p <= 100) st.batt_pct = Math.round(p);
+  if (st.vbat !== undefined || st.batt_pct !== undefined) st.batt_at = Date.now();
+}
 
 /* ============ 设备鉴权（docs/44 通信安全升级）============ */
 // 阶段2：**优先读请求头 X-Device-Secret / X-Device-Id**，回退 URL query 或 JSON body。
@@ -354,7 +369,11 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         logAuthSource(req, dev, 'register');
-        camDeviceState[dev] = { status: o.status || 'idle', last_seen: Date.now() };
+        // ★ 合并写入，不能整个替换 —— 否则注册会把已缓存的电量抹掉
+        if (!camDeviceState[dev]) camDeviceState[dev] = {};
+        camDeviceState[dev].status = o.status || 'idle';
+        camDeviceState[dev].last_seen = Date.now();
+        setCamBattery(dev, o);
         log(`cam 设备注册: ${dev} (mac=${o.mac || '?'})`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true }));
@@ -443,8 +462,15 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         logAuthSource(req, dev, 'status');
-        camDeviceState[dev] = { status: o.status || 'idle', last_seen: Date.now() };
-        log(`cam 状态上报: ${dev} = ${o.status}`);
+        // ★ 合并写入（原来整个替换），并接收设备上报的电量
+        if (!camDeviceState[dev]) camDeviceState[dev] = {};
+        camDeviceState[dev].status = o.status || 'idle';
+        camDeviceState[dev].last_seen = Date.now();
+        setCamBattery(dev, o);
+        log(`cam 状态上报: ${dev} = ${o.status}`
+          + (camDeviceState[dev].batt_pct !== undefined
+              ? `（电量 ${camDeviceState[dev].batt_pct}%${camDeviceState[dev].vbat !== undefined ? ' / ' + camDeviceState[dev].vbat + 'V' : ''}）`
+              : '（本次未带电量）'));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true }));
       } catch (e) {
@@ -489,7 +515,14 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/api/cam/device/list') {
     const devices = Object.entries(camDeviceState).map(([id, st]) => {
       const online = (Date.now() - st.last_seen) < CAM_OFFLINE_MS;
-      return { device_id: id, status: st.status, online, last_seen: st.last_seen };
+      // ★ 电量一并暴露给前端（docs/26 第 35 行："存这两列 + 让手机端能读到"）
+      //   没上报过就是 null，前端显示"未上报"，不要当 0%
+      return {
+        device_id: id, status: st.status, online, last_seen: st.last_seen,
+        vbat: st.vbat !== undefined ? st.vbat : null,
+        batt_pct: st.batt_pct !== undefined ? st.batt_pct : null,
+        batt_at: st.batt_at || null
+      };
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ devices }));
