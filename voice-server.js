@@ -468,8 +468,10 @@ const server = http.createServer(async (req, res) => {
         if (pending.bri_idx !== undefined) cfgExtra.bri_idx = pending.bri_idx;
         if (pending.screen_off_idx !== undefined) cfgExtra.screen_off_idx = pending.screen_off_idx;
       }
+      // ★ CR-20260921-02：take_photo 要把 shot_id 带给设备（设备可据此命名 batch）
+      if (pending.cmd === 'take_photo' && pending.shot_id) cfgExtra.shot_id = pending.shot_id;
       delete camCmdQueue[dev];
-      log(`cam 下发指令 ${cmd} -> ${dev}${cmd === 'set_config' ? ' ' + JSON.stringify(cfgExtra) : ''}`);
+      log(`cam 下发指令 ${cmd} -> ${dev}${Object.keys(cfgExtra).length ? ' ' + JSON.stringify(cfgExtra) : ''}`);
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     // ★ CR-20260922-01：搭车在设备已在轮询的这条接口上加 student 字段（不新增请求 ✗ —— 一次 TLS 握手吃 45KB RAM）
@@ -537,6 +539,14 @@ const server = http.createServer(async (req, res) => {
         camDeviceState[dev].status = o.status || 'idle';
         camDeviceState[dev].last_seen = Date.now();
         setCamBattery(dev, o);
+        // ★ CR-20260921-02：设备抓拍上传成功后【立即】上报一次，带 last_shot_batch
+        //   ⇒ 前端靠它判断"图好了没"（设备空闲时 status 是 5 分钟一次，等周期上报必挂）
+        //   ⚠️ 合并写入：不带该字段的包**不许清掉已有值**（与 vbat 同一套语义）
+        if (o.last_shot_batch !== undefined && o.last_shot_batch !== null && String(o.last_shot_batch).trim() !== '') {
+          camDeviceState[dev].last_shot_batch = String(o.last_shot_batch).trim();
+          camDeviceState[dev].last_shot_at = Date.now();
+          log(`cam 抓拍回带 -> ${dev}: ${camDeviceState[dev].last_shot_batch}`);
+        }
         log(`cam 状态上报: ${dev} = ${o.status}`
           + (camDeviceState[dev].batt_pct !== undefined
               ? `（电量 ${camDeviceState[dev].batt_pct}%${camDeviceState[dev].vbat !== undefined ? ' / ' + camDeviceState[dev].vbat + 'V' : ''}）`
@@ -617,6 +627,19 @@ function validateSetConfig(o) {
           return;
         }
 
+        // ★ CR-20260921-02：远程抓拍一张（录制前预览确认用）
+        //   设备端收到后：拍 1 张 → 单独上传（batch = <dev>_shot_<时间戳>）
+        //   → **上传成功后立即上报一次 status**（带 last_shot_batch）⇒ 前端才知道图好了
+        //   ⚠️ 录制中设备会忽略（不抢相机）；一次只认一张
+        if (action === 'take_photo') {
+          const shotId = String(o.shot_id || ('shot_' + Date.now())).trim();
+          camCmdQueue[dev] = { cmd: 'take_photo', ts: Date.now(), shot_id: shotId };
+          log(`cam 抓拍入队 -> ${dev} (shot_id=${shotId})`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, shot_id: shotId }));
+          return;
+        }
+
         // ★ CR-20260921-04：远程下发设备设置（音量/亮度/息屏）—— 校验见模块级 validateSetConfig()
         if (action === 'set_config') {
           const v = validateSetConfig(o);
@@ -657,7 +680,10 @@ function validateSetConfig(o) {
         device_id: id, status: st.status, online, last_seen: st.last_seen,
         vbat: st.vbat !== undefined ? st.vbat : null,
         batt_pct: st.batt_pct !== undefined ? st.batt_pct : null,
-        batt_at: st.batt_at || null
+        batt_at: st.batt_at || null,
+        // ★ CR-20260921-02：最近一次抓拍的 batch（前端据此判断"预览图好了没"）
+        last_shot_batch: st.last_shot_batch || null,
+        last_shot_at: st.last_shot_at || null
       };
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -833,17 +859,48 @@ function validateSetConfig(o) {
 
         // 落盘后异步触发云端分析（图片视觉时序 + 录音 ASR + 综合分析 → 推送 S2 ingest）
         // 把 device_id 传给分析脚本，供它查 S2 current-binding 拿快照 + 推 ingest。
-        const analyzer = path.join(__dirname, 'cam_analyze.py');
-        exec(`python3 "${analyzer}" "${batchDir}" "${device_id}" "${sop_id}" "${interval_ms}" >> /tmp/cam-analyze.log 2>&1`, (err, stdout, stderr) => {
-          if (err) log(`cam 分析启动失败: ${err.message}`);
-          else log(`cam 分析已启动: batch=${batch}, device_id=${device_id || '(无)'}`);
-        });
+        // ★ CR-20260921-02：**预览抓拍批次（*_shot_*）不做分析** ✗✗
+        //   预览图是临时产物 ⇒ 若也跑分析会：① 白花 AI 费用 ② 作为一条"考核记录"污染学员记录列表
+        //   判据：批次名含 `_shot_`（设备端按 <dev>_shot_<时间戳> 命名 ✓ 规格书 §4.4 ✓）
+        if (/_shot_/.test(batch)) {
+          log(`cam 预览抓拍批次，跳过分析: batch=${batch}`);
+        } else {
+          const analyzer = path.join(__dirname, 'cam_analyze.py');
+          exec(`python3 "${analyzer}" "${batchDir}" "${device_id}" "${sop_id}" "${interval_ms}" >> /tmp/cam-analyze.log 2>&1`, (err, stdout, stderr) => {
+            if (err) log(`cam 分析启动失败: ${err.message}`);
+            else log(`cam 分析已启动: batch=${batch}, device_id=${device_id || '(无)'}`);
+          });
+        }
       } catch (error) {
         log(`cam-upload 错误: ${error.message}`);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: error.message }));
       }
     });
+    return;
+  }
+
+  // GET /api/cam/file-list/<batch> - 列出某批次目录里的文件名（CR-20260921-02）
+  //   ★ 用途：前端**不写死文件名**（设备端实测是 snap_001.jpg 三位，但别 trust 位数 ✗）
+  //     取图流程：列目录 → 取第一个 .jpg → 再走 /api/cam/file/<batch>/<filename> ✓
+  //   ★ 放在 /api/cam/file/ 之前匹配（否则会被下面 startsWith('/api/cam/file/') 抢走 ✗）
+  if (req.method === 'GET' && req.url.startsWith('/api/cam/file-list/')) {
+    try {
+      const batch = path.basename(decodeURIComponent(req.url.replace('/api/cam/file-list/', '').split('?')[0]));
+      if (!batch) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '缺少 batch' })); return; }
+      const dir = path.join(CAM_DIR, batch);
+      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: '批次不存在', batch }));
+        return;
+      }
+      const files = fs.readdirSync(dir).filter(function (f) { return !f.startsWith('_'); });   // 隐藏 _upload_log.txt 等
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, batch, files, jpgs: files.filter(function (f) { return /\.jpe?g$/i.test(f); }) }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
 
