@@ -547,6 +547,22 @@ const server = http.createServer(async (req, res) => {
           camDeviceState[dev].last_shot_at = Date.now();
           log(`cam 抓拍回带 -> ${dev}: ${camDeviceState[dev].last_shot_batch}`);
         }
+        // ★ CR-20260921-02 §15.2b：设备【一识别到 take_photo 就立即回】shot_ack
+        //   ⇒ 这是本次缺失的那个"可观测性"：前端超时时能区分
+        //      「有 ack = 设备收到了但没出图」vs「无 ack = 设备压根没收到」
+        //   ⚠️ 同一套合并写入（不带该字段的包不冲旧值）
+        if (o.shot_ack !== undefined && o.shot_ack !== null && String(o.shot_ack).trim() !== '') {
+          camDeviceState[dev].shot_ack = String(o.shot_ack).trim();
+          camDeviceState[dev].shot_ack_at = Date.now();
+          log(`cam 抓拍确认(ack) -> ${dev}: ${camDeviceState[dev].shot_ack}`);
+        }
+        // ★ 抓拍失败原因（设备端一直在发，服务器端此前直接忽略了 ✗）
+        //   取值如「相机出图失败」「设备忙（录制/上传中）」「上一张还在处理」
+        if (o.shot_err !== undefined && o.shot_err !== null && String(o.shot_err).trim() !== '') {
+          camDeviceState[dev].shot_err = String(o.shot_err).trim();
+          camDeviceState[dev].shot_err_at = Date.now();
+          log(`cam 抓拍失败 -> ${dev}: ${camDeviceState[dev].shot_err}`);
+        }
         log(`cam 状态上报: ${dev} = ${o.status}`
           + (camDeviceState[dev].batt_pct !== undefined
               ? `（电量 ${camDeviceState[dev].batt_pct}%${camDeviceState[dev].vbat !== undefined ? ' / ' + camDeviceState[dev].vbat + 'V' : ''}）`
@@ -683,7 +699,12 @@ function validateSetConfig(o) {
         batt_at: st.batt_at || null,
         // ★ CR-20260921-02：最近一次抓拍的 batch（前端据此判断"预览图好了没"）
         last_shot_batch: st.last_shot_batch || null,
-        last_shot_at: st.last_shot_at || null
+        last_shot_at: st.last_shot_at || null,
+        // ★ CR-20260921-02 §15.2b：抓拍确认与失败原因 —— 前端超时提示靠它们区分原因
+        shot_ack: st.shot_ack || null,
+        shot_ack_at: st.shot_ack_at || null,
+        shot_err: st.shot_err || null,
+        shot_err_at: st.shot_err_at || null
       };
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
