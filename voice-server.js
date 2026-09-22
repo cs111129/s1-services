@@ -66,11 +66,16 @@ const camBindInfo = {};
 // 给 /api/cam/cmd 的响应挂上 student 字段（规格书 §4.2 参考实现）
 // 返回【新的】对象，不改动传进来的那个 —— 否则 cmd/send 里那份 pending 会被污染
 function withStudent(dev, resp) {
+  // ★ 判据必须是「键存不存在」而不是「值真不真」✗✗：
+  //   camBindInfo[dev] 有 3 种状态 —— 键不存在 / 值 null / 值 {id,name}。
+  //   原写法 `if (!b) return resp` 把 null 和 undefined 一起判掉了 ⇒
+  //   **「明确解绑」被当成「没推过」**，响应里键被去掉，设备显示「未知」而不是「未绑定」。
+  //   这正是规格书 §4.3 警告的语义陷阱（"字段不存在" ≠ "值为空"）。
+  if (!(dev in camBindInfo)) return resp;                     // 没推过 → 不加这个键（= 未知）
   const b = camBindInfo[dev];
-  if (!b) return resp;                                        // 没推过 → 不加这个键（= 未知）
   const out = Object.assign({}, resp);
   // 值为 null（明确解绑）或 name 为空 → 都给 null（设备显示「未绑定」，比显示空名字好）
-  out.student = (b.name ? { id: b.id || '', name: b.name } : null);
+  out.student = (b && b.name ? { id: b.id || '', name: b.name } : null);
   return out;
 }
 
