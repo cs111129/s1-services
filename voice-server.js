@@ -54,6 +54,26 @@ const camCmdQueue = {};
 //   老固件不带这两个字段 → 保持 null，前端显示"未上报"，不会显示成 0%
 const camDeviceState = {};
 
+// 当前绑定学员缓存（CR-20260922-01）：device_id -> { id, name }
+// ★ 三态语义（规格书 §4.3，别记错 ✗）：
+//   · 键【不存在】      = 服务器还没推过 / 没实现 ⇒ 设备显示「未知」（灰）
+//   · 值为 null        = 明确【没绑定】        ⇒ 设备显示「未绑定」（金）
+//   · 值为 {id,name}   = 已绑定                ⇒ 设备显示姓名（白）
+// ⚠️ 绝不能把「键不存在」当成「未绑定」✗✗ —— 员工会以为没绑（实际绑了）→ 去重复绑定甚至绑到别人名下
+// ⚠️ 纯内存：S1 一重启就退回「未知」⇒ 由 S2 每 5 分钟幂等重推兜底（规格书 §6）
+const camBindInfo = {};
+
+// 给 /api/cam/cmd 的响应挂上 student 字段（规格书 §4.2 参考实现）
+// 返回【新的】对象，不改动传进来的那个 —— 否则 cmd/send 里那份 pending 会被污染
+function withStudent(dev, resp) {
+  const b = camBindInfo[dev];
+  if (!b) return resp;                                        // 没推过 → 不加这个键（= 未知）
+  const out = Object.assign({}, resp);
+  // 值为 null（明确解绑）或 name 为空 → 都给 null（设备显示「未绑定」，比显示空名字好）
+  out.student = (b.name ? { id: b.id || '', name: b.name } : null);
+  return out;
+}
+
 // 把设备上报的电量写进状态缓存。
 // ★ 只在**确实带了合法值**时才覆盖 —— 老固件/心跳包不带这两个字段，
 //   不能把缓存里已有的电量冲成 undefined（否则一次 cmd 轮询就把电量弄没了）。
@@ -439,7 +459,43 @@ const server = http.createServer(async (req, res) => {
       log(`cam 下发指令 ${cmd} -> ${dev}`);
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ cmd, interval_ms: pending ? (Number(pending.interval_ms) || 0) : 0, max_seconds: pending ? (Number(pending.max_seconds) || 0) : 0, sop_id: pending ? (pending.sop_id || "") : "", enable_audio: pending ? (pending.enable_audio !== false) : true, mode: pending ? (pending.mode || "") : "" }));
+    // ★ CR-20260922-01：搭车在设备已在轮询的这条接口上加 student 字段（不新增请求 ✗ —— 一次 TLS 握手吃 45KB RAM）
+    res.end(JSON.stringify(withStudent(dev, { cmd, interval_ms: pending ? (Number(pending.interval_ms) || 0) : 0, max_seconds: pending ? (Number(pending.max_seconds) || 0) : 0, sop_id: pending ? (pending.sop_id || "") : "", enable_audio: pending ? (pending.enable_audio !== false) : true, mode: pending ? (pending.mode || "") : "" })));
+    return;
+  }
+
+  // POST /api/cam/device/bind - 服务器端(S2) 推送「当前绑定学员」（CR-20260922-01 §4.1）
+  //   与 /api/cam/cmd/send 同构：POST + JSON body + 成功回 { success: true }
+  //   ★ 幂等：重复推同一个学员 = 覆盖同一个值，无副作用 ✓
+  //   student_name：UTF-8 中文【原文】（不要 \uXXXX 转义 ✗ —— 设备端是 strstr，不做转义还原）
+  //                 null / 空 = 明确解绑（⇒ cmd 响应里 student: null，设备显示「未绑定」）
+  if (req.method === 'POST' && req.url === '/api/cam/device/bind') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      try {
+        const o = JSON.parse(body || '{}');
+        const dev = o.device_id;
+        if (!dev) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: '缺少 device_id' }));
+          return;
+        }
+        if (o.student_name === null || o.student_name === undefined || String(o.student_name).trim() === '') {
+          camBindInfo[dev] = null;                              // ★ 明确解绑（不是"没推过"✗）
+          log(`cam 学员解绑 -> ${dev}`);
+        } else {
+          camBindInfo[dev] = { id: String(o.student_id || ''), name: String(o.student_name).trim() };
+          log(`cam 学员绑定 -> ${dev}: ${camBindInfo[dev].name}`);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } catch (e) {
+        log(`cam device/bind 错误: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
     return;
   }
 
