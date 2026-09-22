@@ -458,14 +458,23 @@ const server = http.createServer(async (req, res) => {
     // 有未消费指令则返回并清除
     const pending = camCmdQueue[dev];
     let cmd = null;
+    // ★ CR-20260921-04：set_config 的三个设置字段【只带存在的那几项】✗
+    //   不塞 undefined、也不补 0 —— 设备端靠"字段缺省 = 保持原值"来工作（规格书 §4.3）
+    const cfgExtra = {};
     if (pending) {
       cmd = pending.cmd;
+      if (pending.cmd === 'set_config') {
+        if (pending.vol !== undefined) cfgExtra.vol = pending.vol;
+        if (pending.bri_idx !== undefined) cfgExtra.bri_idx = pending.bri_idx;
+        if (pending.screen_off_idx !== undefined) cfgExtra.screen_off_idx = pending.screen_off_idx;
+      }
       delete camCmdQueue[dev];
-      log(`cam 下发指令 ${cmd} -> ${dev}`);
+      log(`cam 下发指令 ${cmd} -> ${dev}${cmd === 'set_config' ? ' ' + JSON.stringify(cfgExtra) : ''}`);
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     // ★ CR-20260922-01：搭车在设备已在轮询的这条接口上加 student 字段（不新增请求 ✗ —— 一次 TLS 握手吃 45KB RAM）
-    res.end(JSON.stringify(withStudent(dev, { cmd, interval_ms: pending ? (Number(pending.interval_ms) || 0) : 0, max_seconds: pending ? (Number(pending.max_seconds) || 0) : 0, sop_id: pending ? (pending.sop_id || "") : "", enable_audio: pending ? (pending.enable_audio !== false) : true, mode: pending ? (pending.mode || "") : "" })));
+    // ★ CR-20260921-04：set_config 时把 cfgExtra 里的设置字段一并带出
+    res.end(JSON.stringify(withStudent(dev, Object.assign({ cmd, interval_ms: pending ? (Number(pending.interval_ms) || 0) : 0, max_seconds: pending ? (Number(pending.max_seconds) || 0) : 0, sop_id: pending ? (pending.sop_id || "") : "", enable_audio: pending ? (pending.enable_audio !== false) : true, mode: pending ? (pending.mode || "") : "" }, cfgExtra))));
     return;
   }
 
@@ -543,7 +552,57 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST /api/cam/cmd/send - S2 前端下发指令给设备（经 S2 后代转发到 S1）
+  // ★ CR-20260921-04：远程设备设置的档位表 + 校验（模块级纯函数 ⇒ 可单元测试）
+//   档位抄自 funeng2-manifest.md §3.9（★ 单一真源，别在这里另发明档位 ✗）
+//   · vol            = 【实际音量值】20/40/65/80/100
+//   · bri_idx        = 亮度【下标 0~4】 → 40/80/128/180/255
+//   · screen_off_idx = 息屏【下标 0~3】 → 0(常亮)/30/60/120 秒
+//   ★ 三字段都可缺省 ⇒ 只下发要改的那几项，缺的项设备【保持原值】（规格书 §4.3）
+//   ⚠️ 越界【拒绝】而不是 clamp —— "想设 999 被设成 255" 比"没改"更糟（规格书 §4.3）
+const CFG_VOL_STEPS = [20, 40, 65, 80, 100];
+const CFG_BRI_STEPS = [40, 80, 128, 180, 255];
+const CFG_SCREEN_OFF_STEPS = [0, 30, 60, 120];
+
+// ★ 严格类型前置判断（单元测试抓到的真坑）：
+//   `Number([]) === 0`、`Number(false) === 0`、`Number('  ') === 0`、`Number(null) === 0`
+//   ⇒ 只用 Number() 强转的话，**空数组/布尔/空白串会被当成合法的第 0 档**（静默设成常亮/最低亮度）
+//   ⇒ 必须**先限定类型**：只接受 number，或"内容全是数字的字符串"。
+function isNumericLike(v) {
+  if (typeof v === 'number') return isFinite(v);
+  if (typeof v === 'string') {
+    const s = v.trim();
+    if (s === '') return false;
+    return /^-?\d+(\.\d+)?$/.test(s);
+  }
+  return false;   // 数组 / 对象 / 布尔 / null / undefined 一律不认
+}
+
+function validateSetConfig(o) {
+  const out = {};
+  const bad = [];
+  if (o.vol !== undefined && o.vol !== null) {
+    const v = Number(o.vol);
+    if (isNumericLike(o.vol) && CFG_VOL_STEPS.indexOf(v) >= 0) out.vol = v; else bad.push('vol=' + JSON.stringify(o.vol));
+  }
+  if (o.bri_idx !== undefined && o.bri_idx !== null) {
+    const b = Number(o.bri_idx);
+    if (isNumericLike(o.bri_idx) && Number.isInteger(b) && b >= 0 && b < CFG_BRI_STEPS.length) out.bri_idx = b; else bad.push('bri_idx=' + JSON.stringify(o.bri_idx));
+  }
+  if (o.screen_off_idx !== undefined && o.screen_off_idx !== null) {
+    const s = Number(o.screen_off_idx);
+    if (isNumericLike(o.screen_off_idx) && Number.isInteger(s) && s >= 0 && s < CFG_SCREEN_OFF_STEPS.length) out.screen_off_idx = s; else bad.push('screen_off_idx=' + JSON.stringify(o.screen_off_idx));
+  }
+  if (bad.length) {
+    return { ok: false, error: '档位不合法（越界/类型错一律拒绝，不 clamp）: ' + bad.join(', '),
+             accept: { vol: CFG_VOL_STEPS, bri_idx: '0~' + (CFG_BRI_STEPS.length - 1), screen_off_idx: '0~' + (CFG_SCREEN_OFF_STEPS.length - 1) } };
+  }
+  if (Object.keys(out).length === 0) {
+    return { ok: false, error: '至少要带一项（vol / bri_idx / screen_off_idx）' };
+  }
+  return { ok: true, out };
+}
+
+// POST /api/cam/cmd/send - S2 前端下发指令给设备（经 S2 后代转发到 S1）
   if (req.method === 'POST' && req.url === '/api/cam/cmd/send') {
     let body = '';
     req.on('data', c => body += c);
@@ -557,6 +616,22 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: '缺少 device_id 或 action' }));
           return;
         }
+
+        // ★ CR-20260921-04：远程下发设备设置（音量/亮度/息屏）—— 校验见模块级 validateSetConfig()
+        if (action === 'set_config') {
+          const v = validateSetConfig(o);
+          if (!v.ok) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(v));
+            return;
+          }
+          camCmdQueue[dev] = Object.assign({ cmd: 'set_config', ts: Date.now() }, v.out);
+          log(`cam 设置入队 -> ${dev}: ${JSON.stringify(v.out)}`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, queued: v.out }));
+          return;
+        }
+
         const cmd = action === 'start' ? 'start_record' : 'stop_record';
         // 34号：透传 mode（full/video/audio）；同时保留 enable_audio 旧字段（由 mode 映射，固件优先认 mode）
         camCmdQueue[dev] = { cmd, ts: Date.now(), interval_ms: Number(o.interval_ms) || 0, max_seconds: Number(o.max_seconds) || 0, sop_id: o.sop_id || "", enable_audio: o.enable_audio !== false, mode: o.mode || "" };
