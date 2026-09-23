@@ -704,7 +704,16 @@ function validateSetConfig(o) {
         shot_ack: st.shot_ack || null,
         shot_ack_at: st.shot_ack_at || null,
         shot_err: st.shot_err || null,
-        shot_err_at: st.shot_err_at || null
+        shot_err_at: st.shot_err_at || null,
+        // ★★ 2026-09-23 新增：把【绑定状态】也报出来 —— 供 S2 判断"该清理谁"
+        //   起因（S2 侧 CR-20260922-01 缺陷）：S2 清理 S1 上的陈旧绑定原来只靠自己的内存缓存，
+        //   重启即失效 ⇒ S1 会一直留着旧绑定。S2 改用「向 S1 要设备清单」后，
+        //   又发现光有 device_id **分不清**「从没绑过」和「绑过但现在该解绑」✗
+        //   ⇒ 把绑定状态一起报出来，S2 才能精确地、且【只清一次】地推 null ✓
+        //   ⚠️ 判据用 `!== undefined` 而不是真值判断：camBindInfo[dev] 可能是
+        //      `null`（= 明确解绑过）—— 那是有效信息，不能当成"不知道"✗
+        bound_student: (camBindInfo[id] && camBindInfo[id].name) ? camBindInfo[id].name : null,
+        bind_known: camBindInfo[id] !== undefined
       };
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
