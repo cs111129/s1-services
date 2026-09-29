@@ -1455,13 +1455,23 @@ function validateSetConfig(o) {
     return String(s == null ? '' : s).replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
   }
   function headLine(res, obj) { res.write(JSON.stringify(obj) + '\n'); }
-  // 一句话 → 16k/单声道/s16le PCM（ffmpeg 输出到 stdout，直接拿到 Buffer）
+  // 一句话 → 16k/单声道/s16le PCM
+  // ★ 用【异步】execFile 而不是 execSync：execSync 会阻塞事件循环，
+  //   而 libuv 的 socket write 是异步的 ⇒ 阻塞期间已排队的响应数据发不出去 ✗
+  //   （这正是设备端实测"头与首块 PCM 只差 1ms"的成因之一 ✓）
+  function ffmpegToPcm(wav) {
+    return new Promise((resolve, reject) => {
+      execFile('ffmpeg', ['-y', '-v', 'error', '-i', wav,
+                          '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-'],
+               { maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' },
+               (err, stdout) => err ? reject(err) : resolve(stdout));
+    });
+  }
   async function sentencePcm(text) {
     const t = await handleTTS(text);
     const wav = path.join(AUDIO_DIR, path.basename(t.audio).replace(/\.mp3$/, '.wav'));
     if (!fs.existsSync(wav)) throw new Error('TTS WAV 不存在');
-    return execSync(`ffmpeg -y -v error -i "${wav}" -f s16le -acodec pcm_s16le -ar 16000 -ac 1 -`,
-                    { maxBuffer: 64 * 1024 * 1024 });
+    return await ffmpegToPcm(wav);
   }
   // 按句切（合并到 ≤60 字一段，避免每句都吃 TTS 的 ~2s 固定开销）
   function splitSentences(text, maxLen) {
@@ -1553,14 +1563,24 @@ function validateSetConfig(o) {
         if (reply.length > cap) reply = reply.slice(0, cap) + '…';
 
         // ★★★ 先把 JSON 头发出去（★ 不等 TTS）—— 设备屏上可以先出字
+        //   ★★ 2026-09-29 设备端实测反馈修的一个真 bug：他们测到"头与首块 PCM 只差 1 毫秒"
+        //      ⇒ "先出字"没兑现。两个成因，都在这三行里堵：
+        //      ① 没关 Nagle ⇒ 内核把小包攒着，等后续数据一起发 ✗
+        //      ② 写完立刻做 TTS（当时还是 execSync 阻塞事件循环）⇒ libuv 的 socket write 是异步的，
+        //         被同步阻塞挡住 = 头根本没出去 ✗
+        //   ⇒ 关 Nagle + flushHeaders + **让出一次事件循环**（setImmediate）把头真发出去，再开始合成
         streamHeaders(res); headSent = true;
+        try { if (res.socket) res.socket.setNoDelay(true); } catch (e) {}
+        try { if (typeof res.flushHeaders === 'function') res.flushHeaders(); } catch (e) {}
         headLine(res, {
           success: true, text: oneLine(heard), reply: oneLine(reply),
           session: device ? (device + '#' + Math.ceil((chatHistoryOf(device) || []).length / 2)) : '',
           sample_rate: 16000, channels: 1, bits: 16, format: 'pcm_s16le'
         });
+        await new Promise(r => setImmediate(r));   // ★ 让 libuv 把上面这一行真正写到 socket 再继续
+        const tHead = Date.now();
         log(`voice-chat-stream 头已发 d=${detail}${selfA ? ' SELF' : ''} heard="${heard.slice(0, 16)}" ` +
-            `reply=${reply.length}字 头耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
+            `reply=${reply.length}字 头耗时=${((tHead - t0) / 1000).toFixed(1)}s`);
 
         // ★ 按句合成 + 立刻推 PCM（生成与播放重叠 ⇒ 只要生成快于播放就不会欠载）
         const sents = splitSentences(reply, 60);
@@ -1569,7 +1589,11 @@ function validateSetConfig(o) {
           sent++;
           try {
             const pcm = await sentencePcm(s);
-            if (pcm && pcm.length) { res.write(pcm); pushed += pcm.length; }
+            if (pcm && pcm.length) {
+              res.write(pcm); pushed += pcm.length;
+              // ★ 首块 PCM 的时间要单独记 —— 否则"头与首块只差 1ms"这类问题看不出来（设备端实测反馈）
+              if (sent === 1) log(`voice-chat-stream 首块 PCM 已推 距头 ${Date.now() - tHead}ms（${pcm.length} 字节）`);
+            }
             else log(`⚠️ voice-chat-stream 第 ${sent} 句 PCM 为空`);
           } catch (e) {
             // ★ 已推的音频照旧 + 正常结束（绝不发半个 PCM 就不管 —— §11.6）
