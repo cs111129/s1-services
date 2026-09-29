@@ -1426,6 +1426,169 @@ function validateSetConfig(o) {
     return;
   }
 
+  /* ============ CR-20260929-03 期2：流式问答端点 ============ */
+  // 契约见协同 spec CR-20260929-03 §11（+ 设备端 §13 的三条补充）：
+  //   ① 响应 = **1 行 JSON 头（以 \n 结尾）** + 连续裸 PCM（16k/单声道/16bit 小端）
+  //   ② ★ **无论成功失败都先发 JSON 头** ⇒ 设备端逻辑统一："读第一行 → 再决定后续"
+  //   ③ ★ **JSON 值里绝不能出现换行**（设备端判据 = "遇到第一个 \n 就是头结束"）
+  //      ⇒ 服务端负责把 text/reply 里的换行压成空格，不让设备去处理
+  //   ④ ★ **头可能跨块到达** ⇒ 我们自证时**不拿"首块能否解析"当判据**（用首字节时间）
+  //   ⑤ ★ nginx 必须 `proxy_buffering off`（否则攒够一整块才转发 ⇒ 流式白做）
+  //      另加 `X-Accel-Buffering: no` 做双保险
+  //   ⑥ 服务端**只发 pcm_s16le**；将来加 μ-law 会显式写 `format:"ulaw8"`（设备端会明确报错，不会当 PCM 硬播）
+  //
+  // ★ 本版实现（v1）：**先发头 → 按句 TTS → 每句转 16k PCM 立刻推**
+  //   头 ≈ ASR+检索+LLM ≈ 3.3s ⇒ **屏上先出字** ✓；首块音频 ≈ +首句 TTS ≈ 6~7s ✓
+  //   ⚠️ 下一步（真流式）：`tts.py` 改 CosyVoice `streaming_call` + 24k→16k 重采样，
+  //      可把**首块音频压到 ~4s**；本版先把"新契约 + 逐句推"跑通（设备端可先接 ✓ 不用等）
+  function streamHeaders(res) {
+    res.writeHead(200, {
+      'Content-Type': 'application/x-dyz-voice-stream',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no',        // ★ 双保险：即使 nginx 配错也不缓冲
+      'X-Dyz-Sample-Rate': '16000', 'X-Dyz-Channels': '1',
+      'X-Dyz-Bits': '16', 'X-Dyz-Format': 'pcm_s16le'
+    });
+  }
+  // ★ 值里禁换行（见上面 ③）
+  function oneLine(s) {
+    return String(s == null ? '' : s).replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+  }
+  function headLine(res, obj) { res.write(JSON.stringify(obj) + '\n'); }
+  // 一句话 → 16k/单声道/s16le PCM（ffmpeg 输出到 stdout，直接拿到 Buffer）
+  async function sentencePcm(text) {
+    const t = await handleTTS(text);
+    const wav = path.join(AUDIO_DIR, path.basename(t.audio).replace(/\.mp3$/, '.wav'));
+    if (!fs.existsSync(wav)) throw new Error('TTS WAV 不存在');
+    return execSync(`ffmpeg -y -v error -i "${wav}" -f s16le -acodec pcm_s16le -ar 16000 -ac 1 -`,
+                    { maxBuffer: 64 * 1024 * 1024 });
+  }
+  // 按句切（合并到 ≤60 字一段，避免每句都吃 TTS 的 ~2s 固定开销）
+  function splitSentences(text, maxLen) {
+    const cap = maxLen || 60;
+    const parts = String(text).split(/(?<=[。！？；!?;])/).map(s => s.trim()).filter(Boolean);
+    const out = []; let cur = '';
+    for (const p of parts) {
+      if ((cur + p).length <= cap) { cur += p; }
+      else { if (cur) out.push(cur); cur = p.length > cap ? p.slice(0, cap) : p; }
+    }
+    if (cur) out.push(cur);
+    return out.length ? out : [String(text).slice(0, cap)];
+  }
+
+  if (req.method === 'POST' && req.url === '/api/voice-chat-stream') {
+    const ct = req.headers['content-type'] || '';
+    const bm = ct.match(/boundary=(.+)/);
+    if (voiceRateLimited(req)) {
+      streamHeaders(res); headLine(res, { success: false, error: 'rate_limited' }); res.end(); return;
+    }
+    if (!bm) {
+      streamHeaders(res); headLine(res, { success: false, error: 'no_boundary' }); res.end(); return;
+    }
+    const chunks = []; let got = 0, tooBig = false;
+    req.on('data', c => {
+      if (tooBig) return;
+      got += c.length;
+      if (got > VOICE_MAX_BODY) { tooBig = true; req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', async () => {
+      if (tooBig) { streamHeaders(res); headLine(res, { success: false, error: 'too_large' }); res.end(); return; }
+      const t0 = Date.now();
+      let headSent = false;
+      const fail = (code) => {
+        try { if (!headSent) { streamHeaders(res); headSent = true; } headLine(res, { success: false, error: code }); } catch (e) {}
+        try { res.end(); } catch (e) {}
+      };
+      try {
+        const parts = parseMultipart(Buffer.concat(chunks), bm[1]);
+        const audioPart = parts.find(p => p.name === 'audio');
+        const devPart = parts.find(p => p.name === 'device');
+        const resetPart = parts.find(p => p.name === 'reset');
+        const detailPart = parts.find(p => p.name === 'detail');
+        const device = devPart ? String(devPart.data.toString('utf8')).trim() : '';
+        const reset = resetPart ? String(resetPart.data.toString('utf8')).trim() : '0';
+        const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
+        if (!audioPart || !audioPart.data || !audioPart.data.length) { fail('no_audio'); return; }
+
+        const asr = await handleASR(audioPart.data);
+        const heard = (asr.text || '').trim();
+        if (!heard) { log('voice-chat-stream: 没听清'); fail('asr_empty'); return; }
+
+        // 人设固定问答 / 知识库检索 / 三档长度 —— 与 /api/voice-chat 同一套逻辑
+        const selfA = selfAnswer(heard);
+        const kb = selfA ? { ok: true, results: [], reliable: false } : await kbSearchForVoice(heard);
+        let reply, usage = null;
+        if (selfA) {
+          reply = selfA;
+        } else if (!kb.ok) {
+          reply = KB_DOWN_REPLY;
+        } else if (!kb.reliable) {
+          log(`voice-chat-stream: 检索不可信（maxScore=${kb.maxScore}）⇒ 答"查不到"，不叫模型`);
+          reply = NO_KB_REPLY;
+        } else {
+          let history = null;
+          if (device) {
+            const s = chatHistoryOf(device);
+            if (reset === '1' && s) s.length = 0;
+            history = s ? s.slice(-VOICE_CHAT_ROUNDS * 2) : null;
+          }
+          try {
+            const ans = await voiceChatAnswer(heard, kb.results, history, detail);
+            reply = ans.reply; usage = ans.usage;
+            if (ans.refused) { log('voice-chat-stream: 模型判定参考内容里没有答案 ⇒ 答"查不到"'); reply = NO_KB_REPLY; }
+          } catch (e) {
+            log(`⚠️ voice-chat-stream LLM 失败: ${e.message}`);
+            fail('llm_failed'); return;
+          }
+          if (!reply) reply = NO_KB_REPLY;
+          if (device) {
+            const s = chatHistoryOf(device);
+            s.push({ role: 'user', content: heard });
+            s.push({ role: 'assistant', content: reply });
+            while (s.length > VOICE_CHAT_ROUNDS * 2) s.shift();
+          }
+        }
+        const cap = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
+        if (reply.length > cap) reply = reply.slice(0, cap) + '…';
+
+        // ★★★ 先把 JSON 头发出去（★ 不等 TTS）—— 设备屏上可以先出字
+        streamHeaders(res); headSent = true;
+        headLine(res, {
+          success: true, text: oneLine(heard), reply: oneLine(reply),
+          session: device ? (device + '#' + Math.ceil((chatHistoryOf(device) || []).length / 2)) : '',
+          sample_rate: 16000, channels: 1, bits: 16, format: 'pcm_s16le'
+        });
+        log(`voice-chat-stream 头已发 d=${detail}${selfA ? ' SELF' : ''} heard="${heard.slice(0, 16)}" ` +
+            `reply=${reply.length}字 头耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
+
+        // ★ 按句合成 + 立刻推 PCM（生成与播放重叠 ⇒ 只要生成快于播放就不会欠载）
+        const sents = splitSentences(reply, 60);
+        let pushed = 0, sent = 0;
+        for (const s of sents) {
+          sent++;
+          try {
+            const pcm = await sentencePcm(s);
+            if (pcm && pcm.length) { res.write(pcm); pushed += pcm.length; }
+            else log(`⚠️ voice-chat-stream 第 ${sent} 句 PCM 为空`);
+          } catch (e) {
+            // ★ 已推的音频照旧 + 正常结束（绝不发半个 PCM 就不管 —— §11.6）
+            log(`⚠️ voice-chat-stream 第 ${sent} 句 TTS 失败，已推 ${pushed} 字节后正常结束: ${e.message}`);
+            break;
+          }
+        }
+        log(`voice-chat-stream ✓ ${sents.length} 句 → 推 PCM ${pushed} 字节 ` +
+            `tokens=${usage ? (usage.prompt_tokens + '/' + usage.completion_tokens) : '-'} ` +
+            `总耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
+        res.end();
+      } catch (e) {
+        log(`⚠️ voice-chat-stream 异常: ${e.message}`);
+        fail('server_error');
+      }
+    });
+    return;
+  }
+
   // GET /api/voice-audio/:filename
   if (req.method === 'GET' && req.url.startsWith('/api/voice-audio/')) {
     // ★★ CR-20260924-01：补 path.basename() 防【目录穿越】✗✗
