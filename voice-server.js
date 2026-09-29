@@ -1127,7 +1127,7 @@ function validateSetConfig(o) {
   const DETAIL_STYLES = {
     1: { max: 40,  tokens: 140, len: '不超过 40 字，1~2 句，只给最核心的一步或结论' },
     2: { max: 90,  tokens: 280, len: '90 字以内，2~3 句，把关键几步说清楚' },
-    3: { max: 300, tokens: 700, len: '300 字以内，把每一步都说全，可以说 4~6 句' },
+    3: { max: 150, tokens: 400, len: '150 字以内，把关键的几步都说全，可以说 3~5 句' },
   };
   function detailOf(v) {
     const n = parseInt(String(v || '').trim(), 10);
