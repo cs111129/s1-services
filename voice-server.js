@@ -161,6 +161,56 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+/* ============ CR-20260924-01：开公网路由前的加固（限大小 + 限频）============ */
+// ★ 为什么【不】用设备密钥 X-Device-Secret 来护这两个端点 —— 这是 grep 过消费者的结论：
+//   · voice-input.js（WebChat 前端语音模块）：**浏览器直调**，放不了密钥 ✗
+//   · openclaw-webchat-channel 的 dist/web/voice-input.js：同上 ✗
+//   · combined-proxy.js / https-proxy.js：也在转发这三条路径 ✓
+//   ⇒ 加设备密钥会把 WebChat 那条【在用的】链路掐断 ⇒
+//     改用单子给的第②个选项：**限 body 大小 + 限频** ——
+//     既护住 DashScope 额度与进程内存，又对任何现有消费者零影响 ✓
+//   ★ 判据：「我找到了一个使用者」≠「我找全了使用者」——
+//     加鉴权之前必须先把消费者 grep 全，否则就是"为了保护一个端点，打断另一个功能"。
+const VOICE_MAX_BODY = parseInt(process.env.VOICE_MAX_BODY || '', 10) || 2 * 1024 * 1024;  // 2MB（8 秒 μ-law ≈128KB，余量足够）
+const VOICE_RATE_WINDOW_MS = 60 * 1000;
+const VOICE_RATE_MAX = parseInt(process.env.VOICE_RATE_MAX || '', 10) || 40;   // 每 IP 每分钟
+const _voiceRate = {};   // ip -> { n, t }
+function voiceClientIp(req) {
+  return String((req.headers['x-forwarded-for'] || '').split(',')[0] || req.socket.remoteAddress || '?').trim();
+}
+// 返回 true = 该拒绝（已限频）
+function voiceRateLimited(req) {
+  const ip = voiceClientIp(req);
+  const now = Date.now();
+  let b = _voiceRate[ip];
+  if (!b || now - b.t > VOICE_RATE_WINDOW_MS) { b = _voiceRate[ip] = { n: 0, t: now }; }
+  b.n++;
+  // 顺手清理过期桶，避免长期运行内存无界增长（每 IP 一个对象）
+  const keys = Object.keys(_voiceRate);
+  if (keys.length > 500) {
+    for (const k of keys) { if (now - _voiceRate[k].t > VOICE_RATE_WINDOW_MS) delete _voiceRate[k]; }
+  }
+  if (b.n > VOICE_RATE_MAX) {
+    // ★ 只在本轮第一次超限时打日志，否则刷屏（设备若进了这个状态会一直打）
+    if (b.n === VOICE_RATE_MAX + 1) log(`⚠️ voice 限频触发: ${ip} 超过 ${VOICE_RATE_MAX} 次/分钟`);
+    return true;
+  }
+  return false;
+}
+// 按 Content-Length 提前拒（拿不到 CL 时靠 on('data') 里边读边数兜底）
+function voiceTooLargeByHeader(req) {
+  const cl = parseInt(req.headers['content-length'] || '0', 10);
+  return cl > VOICE_MAX_BODY;
+}
+function voiceTooLargeReply(res) {
+  res.writeHead(413, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: `请求体过大（上限 ${Math.round(VOICE_MAX_BODY / 1024)}KB）` }));
+}
+function voiceRateReply(res) {
+  res.writeHead(429, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: '请求过于频繁，请稍后再试' }));
+}
+
 function parseMultipart(buffer, boundary) {
   const parts = [];
   const boundaryBuffer = Buffer.from(`--${boundary}`);
@@ -723,6 +773,10 @@ function validateSetConfig(o) {
 
   // POST /api/voice-input - ASR
   if (req.method === 'POST' && req.url === '/api/voice-input') {
+    // ★ CR-20260924-01 加固：限频 + 限大小（开公网路由前必备，见文件上方那段注释）
+    if (voiceRateLimited(req)) { voiceRateReply(res); return; }
+    if (voiceTooLargeByHeader(req)) { voiceTooLargeReply(res); return; }
+
     const contentType = req.headers['content-type'] || '';
     const boundaryMatch = contentType.match(/boundary=(.+)/);
 
@@ -733,8 +787,22 @@ function validateSetConfig(o) {
     }
 
     const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
+    let got = 0, tooBig = false;
+    req.on('data', chunk => {
+      if (tooBig) return;
+      got += chunk.length;
+      // ★ 兜底：拿不到 Content-Length（chunked）时边读边数，超限立刻断，别把整包读进内存
+      if (got > VOICE_MAX_BODY) {
+        tooBig = true;
+        log(`⚠️ voice-input 请求体超限（>${Math.round(VOICE_MAX_BODY / 1024)}KB）已断开: ${voiceClientIp(req)}`);
+        voiceTooLargeReply(res);
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', async () => {
+      if (tooBig) return;
       try {
         const buffer = Buffer.concat(chunks);
         const parts = parseMultipart(buffer, boundaryMatch[1]);
@@ -760,11 +828,35 @@ function validateSetConfig(o) {
 
   // POST /api/tts - TTS
   if (req.method === 'POST' && req.url === '/api/tts') {
+    // ★ CR-20260924-01 加固：限频 + 限大小（同上）
+    if (voiceRateLimited(req)) { voiceRateReply(res); return; }
+    if (voiceTooLargeByHeader(req)) { voiceTooLargeReply(res); return; }
+
     const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
+    let got = 0, tooBig = false;
+    req.on('data', chunk => {
+      if (tooBig) return;
+      got += chunk.length;
+      if (got > VOICE_MAX_BODY) {
+        tooBig = true;
+        log(`⚠️ tts 请求体超限（>${Math.round(VOICE_MAX_BODY / 1024)}KB）已断开: ${voiceClientIp(req)}`);
+        voiceTooLargeReply(res);
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', async () => {
+      if (tooBig) return;
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString());
+        // ★ 文本也要限长：TTS 按字数计费，且超长文本会让 DashScope 调用很久/失败
+        const VOICE_MAX_TEXT = 1000;
+        if (body.text && String(body.text).length > VOICE_MAX_TEXT) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `文本过长（上限 ${VOICE_MAX_TEXT} 字，当前 ${String(body.text).length} 字）` }));
+          return;
+        }
         if (!body.text) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: '缺少 text 参数' }));
@@ -973,8 +1065,30 @@ function validateSetConfig(o) {
 
   // GET /api/voice-audio/:filename
   if (req.method === 'GET' && req.url.startsWith('/api/voice-audio/')) {
-    let filename = req.url.replace('/api/voice-audio/', '');
+    // ★★ CR-20260924-01：补 path.basename() 防【目录穿越】✗✗
+    //   原文：let filename = req.url.replace('/api/voice-audio/', '');
+    //         let filePath = path.join(AUDIO_DIR, filename);
+    //   ⇒ '../../../../../../etc/passwd' 会被 path.join 规范化 ⇒ **爬出 AUDIO_DIR** ✗✗
+    //   ★ 同一文件里 cam-upload(L880) 与 cam-file(L943) 都写了 path.basename 并注明"防穿越" ⇒
+    //     "别处都防了、就这一处没防" = **漏**，不是设计 ✓
+    //   实测（S1 本机直连 18790，curl --path-as-is，6 层 ..）：
+    //     /etc/hostname 200 · /etc/passwd 200 · **/etc/shadow 200(1024B)** · ~/.ssh/authorized_keys 200 ✗✗
+    //   ⚠️ 顺手多写两步（不是多余，是必需）：
+    //     ① 先切掉 '?' 查询串 —— 否则 'x.mp3?token=abc' 整个当文件名 ⇒ 正常取音频会 404
+    //     ② decodeURIComponent —— 否则 %E4%B8%AD 这类中文/编码文件名取不到
+    //   注意顺序：**先切查询串、再 decode、最后 basename** ——
+    //     decode 之后再 basename 才安全（%2e%2e%2f 解出来是 ../，basename 一并吃掉 ✓）
+    const _rawName = String(req.url).replace('/api/voice-audio/', '').split('?')[0];
+    let _decoded;
+    try { _decoded = decodeURIComponent(_rawName); } catch (e) { _decoded = _rawName; }  // 非法 %XX 不炸，按原样
+    const filename = path.basename(_decoded);
+    if (!filename) { res.writeHead(404); res.end('Not Found'); return; }
     let filePath = path.join(AUDIO_DIR, filename);
+    // ★ 双保险：即使将来有人改了上面那行，这一步也能拦住逃逸（belongs-to 校验）
+    if (path.resolve(filePath).indexOf(path.resolve(AUDIO_DIR) + path.sep) !== 0) {
+      log(`⚠️ voice-audio 拦截越界访问: ${req.url}`);
+      res.writeHead(404); res.end('Not Found'); return;
+    }
 
     // 如果有 WAV 版本则优先使用（SoX 无 libmad 不能播 MP3）
     const wavFile = filename.replace('.mp3', '.wav');
