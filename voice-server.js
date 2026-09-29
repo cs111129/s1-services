@@ -1092,7 +1092,38 @@ function validateSetConfig(o) {
   const KB_TIMEOUT_MS = 8000;
   const LLM_TIMEOUT_MS = 12000;
   const VOICE_CHAT_ROUNDS = 3;          // 保留最近 3 轮上下文（内存；重启即丢，丢了当新会话）
-  const VOICE_REPLY_MAX = 200;           // reply 硬上限（设备端要求 ≤60 汉字；屏上只放得下 24 字）
+  const VOICE_REPLY_MAX = 200;          // 兜底上限（实际按 detail 档位走 DETAIL_STYLES）
+  // ★★ 回答长度三档（用户可选，2026-09-29）—— 设备在请求里带 detail=1|2|3
+  //   缺省/非法值一律按【中等】处理（老固件不带这个字段也能用，和 reset 同一套兼容规则）
+  const DETAIL_STYLES = {
+    1: { max: 40,  tokens: 140, len: '不超过 40 字，1~2 句，只给最核心的一步或结论' },
+    2: { max: 90,  tokens: 280, len: '90 字以内，2~3 句，把关键几步说清楚' },
+    3: { max: 300, tokens: 700, len: '300 字以内，把每一步都说全，可以说 4~6 句' },
+  };
+  function detailOf(v) {
+    const n = parseInt(String(v || '').trim(), 10);
+    return DETAIL_STYLES[n] ? n : 2;   // 不传/空/非法 ⇒ 中等
+  }
+  // ★★ 固定问答（人设类）—— 在【检索之前】短路，理由：
+  //   实测教训：问「你是谁」⇒ 知识库 0 命中 ⇒ reliable=false ⇒ 代码直接回"查不到" ✗，
+  //   而人设明明写在 system prompt 第一句 —— 它排在闸门后面，**根本没机会说话**。
+  //   ⇒ 这类问题不该走知识库，也不该让模型自由发挥：一张写死的表，
+  //     确定性 ✓ 零成本 ✓ 零延迟 ✓ 不可能答错 ✓
+  //   ★ 但**不要**顺手放开闲聊：只认这几类"关于你自己/怎么用你"的问题，其余仍走知识库闸门
+  const SELF_QA = [
+    { re: /(你是谁|你叫什么|你的名字|你是哪个|你是什么|你是人吗|介绍一下你)/,
+      a: '我是赋能02的语音助手，你按住按钮问我，我帮你查店里的规定和流程。' },
+    { re: /(你能做什么|你会做什么|你会什么|你有什么用|能帮我做|你能帮我|你能干)/,
+      a: '我能查店里的规定、SOP、考核标准和客诉处理办法，你直接问就行。' },
+    { re: /(怎么用你|怎么使用|你怎么用|怎么用这个|怎么操作你|怎么跟你说话)/,
+      a: '按住按钮说话，松手等我说完就行。' },
+    { re: /(谁做的你|谁开发|你从哪来|你是哪个公司)/,
+      a: '我是店里赋能系统的一部分，专门帮大家查工作上的事。' },
+  ];
+  function selfAnswer(text) {
+    for (const it of SELF_QA) if (it.re.test(text)) return it.a;
+    return null;
+  }           // reply 硬上限（设备端要求 ≤60 汉字；屏上只放得下 24 字）
   const _chatSessions = new Map();      // device -> [{role,content}...]
 
   // 设备专用提示词 —— ★ 独立一套，**不动**学员端那套（那套要"详细完整/8000 tokens"，正好相反）
@@ -1120,7 +1151,7 @@ function validateSetConfig(o) {
     '',
     '【回答怎么写】',
     '· ★ 把关键步骤/要点【说全】，不要为了短而漏步骤；问"怎么处理"就把每一步都说出来。',
-    '· 总长度控制在 150 字以内，通常 2~4 句；不要客套话、不要复述问题、不要重复。',
+    '· 总长度控制在 __LEN__；不要客套话、不要复述问题、不要重复。',
     '· 口语化，像老员工教新人；直接说做法，不要复述问题、不要寒暄。',
     '· 不要 markdown、不要分点、不要星号/括号/井号、不要 emoji —— 会被逐字念出来。',
     '',
@@ -1180,7 +1211,8 @@ function validateSetConfig(o) {
       .trim();
   }
 
-  async function voiceChatAnswer(text, kbResults, history) {
+  async function voiceChatAnswer(text, kbResults, history, detail) {
+    const style = DETAIL_STYLES[detail] || DETAIL_STYLES[2];
     let kbBlock = '';
     if (kbResults.length) {
       kbBlock = '【知识库参考内容】\n' + kbResults.map((r, i) =>
@@ -1188,7 +1220,7 @@ function validateSetConfig(o) {
     } else {
       kbBlock = '【知识库参考内容】\n（没有检索到任何相关内容）';
     }
-    const msgs = [{ role: 'system', content: VOICE_CHAT_SYSTEM + '\n\n' + kbBlock }];
+    const msgs = [{ role: 'system', content: VOICE_CHAT_SYSTEM.replace('__LEN__', style.len) + '\n\n' + kbBlock }];
     if (history) for (const h of history) msgs.push(h);
     msgs.push({ role: 'user', content: text });
 
@@ -1198,7 +1230,7 @@ function validateSetConfig(o) {
       const r = await fetch('https://api.deepseek.com/chat/completions', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${DEEPSEEK_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'deepseek-chat', messages: msgs, temperature: 0, max_tokens: 400 }),
+        body: JSON.stringify({ model: 'deepseek-chat', messages: msgs, temperature: 0, max_tokens: style.tokens }),
         signal: ac.signal
       });
       const j = await r.json();
@@ -1252,6 +1284,8 @@ function validateSetConfig(o) {
         //   不许 400。reset 同理，不带 = "0"（续上下文）。
         const device = devPart ? String(devPart.data.toString('utf8')).trim() : '';
         const reset = resetPart ? String(resetPart.data.toString('utf8')).trim() : '0';
+        const detailPart = parts.find(p => p.name === 'detail');
+        const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
 
         if (!audioPart || !audioPart.data || !audioPart.data.length) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1270,7 +1304,10 @@ function validateSetConfig(o) {
         }
 
         // ② 知识库检索（★ 这一步是"先检索再回答"的核心）
-        const kb = await kbSearchForVoice(heard);
+        // ② ★ 固定问答（人设类）先行短路：这类问题不走知识库
+        const selfA = selfAnswer(heard);
+        // ③ 知识库检索（先检索再回答的核心；自问自答时跳过，省一次调用）
+        const kb = selfA ? { ok: true, results: [], reliable: false } : await kbSearchForVoice(heard);
 
         // ③ 决定回答：检索服务挂了 / 检索结果不可信 / 没这条知识 ⇒ 直接用兜底话术，**不叫模型**
         //    ★★ 这是防"编答案"的关键闸门。实测（2026-09-29）：只靠提示词说"不许编"是不够的 ——
@@ -1278,7 +1315,9 @@ function validateSetConfig(o) {
         //       "录像设备开机后按录制键就开始" ✗ 那是它自己编的。
         //       ⇒ 把判据挪到【代码】里：检索不可信 ⇒ 根本不给它编的机会。
         let reply, usage = null;
-        if (!kb.ok) {
+        if (selfA) {
+          reply = selfA;
+        } else if (!kb.ok) {
           reply = KB_DOWN_REPLY;
         } else if (!kb.reliable) {
           log(`voice-chat: 检索不可信（maxScore=${kb.maxScore}）⇒ 直接答"查不到"，不叫模型`);
@@ -1291,7 +1330,7 @@ function validateSetConfig(o) {
             history = s ? s.slice(-VOICE_CHAT_ROUNDS * 2) : null;
           }
           try {
-            const ans = await voiceChatAnswer(heard, kb.results, history);
+            const ans = await voiceChatAnswer(heard, kb.results, history, detail);
             reply = ans.reply;
             usage = ans.usage;
             if (ans.refused) {
@@ -1317,7 +1356,8 @@ function validateSetConfig(o) {
         }
 
         // ④ ★ 服务端自己截断（别指望设备端，规格书 §4.4 写死了）
-        if (reply.length > VOICE_REPLY_MAX) reply = reply.slice(0, VOICE_REPLY_MAX) + '…';
+        const cap = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
+        if (reply.length > cap) reply = reply.slice(0, cap) + '…';
         if (!reply) reply = NO_KB_REPLY;
 
         // ⑤ TTS
@@ -1334,7 +1374,7 @@ function validateSetConfig(o) {
 
         // ★ 全过程都要留证据：否则出事故时只看到"回复很短"，分不清是
         //   "知识库没命中"（正常）还是"模型没答"（异常）
-        log(`voice-chat ✓ device=${device || '-'} kb=${kb.ok ? kb.results.length : 'DOWN'} ` +
+        log(`voice-chat ✓ device=${device || '-'} d=${detail}${selfA ? ' SELF' : ''} kb=${kb.ok ? kb.results.length : 'DOWN'} ` +
             `rel=${kb.reliable ? 'Y' : 'N'}(${kb.maxScore}) ` +
             `heard="${heard.slice(0, 20)}" reply=${reply.length}字 ` +
             `tokens=${usage ? (usage.prompt_tokens + '/' + usage.completion_tokens) : '-'} ` +
