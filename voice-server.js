@@ -1,4 +1,4 @@
-const http = require('http');
+﻿const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { exec, execFile, execSync } = require('child_process');
@@ -1155,7 +1155,7 @@ function validateSetConfig(o) {
         });
         if (!r.ok) { log(`⚠️ 知识库检索返回 HTTP ${r.status}`); return { ok: false, results: [], reliable: false }; }
         const j = await r.json();
-        return { ok: true, results: (j.results || []).slice(0, 3),
+        return { ok: true, results: (j.results || []).slice(0, 5),
                  reliable: j.reliable === true, maxScore: j.maxScore };
       } finally { clearTimeout(tid); }
     } catch (e) {
