@@ -1092,7 +1092,7 @@ function validateSetConfig(o) {
   const KB_TIMEOUT_MS = 8000;
   const LLM_TIMEOUT_MS = 12000;
   const VOICE_CHAT_ROUNDS = 3;          // 保留最近 3 轮上下文（内存；重启即丢，丢了当新会话）
-  const VOICE_REPLY_MAX = 60;           // reply 硬上限（设备端要求 ≤60 汉字；屏上只放得下 24 字）
+  const VOICE_REPLY_MAX = 200;           // reply 硬上限（设备端要求 ≤60 汉字；屏上只放得下 24 字）
   const _chatSessions = new Map();      // device -> [{role,content}...]
 
   // 设备专用提示词 —— ★ 独立一套，**不动**学员端那套（那套要"详细完整/8000 tokens"，正好相反）
@@ -1109,16 +1109,18 @@ function validateSetConfig(o) {
     '你是「赋能02」培训录制设备的语音助手，服务酒店门店的一线员工。',
     '',
     '【输出格式 · 必须严格照做】',
-    '· 参考内容里如果【有能回答这个问题的信息】，只输出一行：',
+    '· 参考内容里【有相关信息】就回答，只输出一行：',
     '  答：<你的回答>',
-    '  （清单、表格里的条目、流程步骤都算"有信息"；不用原封不动抄，能回答问题就行）',
+    '  （清单、表格条目、流程步骤都算"有信息"；不用逐字照抄，把要点讲全讲顺就行；',
+    '    参考内容给的是通用于所有客诉的流程，也可以直接用来回答某个具体客诉）',
     '· 参考内容里【完全找不到相关信息】时，只输出两个字：',
     '  查不到',
-    '· ⚠️ 判断依据只能是参考内容：哪怕你自己知道答案，参考内容里没有也要输出"查不到"。',
+    '· ⚠️ 可以有依据地归纳，但【不许凭空添加参考内容里没有的步骤】。',
     '· 不要输出解释、不要输出别的任何内容、不要输出"参考内容"这类词。',
     '',
     '【回答怎么写】',
-    '· 最多两句话，总共不超过 40 个字，越短越好。',
+    '· ★ 把关键步骤/要点【说全】，不要为了短而漏步骤；问"怎么处理"就把每一步都说出来。',
+    '· 总长度控制在 150 字以内，通常 2~4 句；不要客套话、不要复述问题、不要重复。',
     '· 口语化，像老员工教新人；直接说做法，不要复述问题、不要寒暄。',
     '· 不要 markdown、不要分点、不要星号/括号/井号、不要 emoji —— 会被逐字念出来。',
     '',
@@ -1196,7 +1198,7 @@ function validateSetConfig(o) {
       const r = await fetch('https://api.deepseek.com/chat/completions', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${DEEPSEEK_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'deepseek-chat', messages: msgs, temperature: 0.3, max_tokens: 160 }),
+        body: JSON.stringify({ model: 'deepseek-chat', messages: msgs, temperature: 0, max_tokens: 400 }),
         signal: ac.signal
       });
       const j = await r.json();
