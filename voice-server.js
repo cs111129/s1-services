@@ -1096,19 +1096,31 @@ function validateSetConfig(o) {
   const _chatSessions = new Map();      // device -> [{role,content}...]
 
   // 设备专用提示词 —— ★ 独立一套，**不动**学员端那套（那套要"详细完整/8000 tokens"，正好相反）
+  //
+  // ★★ 为什么要求"强制二选一 + 固定前缀"（2026-09-29 实测教训）：
+  //   第一版只在提示词里写"参考内容没有答案就说不知道"，实测**模型照样编** ——
+  //   问「录像怎么开始」（知识库里根本没有设备说明），它答出了
+  //   "录像设备开机后按录制键就开始" ✗ 那是它自己编的。
+  //   ⇒ 光靠"不许编"这种祈使句约束不住；改成【强制二选一 + 代码校验前缀】：
+  //     模型必须选一个分支输出，代码再检查格式 —— 格式不对就当成"查不到"。
+  //   ⇒ 失败模式从"编一个答案"变成"说查不到"，这是我们要的方向
+  //     （给学员用，编错流程比查不到坏得多）。
   const VOICE_CHAT_SYSTEM = [
     '你是「赋能02」培训录制设备的语音助手，服务酒店门店的一线员工。',
     '',
-    '【最重要的规则】',
-    '1. 只依据下面【知识库参考内容】回答。参考内容里没有答案时，直接说「这个我查不到，你问下店长吧」。',
-    '2. 绝对不许用你自己的知识补充、推测或编造步骤 —— 宁可说不知道。（员工会照着做，编错了会出事）',
-    '3. 不要提「知识库」「参考内容」「资料」这些词，就像同事随口告诉你一样。',
+    '【输出格式 · 必须严格照做】',
+    '· 如果下面【知识库参考内容】里【直接回答了这个问题的句子】，只输出一行：',
+    '  答：<你的回答>',
+    '· 如果没有（包括"只是恰好出现了问题里的字词、但并没回答它"），只输出两个字：',
+    '  查不到',
+    '· 不要输出解释、不要输出标点以外的任何内容、不要输出"参考内容"这类词。',
     '',
-    '【怎么说话】',
+    '【回答怎么写】',
     '· 最多两句话，总共不超过 40 个字，越短越好。',
-    '· 口语化，像老员工教新人。',
-    '· 不要 markdown、不要分点、不要星号/括号/井号、不要 emoji —— 这些会被逐字念出来。',
-    '· 直接说做法，不要复述问题、不要寒暄。'
+    '· 口语化，像老员工教新人；直接说做法，不要复述问题、不要寒暄。',
+    '· 不要 markdown、不要分点、不要星号/括号/井号、不要 emoji —— 会被逐字念出来。',
+    '',
+    '【绝对不许】用你自己的知识补充、推测或编造步骤 —— 员工会照着做，编错了会出事。'
   ].join('\n');
 
   // 取该设备的上下文数组（没有 device 就返回 null = 无会话）
@@ -1123,8 +1135,11 @@ function validateSetConfig(o) {
     return s;
   }
 
-  // 查知识库。★ 返回 {ok:true, results} / {ok:false} —— 必须区分
-  //   「检索成功但没这条知识」和「检索服务挂了」（"未知 ≠ 零"，两者对用户说的话不一样）
+  // 查知识库。★ 返回 {ok, results, reliable} —— 三个状态必须分开：
+  //   ok=false            ⇒ 检索服务不可用（跟用户说"稍后再问"，不是"没这条知识"）
+  //   ok=true reliable=false ⇒ 检索到了但【都不靠谱】（弱命中）⇒ 直接说查不到，不叫模型
+  //   ok=true reliable=true  ⇒ 有稀有词支撑 ⇒ 才敢让模型组织语言
+  //   ★ "未知 ≠ 零"：把"服务挂了"和"没这条知识"说成同一句话，会让人查错方向
   async function kbSearchForVoice(query) {
     try {
       const ac = new AbortController();
@@ -1136,13 +1151,14 @@ function validateSetConfig(o) {
           body: JSON.stringify({ query: String(query).slice(0, 200) }),
           signal: ac.signal
         });
-        if (!r.ok) { log(`⚠️ 知识库检索返回 HTTP ${r.status}`); return { ok: false, results: [] }; }
+        if (!r.ok) { log(`⚠️ 知识库检索返回 HTTP ${r.status}`); return { ok: false, results: [], reliable: false }; }
         const j = await r.json();
-        return { ok: true, results: (j.results || []).slice(0, 3) };
+        return { ok: true, results: (j.results || []).slice(0, 3),
+                 reliable: j.reliable === true, maxScore: j.maxScore };
       } finally { clearTimeout(tid); }
     } catch (e) {
       log(`⚠️ 知识库检索失败: ${e.message}`);
-      return { ok: false, results: [] };
+      return { ok: false, results: [], reliable: false };
     }
   }
 
@@ -1184,7 +1200,13 @@ function validateSetConfig(o) {
       const j = await r.json();
       if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
       const content = j.choices && j.choices[0] && j.choices[0].message.content;
-      return { reply: cleanReply(content), usage: j.usage || null };
+      // ★★ 代码校验契约：只接受 `答：xxx` 这一种格式；其余（含"查不到"、
+      //    以及任何没按格式来的胡说）一律当成"没有可依据的答案"。
+      //    这一步是防编造的最后一道闸门 —— 不依赖模型"自觉"。
+      const raw = String(content || '').trim();
+      const m = /^答\s*[:：]\s*([\s\S]+)$/.exec(raw);
+      const okAnswer = !!(m && m[1].trim());
+      return { reply: okAnswer ? cleanReply(m[1]) : '', refused: !okAnswer, raw: raw.slice(0, 60), usage: j.usage || null };
     } finally { clearTimeout(tid); }
   }
 
@@ -1246,12 +1268,16 @@ function validateSetConfig(o) {
         // ② 知识库检索（★ 这一步是"先检索再回答"的核心）
         const kb = await kbSearchForVoice(heard);
 
-        // ③ 决定回答：检索服务挂了 / 没这条知识 ⇒ 直接用兜底话术，**不叫模型**
-        //    （省一次调用，更重要的是【保证不会张口编】）
+        // ③ 决定回答：检索服务挂了 / 检索结果不可信 / 没这条知识 ⇒ 直接用兜底话术，**不叫模型**
+        //    ★★ 这是防"编答案"的关键闸门。实测（2026-09-29）：只靠提示词说"不许编"是不够的 ——
+        //       问「录像怎么开始」（知识库里根本没有设备说明），模型照样答出
+        //       "录像设备开机后按录制键就开始" ✗ 那是它自己编的。
+        //       ⇒ 把判据挪到【代码】里：检索不可信 ⇒ 根本不给它编的机会。
         let reply, usage = null;
         if (!kb.ok) {
           reply = KB_DOWN_REPLY;
-        } else if (!kb.results.length) {
+        } else if (!kb.reliable) {
+          log(`voice-chat: 检索不可信（maxScore=${kb.maxScore}）⇒ 直接答"查不到"，不叫模型`);
           reply = NO_KB_REPLY;
         } else {
           let history = null;
@@ -1264,12 +1290,19 @@ function validateSetConfig(o) {
             const ans = await voiceChatAnswer(heard, kb.results, history);
             reply = ans.reply;
             usage = ans.usage;
+            if (ans.refused) {
+              log(`voice-chat: 模型判定参考内容里没有答案（raw="${ans.raw}"）⇒ 答"查不到"`);
+              reply = NO_KB_REPLY;
+            }
           } catch (e) {
             log(`⚠️ voice-chat LLM 失败: ${e.message}`);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: 'llm_failed' }));
             return;
           }
+          // ★ 模型有时候还是会绕开"不知道"去编 ⇒ 再过一道：回复里出现明确兜底词就采用，
+          //   否则要求它至少在参考内容里找得到依据（这里只做长度与空值兜底，不做语义判断）
+          if (!reply) reply = NO_KB_REPLY;
           // 写回上下文（只存真的答过的轮次）
           if (device) {
             const s = chatHistoryOf(device);
@@ -1298,6 +1331,7 @@ function validateSetConfig(o) {
         // ★ 全过程都要留证据：否则出事故时只看到"回复很短"，分不清是
         //   "知识库没命中"（正常）还是"模型没答"（异常）
         log(`voice-chat ✓ device=${device || '-'} kb=${kb.ok ? kb.results.length : 'DOWN'} ` +
+            `rel=${kb.reliable ? 'Y' : 'N'}(${kb.maxScore}) ` +
             `heard="${heard.slice(0, 20)}" reply=${reply.length}字 ` +
             `tokens=${usage ? (usage.prompt_tokens + '/' + usage.completion_tokens) : '-'} ` +
             `耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
