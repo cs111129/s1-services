@@ -1077,6 +1077,248 @@ function validateSetConfig(o) {
     return;
   }
 
+  /* ============ CR-20260929-01：设备问 → 知识库检索 → AI 答 → TTS ============ */
+  // 设备端硬约束（#42 内存）：一轮只许【2 次 TLS 握手】⇒ ASR+检索+LLM+TTS 必须在
+  //   同一个请求里串完，一次返回 {text, reply, audio}（设备再 GET 音频）。
+  //   ✗ 不能设计成"设备再来问一次答案"—— 那要多一次握手。
+  //
+  // ★★ 与 CR 规格书的差别（★ 重要）：规格书按"直接调 DeepSeek 答"写的，
+  //    但用户要的是【先检索知识库、再回答】⇒ 这里多了一步 S2 的知识库检索。
+  //    没有这一步，模型会用它自己的知识编答案 —— 给学员用，编一个错流程比说"不知道"坏得多。
+  //
+  // ★ 为什么检索走 S2：知识库与 kb-search 服务都在 S2（18906），
+  //   公网路由 https://ai.hiiin.com/api/kb-search 现成，实测 S1→S2 0.12~0.27s。
+  const KB_SEARCH_URL = process.env.KB_SEARCH_URL || 'https://ai.hiiin.com/api/kb-search';
+  const KB_TIMEOUT_MS = 8000;
+  const LLM_TIMEOUT_MS = 12000;
+  const VOICE_CHAT_ROUNDS = 3;          // 保留最近 3 轮上下文（内存；重启即丢，丢了当新会话）
+  const VOICE_REPLY_MAX = 60;           // reply 硬上限（设备端要求 ≤60 汉字；屏上只放得下 24 字）
+  const _chatSessions = new Map();      // device -> [{role,content}...]
+
+  // 设备专用提示词 —— ★ 独立一套，**不动**学员端那套（那套要"详细完整/8000 tokens"，正好相反）
+  const VOICE_CHAT_SYSTEM = [
+    '你是「赋能02」培训录制设备的语音助手，服务酒店门店的一线员工。',
+    '',
+    '【最重要的规则】',
+    '1. 只依据下面【知识库参考内容】回答。参考内容里没有答案时，直接说「这个我查不到，你问下店长吧」。',
+    '2. 绝对不许用你自己的知识补充、推测或编造步骤 —— 宁可说不知道。（员工会照着做，编错了会出事）',
+    '3. 不要提「知识库」「参考内容」「资料」这些词，就像同事随口告诉你一样。',
+    '',
+    '【怎么说话】',
+    '· 最多两句话，总共不超过 40 个字，越短越好。',
+    '· 口语化，像老员工教新人。',
+    '· 不要 markdown、不要分点、不要星号/括号/井号、不要 emoji —— 这些会被逐字念出来。',
+    '· 直接说做法，不要复述问题、不要寒暄。'
+  ].join('\n');
+
+  // 取该设备的上下文数组（没有 device 就返回 null = 无会话）
+  function chatHistoryOf(device) {
+    if (!device) return null;
+    let s = _chatSessions.get(device);
+    if (!s) { s = []; _chatSessions.set(device, s); }
+    if (_chatSessions.size > 500) {          // 防无界增长
+      const first = _chatSessions.keys().next().value;
+      if (first !== device) _chatSessions.delete(first);
+    }
+    return s;
+  }
+
+  // 查知识库。★ 返回 {ok:true, results} / {ok:false} —— 必须区分
+  //   「检索成功但没这条知识」和「检索服务挂了」（"未知 ≠ 零"，两者对用户说的话不一样）
+  async function kbSearchForVoice(query) {
+    try {
+      const ac = new AbortController();
+      const tid = setTimeout(() => ac.abort(), KB_TIMEOUT_MS);
+      try {
+        const r = await fetch(KB_SEARCH_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: String(query).slice(0, 200) }),
+          signal: ac.signal
+        });
+        if (!r.ok) { log(`⚠️ 知识库检索返回 HTTP ${r.status}`); return { ok: false, results: [] }; }
+        const j = await r.json();
+        return { ok: true, results: (j.results || []).slice(0, 3) };
+      } finally { clearTimeout(tid); }
+    } catch (e) {
+      log(`⚠️ 知识库检索失败: ${e.message}`);
+      return { ok: false, results: [] };
+    }
+  }
+
+  // 兜底话术（检索不到 / 检索服务不可用）
+  const NO_KB_REPLY = '这个我查不到，你问下店长吧。';
+  const KB_DOWN_REPLY = '我这边知识库暂时连不上，你稍后再问一次吧。';
+
+  function cleanReply(s) {
+    return String(s || '')
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/[*#`>_~|]/g, '')          // markdown 记号：TTS 会逐字念
+      .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '')  // emoji
+      .replace(/\[[^\]]*\]|（[^）]*注[^）]*）|\([^)]*注[^)]*\)/g, '')      // 括号注释
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  async function voiceChatAnswer(text, kbResults, history) {
+    let kbBlock = '';
+    if (kbResults.length) {
+      kbBlock = '【知识库参考内容】\n' + kbResults.map((r, i) =>
+        `[${i + 1}] ${r.file}\n${r.snippet}`).join('\n\n');
+    } else {
+      kbBlock = '【知识库参考内容】\n（没有检索到任何相关内容）';
+    }
+    const msgs = [{ role: 'system', content: VOICE_CHAT_SYSTEM + '\n\n' + kbBlock }];
+    if (history) for (const h of history) msgs.push(h);
+    msgs.push({ role: 'user', content: text });
+
+    const ac = new AbortController();
+    const tid = setTimeout(() => ac.abort(), LLM_TIMEOUT_MS);
+    try {
+      const r = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${DEEPSEEK_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-chat', messages: msgs, temperature: 0.3, max_tokens: 160 }),
+        signal: ac.signal
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
+      const content = j.choices && j.choices[0] && j.choices[0].message.content;
+      return { reply: cleanReply(content), usage: j.usage || null };
+    } finally { clearTimeout(tid); }
+  }
+
+  if (req.method === 'POST' && req.url === '/api/voice-chat') {
+    if (voiceRateLimited(req)) { voiceRateReply(res); return; }
+    if (voiceTooLargeByHeader(req)) { voiceTooLargeReply(res); return; }
+
+    const contentType = req.headers['content-type'] || '';
+    const boundaryMatch = contentType.match(/boundary=(.+)/);
+    if (!boundaryMatch) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'no_boundary' }));
+      return;
+    }
+
+    const chunks = [];
+    let got = 0, tooBig = false;
+    req.on('data', chunk => {
+      if (tooBig) return;
+      got += chunk.length;
+      if (got > VOICE_MAX_BODY) {
+        tooBig = true;
+        log(`⚠️ voice-chat 请求体超限（>${Math.round(VOICE_MAX_BODY / 1024)}KB）已断开: ${voiceClientIp(req)}`);
+        voiceTooLargeReply(res);
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', async () => {
+      if (tooBig) return;
+      const t0 = Date.now();
+      try {
+        const parts = parseMultipart(Buffer.concat(chunks), boundaryMatch[1]);
+        const audioPart = parts.find(p => p.name === 'audio');
+        const devPart = parts.find(p => p.name === 'device');
+        const resetPart = parts.find(p => p.name === 'reset');
+        // ★ "字段不存在" ≠ "值为空"（规格书 §4.4）：老固件不带 device ⇒ 按【无会话】处理，
+        //   不许 400。reset 同理，不带 = "0"（续上下文）。
+        const device = devPart ? String(devPart.data.toString('utf8')).trim() : '';
+        const reset = resetPart ? String(resetPart.data.toString('utf8')).trim() : '0';
+
+        if (!audioPart || !audioPart.data || !audioPart.data.length) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'no_audio' }));
+          return;
+        }
+
+        // ① ASR
+        const asr = await handleASR(audioPart.data);
+        const heard = (asr.text || '').trim();
+        if (!heard) {
+          log(`voice-chat: 没听清（device=${device || '-'}）`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'asr_empty' }));
+          return;
+        }
+
+        // ② 知识库检索（★ 这一步是"先检索再回答"的核心）
+        const kb = await kbSearchForVoice(heard);
+
+        // ③ 决定回答：检索服务挂了 / 没这条知识 ⇒ 直接用兜底话术，**不叫模型**
+        //    （省一次调用，更重要的是【保证不会张口编】）
+        let reply, usage = null;
+        if (!kb.ok) {
+          reply = KB_DOWN_REPLY;
+        } else if (!kb.results.length) {
+          reply = NO_KB_REPLY;
+        } else {
+          let history = null;
+          if (device) {
+            const s = chatHistoryOf(device);
+            if (reset === '1' && s) s.length = 0;
+            history = s ? s.slice(-VOICE_CHAT_ROUNDS * 2) : null;
+          }
+          try {
+            const ans = await voiceChatAnswer(heard, kb.results, history);
+            reply = ans.reply;
+            usage = ans.usage;
+          } catch (e) {
+            log(`⚠️ voice-chat LLM 失败: ${e.message}`);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'llm_failed' }));
+            return;
+          }
+          // 写回上下文（只存真的答过的轮次）
+          if (device) {
+            const s = chatHistoryOf(device);
+            s.push({ role: 'user', content: heard });
+            s.push({ role: 'assistant', content: reply });
+            while (s.length > VOICE_CHAT_ROUNDS * 2) s.shift();
+          }
+        }
+
+        // ④ ★ 服务端自己截断（别指望设备端，规格书 §4.4 写死了）
+        if (reply.length > VOICE_REPLY_MAX) reply = reply.slice(0, VOICE_REPLY_MAX) + '…';
+        if (!reply) reply = NO_KB_REPLY;
+
+        // ⑤ TTS
+        let audioPath = '';
+        try {
+          const t = await handleTTS(reply);
+          audioPath = t.audio || '';
+        } catch (e) {
+          log(`⚠️ voice-chat TTS 失败: ${e.message}`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'tts_failed' }));
+          return;
+        }
+
+        // ★ 全过程都要留证据：否则出事故时只看到"回复很短"，分不清是
+        //   "知识库没命中"（正常）还是"模型没答"（异常）
+        log(`voice-chat ✓ device=${device || '-'} kb=${kb.ok ? kb.results.length : 'DOWN'} ` +
+            `heard="${heard.slice(0, 20)}" reply=${reply.length}字 ` +
+            `tokens=${usage ? (usage.prompt_tokens + '/' + usage.completion_tokens) : '-'} ` +
+            `耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
+
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+          success: true,
+          text: heard,
+          reply: reply,
+          audio: audioPath,
+          session: device ? (device + '#' + Math.ceil((chatHistoryOf(device) || []).length / 2)) : ''
+        }, null, 0));
+      } catch (e) {
+        log(`⚠️ voice-chat 异常: ${e.message}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'asr_failed' }));
+      }
+    });
+    return;
+  }
+
   // GET /api/voice-audio/:filename
   if (req.method === 'GET' && req.url.startsWith('/api/voice-audio/')) {
     // ★★ CR-20260924-01：补 path.basename() 防【目录穿越】✗✗
