@@ -27,9 +27,15 @@ ssh root@120.26.114.222 "cd /root/.openclaw/陈盛工作区/项目/语音交互 
 | `/api/cam/*` | 设备密钥 `X-Device-Secret` | 赋能1号视觉板 · S2（`student-data.js` + `auth-service.js`） |
 
 ★★ **两个语音端点【不能】加 `X-Device-Secret`** —— WebChat 那条是**浏览器直调**，放不了密钥 ✗
-⇒ 保护手段是 **app 内限频（40 次/分/IP）+ 限 body（2MB）+ TTS 文本 ≤1000 字**
+⇒ 保护手段是 **app 内限频（120 次/分/IP）+ 限 body（2MB）+ TTS 文本 ≤1000 字**
 （见配置手册 **§121.4**）。要动之前先 grep 消费者：
 `grep -rn "voice-input\|/api/tts\|voice-audio" /root /var/www --include='*.js' --include='*.html'`
+
+★★ **限频取 IP 必须用 `X-Real-IP`，不能用 `X-Forwarded-For` 的第一个** ✗
+nginx 的 `$proxy_add_x_forwarded_for` 是**追加**语义 ⇒ 客户端能把自己的假 IP 排到最前面 ⇒
+**限频可被一个请求头绕过**（2026-09-29 实测：轮换假 XFF 连打 130 次 **0 拦截** ✗；改 `X-Real-IP` 后第 **121** 次 429 ✓）
+- 谁在用这套限频：`voiceClientIp()` / `voiceRateLimited()`（`VOICE_RATE_MAX` / `VOICE_MAX_BODY` 可用环境变量覆盖）
+- ★ 门店 NAT 后设备 + 多台手机会**共用一个公网 IP** ⇒ 限额别调太紧（40 就会出假 429，现为 120）
 
 ## nginx 相关（S1 上的 cam/voice 路由）
 
