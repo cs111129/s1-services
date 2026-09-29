@@ -292,7 +292,13 @@ function globTtsChunks() {
 }
 
 // TTS: 文字 → 音频
-async function handleTTS(text) {
+//   ★ audioFmt（CR-20260929-03 §16.4，设备端建议的字段名）：
+//     'pcm16'（缺省）/ 'ulaw8' ⇒ 生成的 .wav 用 8bit μ-law（tag=7, 16k）
+//     ⇒ ★ 体积直接减半（16k/16bit=32KB/s → 16k/8bit=16KB/s）
+//     ⇒ 设备端 §16 已验完 μ-law 解码（查表 + 正经遍历 RIFF 块找 fmt/data）✓
+//     ⚠️ 默认必须是 pcm16 —— 浏览器/WebChat 也在用 /api/tts，它们没有 μ-law 解码器 ✗
+async function handleTTS(text, audioFmt) {
+  const ulaw = (audioFmt === 'ulaw8');
   const timestamp = Date.now();
   const ttsMp3 = `tts-${timestamp}.mp3`;
   const ttsWav = `tts-${timestamp}.wav`;
@@ -327,8 +333,10 @@ async function handleTTS(text) {
     }
 
     // 同时生成 WAV 版本（SoX 无 libmad 无法播 MP3）
+    //   ★ ulaw8 时改用 pcm_mulaw（8bit，tag=7）—— 设备端按 fmt 块自适应 ✓
     try {
-      execSync(`ffmpeg -y -i "${mp3Target}" -acodec pcm_s16le -ar 16000 -ac 1 "${wavTarget}"`, { stdio: 'pipe', timeout: 15000 });
+      const ac = ulaw ? 'pcm_mulaw' : 'pcm_s16le';
+      execSync(`ffmpeg -y -i "${mp3Target}" -acodec ${ac} -ar 16000 -ac 1 "${wavTarget}"`, { stdio: 'pipe', timeout: 15000 });
     } catch(e) {
       log(`WAV 转码失败(不影响 MP3): ${e.message}`);
     }
@@ -1315,6 +1323,9 @@ function validateSetConfig(o) {
         const reset = resetPart ? String(resetPart.data.toString('utf8')).trim() : '0';
         const detailPart = parts.find(p => p.name === 'detail');
         const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
+        // ★ audio_fmt 对老路也生效（CR-20260929-03 §16.4）—— fallback 那条路同样能省一半流量
+        const fmtPartOld = parts.find(p => p.name === 'audio_fmt');
+        const afmt = (fmtPartOld && String(fmtPartOld.data.toString('utf8')).trim() === 'ulaw8') ? 'ulaw8' : 'pcm16';
 
         if (!audioPart || !audioPart.data || !audioPart.data.length) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1392,7 +1403,7 @@ function validateSetConfig(o) {
         // ⑤ TTS
         let audioPath = '';
         try {
-          const t = await handleTTS(reply);
+          const t = await handleTTS(reply, afmt);
           audioPath = t.audio || '';
         } catch (e) {
           log(`⚠️ voice-chat TTS 失败: ${e.message}`);
@@ -1441,13 +1452,14 @@ function validateSetConfig(o) {
   //   头 ≈ ASR+检索+LLM ≈ 3.3s ⇒ **屏上先出字** ✓；首块音频 ≈ +首句 TTS ≈ 6~7s ✓
   //   ⚠️ 下一步（真流式）：`tts.py` 改 CosyVoice `streaming_call` + 24k→16k 重采样，
   //      可把**首块音频压到 ~4s**；本版先把"新契约 + 逐句推"跑通（设备端可先接 ✓ 不用等）
-  function streamHeaders(res) {
+  function streamHeaders(res, afmt) {
+    const ulaw = (afmt === 'ulaw8');
     res.writeHead(200, {
       'Content-Type': 'application/x-dyz-voice-stream',
       'Cache-Control': 'no-cache',
       'X-Accel-Buffering': 'no',        // ★ 双保险：即使 nginx 配错也不缓冲
       'X-Dyz-Sample-Rate': '16000', 'X-Dyz-Channels': '1',
-      'X-Dyz-Bits': '16', 'X-Dyz-Format': 'pcm_s16le'
+      'X-Dyz-Bits': ulaw ? '8' : '16', 'X-Dyz-Format': ulaw ? 'ulaw8' : 'pcm_s16le'
     });
   }
   // ★ 值里禁换行（见上面 ③）
@@ -1459,19 +1471,22 @@ function validateSetConfig(o) {
   // ★ 用【异步】execFile 而不是 execSync：execSync 会阻塞事件循环，
   //   而 libuv 的 socket write 是异步的 ⇒ 阻塞期间已排队的响应数据发不出去 ✗
   //   （这正是设备端实测"头与首块 PCM 只差 1ms"的成因之一 ✓）
-  function ffmpegToPcm(wav) {
+  function ffmpegToPcm(wav, fmt) {
+    const ulaw = (fmt === 'ulaw8');
     return new Promise((resolve, reject) => {
       execFile('ffmpeg', ['-y', '-v', 'error', '-i', wav,
-                          '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-'],
+                          '-f', ulaw ? 'mulaw' : 's16le',
+                          '-acodec', ulaw ? 'pcm_mulaw' : 'pcm_s16le',
+                          '-ar', '16000', '-ac', '1', '-'],
                { maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' },
                (err, stdout) => err ? reject(err) : resolve(stdout));
     });
   }
-  async function sentencePcm(text) {
-    const t = await handleTTS(text);
+  async function sentencePcm(text, fmt) {
+    const t = await handleTTS(text, fmt);
     const wav = path.join(AUDIO_DIR, path.basename(t.audio).replace(/\.mp3$/, '.wav'));
     if (!fs.existsSync(wav)) throw new Error('TTS WAV 不存在');
-    return await ffmpegToPcm(wav);
+    return await ffmpegToPcm(wav, fmt);
   }
   // 按句切（合并到 ≤60 字一段，避免每句都吃 TTS 的 ~2s 固定开销）
   function splitSentences(text, maxLen) {
@@ -1516,9 +1531,12 @@ function validateSetConfig(o) {
         const devPart = parts.find(p => p.name === 'device');
         const resetPart = parts.find(p => p.name === 'reset');
         const detailPart = parts.find(p => p.name === 'detail');
+        const fmtPart = parts.find(p => p.name === 'audio_fmt');
         const device = devPart ? String(devPart.data.toString('utf8')).trim() : '';
         const reset = resetPart ? String(resetPart.data.toString('utf8')).trim() : '0';
         const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
+        // ★ audio_fmt：'pcm16'(缺省) / 'ulaw8'（设备端 §16.4 建议的字段名）—— 非法值一律按 pcm16，不报错
+        const afmt = (fmtPart && String(fmtPart.data.toString('utf8')).trim() === 'ulaw8') ? 'ulaw8' : 'pcm16';
         if (!audioPart || !audioPart.data || !audioPart.data.length) { fail('no_audio'); return; }
 
         const asr = await handleASR(audioPart.data);
@@ -1569,17 +1587,18 @@ function validateSetConfig(o) {
         //      ② 写完立刻做 TTS（当时还是 execSync 阻塞事件循环）⇒ libuv 的 socket write 是异步的，
         //         被同步阻塞挡住 = 头根本没出去 ✗
         //   ⇒ 关 Nagle + flushHeaders + **让出一次事件循环**（setImmediate）把头真发出去，再开始合成
-        streamHeaders(res); headSent = true;
+        streamHeaders(res, afmt); headSent = true;
         try { if (res.socket) res.socket.setNoDelay(true); } catch (e) {}
         try { if (typeof res.flushHeaders === 'function') res.flushHeaders(); } catch (e) {}
         headLine(res, {
           success: true, text: oneLine(heard), reply: oneLine(reply),
           session: device ? (device + '#' + Math.ceil((chatHistoryOf(device) || []).length / 2)) : '',
-          sample_rate: 16000, channels: 1, bits: 16, format: 'pcm_s16le'
+          sample_rate: 16000, channels: 1,
+          bits: afmt === 'ulaw8' ? 8 : 16, format: afmt === 'ulaw8' ? 'ulaw8' : 'pcm_s16le'
         });
         await new Promise(r => setImmediate(r));   // ★ 让 libuv 把上面这一行真正写到 socket 再继续
         const tHead = Date.now();
-        log(`voice-chat-stream 头已发 d=${detail}${selfA ? ' SELF' : ''} heard="${heard.slice(0, 16)}" ` +
+        log(`voice-chat-stream 头已发 d=${detail} fmt=${afmt}${selfA ? ' SELF' : ''} heard="${heard.slice(0, 16)}" ` +
             `reply=${reply.length}字 头耗时=${((tHead - t0) / 1000).toFixed(1)}s`);
 
         // ★ 按句合成 + 立刻推 PCM（生成与播放重叠 ⇒ 只要生成快于播放就不会欠载）
@@ -1588,7 +1607,7 @@ function validateSetConfig(o) {
         for (const s of sents) {
           sent++;
           try {
-            const pcm = await sentencePcm(s);
+            const pcm = await sentencePcm(s, afmt);
             if (pcm && pcm.length) {
               res.write(pcm); pushed += pcm.length;
               // ★ 首块 PCM 的时间要单独记 —— 否则"头与首块只差 1ms"这类问题看不出来（设备端实测反馈）
