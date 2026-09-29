@@ -173,10 +173,24 @@ function log(msg) {
 //     加鉴权之前必须先把消费者 grep 全，否则就是"为了保护一个端点，打断另一个功能"。
 const VOICE_MAX_BODY = parseInt(process.env.VOICE_MAX_BODY || '', 10) || 2 * 1024 * 1024;  // 2MB（8 秒 μ-law ≈128KB，余量足够）
 const VOICE_RATE_WINDOW_MS = 60 * 1000;
-const VOICE_RATE_MAX = parseInt(process.env.VOICE_RATE_MAX || '', 10) || 40;   // 每 IP 每分钟
+// ★ 每 IP 每分钟。默认 120 而不是 40 —— 一次语音交互 = 1 ASR + 1 TTS（2 次请求），
+//   120 ⇒ 每分钟 60 轮对话，远高于真实用量；但门店 NAT 后面可能同时有
+//   设备 + 几台手机（共用一个公网 IP）⇒ 40 会偏紧，容易打出假 429 ✗
+const VOICE_RATE_MAX = parseInt(process.env.VOICE_RATE_MAX || '', 10) || 120;
 const _voiceRate = {};   // ip -> { n, t }
+// ★★ 取客户端 IP：**必须优先 X-Real-IP，不能用 X-Forwarded-For 的第一个** ✗
+//   原因：nginx 那边两个头来源不同 ——
+//     · `X-Real-IP $remote_addr`        = nginx 拿到的真实对端地址，**客户端伪造不了** ✓
+//     · `X-Forwarded-For $proxy_add_x_forwarded_for` = **在客户端传来的 XFF 后面追加** ⇒
+//       客户端只要先发一个 `X-Forwarded-For: 1.2.3.4`，它就会排在**最前面**，
+//       而我原来取 `split(',')[0]` ⇒ **每次换一个假 IP 就能绕过限频** ✗✗（等于没限）
+//   ⇒ 改：X-Real-IP 优先；没有它才退回 XFF；再没有才用 socket 地址
 function voiceClientIp(req) {
-  return String((req.headers['x-forwarded-for'] || '').split(',')[0] || req.socket.remoteAddress || '?').trim();
+  const real = String(req.headers['x-real-ip'] || '').trim();
+  if (real) return real;
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  if (xff) return xff;
+  return String(req.socket.remoteAddress || '?').trim();
 }
 // 返回 true = 该拒绝（已限频）
 function voiceRateLimited(req) {
