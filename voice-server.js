@@ -279,6 +279,18 @@ async function handleASR(audioData) {
   }
 }
 
+// ★ 找出本次 tts.py 产出的分段文件（/tmp/tts-chunk-<n>.mp3），按序号排序
+//   为什么需要：tts.py 超过 MAX_CHARS(200) 会按句切段输出 -1/-2/-3…，
+//   而原来只 copy 了 -1 ⇒ 回复 >200 字时播到一半突然停（CR-20260929-03 §3）
+function globTtsChunks() {
+  try {
+    return fs.readdirSync('/tmp')
+      .filter(n => /^tts-chunk-\d+\.mp3$/.test(n))
+      .sort((a, b) => parseInt(a.match(/(\d+)/)[1], 10) - parseInt(b.match(/(\d+)/)[1], 10))
+      .map(n => '/tmp/' + n);
+  } catch (e) { return []; }
+}
+
 // TTS: 文字 → 音频
 async function handleTTS(text) {
   const timestamp = Date.now();
@@ -288,14 +300,31 @@ async function handleTTS(text) {
   const wavTarget = path.join(AUDIO_DIR, ttsWav);
 
   try {
+    // ★★★ CR-20260929-03 §3 修：tts.py 超过 MAX_CHARS(200) 会按句切成多段
+    //   （/tmp/tts-chunk-1.mp3、-2.mp3…，脚本注释自己就写着"大文件易截尾"），
+    //   而这里原来【只 copy 了第 1 段】⇒ 回复 >200 字时**播到一半突然停** ✗✗
+    //   实测 260 字：产出 435,975B + 459,799B 两段，服务器只发出 869,434B/27.2s（=只有第一段）✗
+    //   ⇒ ① 先清掉旧段（否则会把上一次的段也 concat 进来 ✗）② 按序号全部合并
+    //   ⚠️ /tmp/tts-chunk-*.mp3 是【固定路径】⇒ 并发调用会互相覆盖（既有缺陷，本次不扩大；
+    //      彻底解决要改 tts.py 支持自定义前缀，另开）
+    for (const oldChunk of globTtsChunks()) { try { fs.unlinkSync(oldChunk); } catch (e) {} }
+
     await execFileAsync('python3', [TTS_SCRIPT, text, '--voice', TTS_VOICE], { env: execEnv });
 
-    const ttsSource = '/tmp/tts-chunk-1.mp3';
-    if (!fs.existsSync(ttsSource)) {
+    const chunks = globTtsChunks();
+    if (!chunks.length) {
       throw new Error('TTS 输出文件不存在');
     }
-
-    fs.copyFileSync(ttsSource, mp3Target);
+    if (chunks.length === 1) {
+      fs.copyFileSync(chunks[0], mp3Target);
+    } else {
+      // 多段合并：各段同为 libmp3lame/128k ⇒ ffmpeg concat 用 -c copy 无损且快
+      const listFile = path.join(AUDIO_DIR, `tts-${timestamp}-list.txt`);
+      fs.writeFileSync(listFile, chunks.map(f => `file '${f}'`).join('\n'), 'utf8');
+      execSync(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c copy "${mp3Target}"`, { stdio: 'pipe', timeout: 30000 });
+      try { fs.unlinkSync(listFile); } catch (e) {}
+      log(`TTS 分段合并: ${chunks.length} 段 → ${path.basename(mp3Target)}`);
+    }
 
     // 同时生成 WAV 版本（SoX 无 libmad 无法播 MP3）
     try {
