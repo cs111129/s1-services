@@ -11,7 +11,12 @@ const PORT = 18790;
 const AUDIO_DIR = path.join(__dirname, 'audio-files');
 const CAM_DIR = path.join(__dirname, 'cam-uploads');   // 视觉采集板整组上传存储目录
 const TTS_SCRIPT = '/root/.openclaw/陈盛工作区/脚本/语音/tts.py';
-const TTS_VOICE = 'longzhe';  // CosyVoice 音色名(可选几十种): longzhe/longhua/xiaoyi/aiyue/...
+// ★ 音色可用环境变量覆盖（2026-10-07）—— 换音色不用改代码、不用重新 review
+//   实测 cosyvoice-v1 **19 个音色全部可用**（清单 + 试听样本见 02-运维/scripts/voice-probe*.py）
+//   男：longzhe(现用) longcheng longshu longshuo longfei longxiang longxiaocheng longlaotie longjielidou
+//   女：longwan longhua longxiaochun longxiaoxia longxiaobai longjing longmiao longyue longyuan
+//       儿童：longtong ｜ ★ `cosyvoice-v2` 本账号**未开通**（报 418 InvalidParameter）；`qwen-tts` 走兼容模式 404
+const TTS_VOICE = process.env.TTS_VOICE || 'longzhe';  // CosyVoice 音色名
 const ASR_SCRIPT = path.join(__dirname, 'asr_recognition.py');
 
 // 确保 DASHSCOPE_API_KEY 环境变量可用
@@ -1580,7 +1585,10 @@ function validateSetConfig(o) {
     if (!fs.existsSync(wav)) throw new Error('TTS WAV 不存在');
     return await ffmpegToPcm(wav, fmt);
   }
-  // 按句切（合并到 ≤60 字一段，避免每句都吃 TTS 的 ~2s 固定开销）
+  // ★ 按句切（合并到 ≤60 字一段，避免每句都吃 TTS 的 ~2s 固定开销）
+  //   ⚠️ 2026-10-07 起**流式那条路不再用它**（见下面 splitSents/自适应分块）——
+  //   它有致命缺陷：句子超过 cap 时 `p.slice(0, cap)` 会**在句子中间硬切**，
+  //   而"每段单独合成"会把句末的自然停顿抹平成均匀小缝（实测见配置手册 §122.7）
   function splitSentences(text, maxLen) {
     const cap = maxLen || 60;
     const parts = String(text).split(/(?<=[。！？；!?;])/).map(s => s.trim()).filter(Boolean);
@@ -1591,6 +1599,32 @@ function validateSetConfig(o) {
     }
     if (cur) out.push(cur);
     return out.length ? out : [String(text).slice(0, cap)];
+  }
+  /* ============ 流式的"只在句末断开"分块（2026-10-07 重做，治停顿不自然）============
+     ★ 病根两条（实测）：
+       ① `slice(0, cap)` **在句子中间硬切** ⇒ 听起来就是"不该停的地方停了" ✗
+       ② 每段单独合成 ⇒ 句末的自然停顿（实测 0.5~1.05s）被抹成 0.23~0.45s 的**均匀小缝**
+          （同一段 124 字：切 4 段 ⇒ 停顿 22 处/6.41s；整段一次 ⇒ 25 处/8.44s）✗
+     ★ 改法：**只在句末标点断开**（句子太长才退到从句标点），并且**块尽量大**；
+       代价是首块变大 ⇒ 出声变慢，所以用"**按播放队列自适应**"：
+         队列里还有多少秒可播 → 决定下一块能放多大（合成速度实测 ≈18 字/秒，取 16 保守）
+       ⇒ 首块仍是 60 字（出声不受影响），后面越攒越大（最多 240 字）✓
+  */
+  const STREAM_FIRST_CAP = 60;    // 首块上限（出声延迟由它决定，别再调大）
+  const STREAM_REST_CAP = 240;    // 后续块上限（越大越自然；实测单次 248 字没问题 ✓）
+  const STREAM_SYNTH_CPS = 16;    // 合成速度（字/秒）保守值（实测 230 字 12.8s ≈ 18）
+  // 只在句末标点断开（保留标点）；没有标点的尾巴也算一句
+  function splitSents(text) {
+    return (String(text).match(/[^。！？!?；;]*[。！？!?；;]|[^。！？!?；;]+$/g) || [String(text)])
+      .map(s => s.trim()).filter(Boolean);
+  }
+  // 一句超过 cap 时：**先从从句标点断**（，、：,），实在没有才硬切（极少数）
+  function cutPiece(s, cap) {
+    if (s.length <= cap) return [s, ''];
+    const head = s.slice(0, cap);
+    const m = head.match(/^[\s\S]*[，、：,]/);
+    if (m && m[0].length >= Math.min(20, cap)) return [m[0], s.slice(m[0].length)];
+    return [head, s.slice(cap)];
   }
 
   if (req.method === 'POST' && req.url === '/api/voice-chat-stream') {
@@ -1698,26 +1732,49 @@ function validateSetConfig(o) {
         log(`voice-chat-stream 头已发 d=${detail} fmt=${afmt}${selfA ? ' SELF' : ''} heard="${heard.slice(0, 16)}" ` +
             `reply=${reply.length}字 头耗时=${((tHead - t0) / 1000).toFixed(1)}s`);
 
-        // ★ 按句合成 + 立刻推 PCM（生成与播放重叠 ⇒ 只要生成快于播放就不会欠载）
-        const sents = splitSentences(reply, 60);
-        let pushed = 0, sent = 0;
-        for (const s of sents) {
-          sent++;
+        // ★★★ 自适应分块：只在句末断开，块大小按"播放队列还能撑多久"决定
+        //   首块 60 字（出声快）→ 队列攒起来后放大到 240 字（语调自然、拼缝少）
+        const sents = splitSents(reply);
+        const bytesPerSec = afmt === 'ulaw8' ? 16000 : 32000;
+        let pushed = 0, pieceN = 0, si = 0, carry = '';
+        while (si < sents.length || carry) {
+          const queuedSec = pushed / bytesPerSec;            // 已推的音频还能播多少秒
+          const target = Math.min(STREAM_REST_CAP,
+            Math.max(STREAM_FIRST_CAP, Math.floor(queuedSec * 0.7 * STREAM_SYNTH_CPS)));
+          let piece = carry; carry = '';
+          while (si < sents.length) {
+            const nx = sents[si];
+            if (!piece && nx.length > target) {              // 单句比目标还长 ⇒ 从句标点断
+              const cut = cutPiece(nx, target);
+              piece = cut[0];
+              if (cut[1]) carry = cut[1]; else si++;
+              break;
+            }
+            if (piece && piece.length + nx.length > target) break;   // 装不下就收口
+            piece += nx; si++;
+            if (piece.length >= target) break;
+          }
+          if (!piece) break;
+          pieceN++;
           try {
-            const pcm = await sentencePcm(s, afmt);
+            const pcm = await sentencePcm(piece, afmt);
             if (pcm && pcm.length) {
               res.write(pcm); pushed += pcm.length;
               // ★ 首块 PCM 的时间要单独记 —— 否则"头与首块只差 1ms"这类问题看不出来（设备端实测反馈）
-              if (sent === 1) log(`voice-chat-stream 首块 PCM 已推 距头 ${Date.now() - tHead}ms（${pcm.length} 字节）`);
-            }
-            else log(`⚠️ voice-chat-stream 第 ${sent} 句 PCM 为空`);
+              if (pieceN === 1) {
+                log(`voice-chat-stream 首块 PCM 已推 距头 ${Date.now() - tHead}ms（${pcm.length} 字节）`);
+              } else {
+                log(`voice-chat-stream 第 ${pieceN} 块：${piece.length} 字 → ${pcm.length} 字节（队列还剩 ` +
+                    `${(pushed / bytesPerSec).toFixed(1)}s 可播）`);
+              }
+            } else log(`⚠️ voice-chat-stream 第 ${pieceN} 块 PCM 为空`);
           } catch (e) {
             // ★ 已推的音频照旧 + 正常结束（绝不发半个 PCM 就不管 —— §11.6）
-            log(`⚠️ voice-chat-stream 第 ${sent} 句 TTS 失败，已推 ${pushed} 字节后正常结束: ${e.message}`);
+            log(`⚠️ voice-chat-stream 第 ${pieceN} 块 TTS 失败，已推 ${pushed} 字节后正常结束: ${e.message}`);
             break;
           }
         }
-        log(`voice-chat-stream ✓ ${sents.length} 句 → 推 PCM ${pushed} 字节 ` +
+        log(`voice-chat-stream ✓ ${pieceN} 块（共 ${reply.length} 字）→ 推 PCM ${pushed} 字节 ` +
             `tokens=${usage ? (usage.prompt_tokens + '/' + usage.completion_tokens) : '-'} ` +
             `总耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
         res.end();
