@@ -13,10 +13,11 @@ const CAM_DIR = path.join(__dirname, 'cam-uploads');   // 视觉采集板整组�
 const TTS_SCRIPT = '/root/.openclaw/陈盛工作区/脚本/语音/tts.py';
 // ★ 音色可用环境变量覆盖（2026-10-07）—— 换音色不用改代码、不用重新 review
 //   实测 cosyvoice-v1 **19 个音色全部可用**（清单 + 试听样本见 02-运维/scripts/voice-probe*.py）
-//   男：longzhe(现用) longcheng longshu longshuo longfei longxiang longxiaocheng longlaotie longjielidou
+//   男：longzhe longcheng longshu longshuo longfei longxiang longxiaocheng longlaotie longjielidou
 //   女：longwan longhua longxiaochun longxiaoxia longxiaobai longjing longmiao longyue longyuan
 //       儿童：longtong ｜ ★ `cosyvoice-v2` 本账号**未开通**（报 418 InvalidParameter）；`qwen-tts` 走兼容模式 404
-const TTS_VOICE = process.env.TTS_VOICE || 'longzhe';  // CosyVoice 音色名
+//   ★★ 2026-10-07 用户试听后拍板：**改用 `longyuan`（龙媛，女声 9 号）**（原 longzhe 龙哲，男）
+const TTS_VOICE = process.env.TTS_VOICE || 'longyuan';  // CosyVoice 音色名
 const ASR_SCRIPT = path.join(__dirname, 'asr_recognition.py');
 
 // 确保 DASHSCOPE_API_KEY 环境变量可用
