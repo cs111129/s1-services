@@ -1156,11 +1156,29 @@ function validateSetConfig(o) {
   // ★ 整段 WAV 那条路（老 /api/voice-chat）的**按格式**字数上限 —— 设备端把整个 WAV 收进内存，
   //   VOICE_WAV_MAX = 1.5MB，超了就是**静默截断**（念一半停住，用户以为是 bug）。
   //   实测 ≈5.0 字/秒（4.6~5.3）⇒ pcm16(32KB/s)：200 字 ≈ 38s ≈ 1.23MB（安全）；
-  //                  ulaw8(16KB/s)：300 字 ≈ 60s ≈ 0.96MB（安全）。
+  //                  ulaw8(16KB/s)：400 字 ≈ 80s ≈ 1.25MB（安全）。
   //   ★ 实测锚点：247 字 → 1,487KB ⇒ **pcm16 的物理封顶约 243 字**，取 200 留 20% 余量。
-  //   ★ 流式那条路不受此限（边生成边播，不整段缓冲）⇒ 只有这条路需要按格式收紧。
+  //   ★ 流式那条路**也要看这个预算**（设备端把流式 PCM 收在同一个缓冲里 —— 2026-10-07 实测证实）✓
   function wavCapFor(afmt, want) {
-    return afmt === 'ulaw8' ? Math.min(want, 300) : Math.min(want, 200);
+    return afmt === 'ulaw8' ? Math.min(want, 400) : Math.min(want, 200);
+  }
+  // ★★ 设备端整段音频缓冲 = `VOICE_WAV_MAX` = 1.5MB ⇒ 服务端自己留 ~100KB 余量
+  //   为什么流式也要按它收：2026-10-07 实测日志里 `detail=3` 推过 **2,075,594 字节** PCM，
+  //   而设备端此前只验过 897KB 的长流 ⇒ 超出部分**尾巴没了**（用户报"没念完"）✗
+  const DEV_AUDIO_BUDGET = 1.4 * 1024 * 1024;
+  // 16k 单声道：pcm16 = 32KB/s、ulaw8 = 16KB/s；中文 TTS ≈5.0 字/秒
+  //   ⇒ **每字 ≈6.4KB（pcm16）/ 3.2KB（ulaw8）**（用实测校准过：247 字 → 1,487KB ✓）
+  const BYTES_PER_CHAR = { pcm16: 6400, ulaw8: 3200 };
+  function audioBytesFor(n, fmt) { return n * (BYTES_PER_CHAR[fmt] || BYTES_PER_CHAR.pcm16); }
+  // 流式：按字节预算选格式（pcm16 装得下就用 pcm16，装不下换 μ-law = 正好一半）
+  //   ★ 必须在**发 JSON 头之前**定下来，否则头里写的 format 与实际字节流不一致 ✗
+  function pickStreamFmt(afmt, n) {
+    if (!AUTO_ULAW8 || afmt === 'ulaw8') return afmt;
+    const need = audioBytesFor(n, 'pcm16');
+    if (need <= DEV_AUDIO_BUDGET) return 'pcm16';
+    log(`voice-chat-stream: ${n} 字 pcm16 ≈ ${(need / 1048576).toFixed(2)}MB > 预算 ` +
+        `${(DEV_AUDIO_BUDGET / 1048576).toFixed(1)}MB ⇒ 自动改 ulaw8（≈${(need / 2 / 1048576).toFixed(2)}MB）`);
+    return 'ulaw8';
   }
   // ★★ 老路自动降级 pcm16 → ulaw8（2026-10-07，用户拍板"顺手改"）
   //   要解决的问题：设备不带 audio_fmt 时，"具体"档被 pcm16 的 200 字线截掉一截
@@ -1441,11 +1459,12 @@ function validateSetConfig(o) {
         //   ★ 按 audio_fmt 收上限：整段 WAV 要装进设备 1.5MB 缓冲（见 wavCapFor）
         const want = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
         let cap = wavCapFor(afmt, want);
-        // ★★ 自动降级：只在"再截就要丢字"时才换格式（详见 AUTO_ULAW8 的注释）
+        // ★★ 自动降级：只要 ulaw8 能**多留字**就换（不要求"ulaw8 一定装得下"——
+        //   原来那个条件让 341 字的回复既没降级、又被 pcm16 的 200 字线砍掉 141 字 ✗）
         if (AUTO_ULAW8 && afmt === 'pcm16' && reply.length > cap) {
           const cap8 = wavCapFor('ulaw8', want);
-          if (reply.length <= cap8) {
-            log(`voice-chat: 回复 ${reply.length} 字 > pcm16 上限 ${cap} 字 ⇒ 自动降级 ulaw8（设备端按 RIFF fmt 自适应 ✓）`);
+          if (cap8 > cap) {
+            log(`voice-chat: 回复 ${reply.length} 字 > pcm16 上限 ${cap} 字 ⇒ 自动降级 ulaw8（上限 ${cap8} 字，设备端按 RIFF fmt 自适应 ✓）`);
             afmt = 'ulaw8';
             cap = cap8;
           }
@@ -1603,7 +1622,8 @@ function validateSetConfig(o) {
         const reset = resetPart ? String(resetPart.data.toString('utf8')).trim() : '0';
         const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
         // ★ audio_fmt：'pcm16'(缺省) / 'ulaw8'（设备端 §16.4 建议的字段名）—— 非法值一律按 pcm16，不报错
-        const afmt = (fmtPart && String(fmtPart.data.toString('utf8')).trim() === 'ulaw8') ? 'ulaw8' : 'pcm16';
+        //   ★ 用 let：下面可能要按"体积预算"自动改成 ulaw8（见 pickStreamFmt）
+        let afmt = (fmtPart && String(fmtPart.data.toString('utf8')).trim() === 'ulaw8') ? 'ulaw8' : 'pcm16';
         if (!audioPart || !audioPart.data || !audioPart.data.length) { fail('no_audio'); return; }
 
         const asr = await handleASR(audioPart.data);
@@ -1644,6 +1664,12 @@ function validateSetConfig(o) {
         }
         const cap = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
         if (reply.length > cap) reply = reply.slice(0, cap) + '…';
+        // ★★ 流式也要看**体积预算**（2026-10-07 用户实测"具体档没念完"后定位）
+        //   实测日志：`detail=3` 推过 **2,075,594 字节**的 PCM（301 字），
+        //   而设备端 `VOICE_WAV_MAX` 只有 **1.5MB** —— 之前只验过 897KB 的长流 ✗
+        //   ⇒ pcm16 装不下就改 μ-law（体积正好一半），**在发头之前**定下来，
+        //     这样 JSON 头里的 format/bits 与实际字节流一致 ✓
+        afmt = pickStreamFmt(afmt, reply.length, detail);
 
         // ★★★ 先把 JSON 头发出去（★ 不等 TTS）—— 设备屏上可以先出字
         //   ★★ 2026-09-29 设备端实测反馈修的一个真 bug：他们测到"头与首块 PCM 只差 1 毫秒"
