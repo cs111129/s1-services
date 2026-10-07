@@ -1129,17 +1129,32 @@ function validateSetConfig(o) {
   const KB_TIMEOUT_MS = 8000;
   const LLM_TIMEOUT_MS = 12000;
   const VOICE_CHAT_ROUNDS = 3;          // 保留最近 3 轮上下文（内存；重启即丢，丢了当新会话）
-  const VOICE_REPLY_MAX = 200;          // 兜底上限（实际按 detail 档位走 DETAIL_STYLES）
+  const VOICE_REPLY_MAX = 300;          // 兜底上限（实际按 detail 档位走 DETAIL_STYLES）
   // ★★ 回答长度三档（用户可选，2026-09-29）—— 设备在请求里带 detail=1|2|3
   //   缺省/非法值一律按【中等】处理（老固件不带这个字段也能用，和 reset 同一套兼容规则）
+  //   ★ 2026-09-30 三档整体翻倍（用户实测反馈"说话太少，步骤讲不全"）：
+  //     ⚠️ 长度上限直接决定 TTS 音频大小，而设备端 WAV 缓冲 VOICE_WAV_MAX = 1.5MB：
+  //        中文 TTS 实测 ≈4.65 字/秒 ⇒ 16k 单声道 pcm16 = 32KB/s：
+  //        · 80  字 ≈ 17s ≈ 550KB  ✓
+  //        · 180 字 ≈ 39s ≈ 1.24MB ✓（离 1.5MB 只剩 260KB 余量，别再往上加）
+  //        · 300 字 ≈ 65s ≈ 2.06MB ✗ 超设备缓冲 ⇒ 这条档位必须走 ulaw8(0.5×) = 1.03MB ✓
+  //      ⇒ 设备端选「3 具体」时应带 audio_fmt=ulaw8；流式那条路不受此限（边生成边播）
   const DETAIL_STYLES = {
-    1: { max: 40,  tokens: 140, len: '不超过 40 字，1~2 句，只给最核心的一步或结论' },
-    2: { max: 90,  tokens: 280, len: '90 字以内，2~3 句，把关键几步说清楚' },
-    3: { max: 150, tokens: 400, len: '150 字以内，把关键的几步都说全，可以说 3~5 句' },
+    1: { max: 80,  tokens: 280, len: '不超过 80 字，2~4 句，只给最核心的一步或结论' },
+    2: { max: 180, tokens: 560, len: '180 字以内，4~6 句，把关键几步说清楚' },
+    3: { max: 300, tokens: 800, len: '300 字以内，把关键的几步都说全，可以说 6~8 句' },
   };
   function detailOf(v) {
     const n = parseInt(String(v || '').trim(), 10);
     return DETAIL_STYLES[n] ? n : 2;   // 不传/空/非法 ⇒ 中等
+  }
+  // ★ 整段 WAV 那条路（老 /api/voice-chat）的**按格式**字数上限 —— 设备端把整个 WAV 收进内存，
+  //   VOICE_WAV_MAX = 1.5MB，超了就是**静默截断**（念一半停住，用户以为是 bug）。
+  //   实测 ≈4.65 字/秒 ⇒ pcm16(32KB/s)：200 字 ≈ 43s ≈ 1.37MB（安全）；
+  //                  ulaw8(16KB/s)：300 字 ≈ 65s ≈ 1.03MB（安全）。
+  //   ★ 流式那条路不受此限（边生成边播，不整段缓冲）⇒ 只有这条路需要按格式收紧。
+  function wavCapFor(afmt, want) {
+    return afmt === 'ulaw8' ? Math.min(want, 300) : Math.min(want, 200);
   }
   // ★★ 固定问答（人设类）—— 在【检索之前】短路，理由：
   //   实测教训：问「你是谁」⇒ 知识库 0 命中 ⇒ reliable=false ⇒ 代码直接回"查不到" ✗，
@@ -1407,8 +1422,13 @@ function validateSetConfig(o) {
         }
 
         // ④ ★ 服务端自己截断（别指望设备端，规格书 §4.4 写死了）
-        const cap = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
-        if (reply.length > cap) reply = reply.slice(0, cap) + '…';
+        //   ★ 按 audio_fmt 收上限：整段 WAV 要装进设备 1.5MB 缓冲（见 wavCapFor）
+        const want = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
+        const cap = wavCapFor(afmt, want);
+        if (reply.length > cap) {
+          log(`voice-chat: 回复 ${reply.length} 字 > ${afmt} 上限 ${cap} 字 ⇒ 截断（避免设备端 WAV 缓冲溢出）`);
+          reply = reply.slice(0, cap) + '…';
+        }
         if (!reply) reply = NO_KB_REPLY;
 
         // ⑤ TTS
