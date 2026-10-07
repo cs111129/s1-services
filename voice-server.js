@@ -1585,21 +1585,10 @@ function validateSetConfig(o) {
     if (!fs.existsSync(wav)) throw new Error('TTS WAV 不存在');
     return await ffmpegToPcm(wav, fmt);
   }
-  // ★ 按句切（合并到 ≤60 字一段，避免每句都吃 TTS 的 ~2s 固定开销）
-  //   ⚠️ 2026-10-07 起**流式那条路不再用它**（见下面 splitSents/自适应分块）——
-  //   它有致命缺陷：句子超过 cap 时 `p.slice(0, cap)` 会**在句子中间硬切**，
-  //   而"每段单独合成"会把句末的自然停顿抹平成均匀小缝（实测见配置手册 §122.7）
-  function splitSentences(text, maxLen) {
-    const cap = maxLen || 60;
-    const parts = String(text).split(/(?<=[。！？；!?;])/).map(s => s.trim()).filter(Boolean);
-    const out = []; let cur = '';
-    for (const p of parts) {
-      if ((cur + p).length <= cap) { cur += p; }
-      else { if (cur) out.push(cur); cur = p.length > cap ? p.slice(0, cap) : p; }
-    }
-    if (cur) out.push(cur);
-    return out.length ? out : [String(text).slice(0, cap)];
-  }
+  // 【已删除】旧的 splitSentences(text, 60)：按标点切碎再合并到 ≤60 字，句子超长时 `p.slice(0, cap)` 硬切。
+  //   ★ 2026-10-07 用户报"断句不自然"后确认它是病根之一（句子中间硬切 + 每段单独合成抹平句末停顿），
+  //     已由下面的 splitSents() + 自适应分块取代（实测 264 字回答 7 块 → 3 块）。
+  //   ★ 要恢复旧行为（不推荐）：`git show ac008d6^:voice-server.js | grep -A12 'function splitSentences'`
   /* ============ 流式的"只在句末断开"分块（2026-10-07 重做，治停顿不自然）============
      ★ 病根两条（实测）：
        ① `slice(0, cap)` **在句子中间硬切** ⇒ 听起来就是"不该停的地方停了" ✗
