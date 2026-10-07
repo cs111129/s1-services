@@ -1162,6 +1162,15 @@ function validateSetConfig(o) {
   function wavCapFor(afmt, want) {
     return afmt === 'ulaw8' ? Math.min(want, 300) : Math.min(want, 200);
   }
+  // ★★ 老路自动降级 pcm16 → ulaw8（2026-10-07，用户拍板"顺手改"）
+  //   要解决的问题：设备不带 audio_fmt 时，"具体"档被 pcm16 的 200 字线截掉一截
+  //   （实测：模型写 235 字 ⇒ 白丢 35 字）。
+  //   为什么敢换：设备端 `voice.c` 的 `wav_parse()` 是**逐块遍历 RIFF、按 fmt 的 tag/位深自适应**
+  //   （CR-20260929-03 §16.2 真机验过 tag=7），且**老路与流式共用同一对
+  //   voice_feed_pcm16()/voice_feed_ulaw8()** ⇒ 格式由**响应自己**说了算，设备无需改动 ✓
+  //   ★ 只在"不换就要截断"时才换（不无谓改变既有行为），且留日志 + 在 JSON/响应头里回报实际格式
+  //   ★ 关掉的办法：环境变量 VOICE_AUTO_ULAW8=0
+  const AUTO_ULAW8 = process.env.VOICE_AUTO_ULAW8 !== '0';
   // ★★ 固定问答（人设类）—— 在【检索之前】短路，理由：
   //   实测教训：问「你是谁」⇒ 知识库 0 命中 ⇒ reliable=false ⇒ 代码直接回"查不到" ✗，
   //   而人设明明写在 system prompt 第一句 —— 它排在闸门后面，**根本没机会说话**。
@@ -1358,8 +1367,9 @@ function validateSetConfig(o) {
         const detailPart = parts.find(p => p.name === 'detail');
         const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
         // ★ audio_fmt 对老路也生效（CR-20260929-03 §16.4）—— fallback 那条路同样能省一半流量
+        //   ★ 用 let：下面第 ④ 步可能在"不降级就要截断"时把它改成 ulaw8
         const fmtPartOld = parts.find(p => p.name === 'audio_fmt');
-        const afmt = (fmtPartOld && String(fmtPartOld.data.toString('utf8')).trim() === 'ulaw8') ? 'ulaw8' : 'pcm16';
+        let afmt = (fmtPartOld && String(fmtPartOld.data.toString('utf8')).trim() === 'ulaw8') ? 'ulaw8' : 'pcm16';
 
         if (!audioPart || !audioPart.data || !audioPart.data.length) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1430,7 +1440,16 @@ function validateSetConfig(o) {
         // ④ ★ 服务端自己截断（别指望设备端，规格书 §4.4 写死了）
         //   ★ 按 audio_fmt 收上限：整段 WAV 要装进设备 1.5MB 缓冲（见 wavCapFor）
         const want = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
-        const cap = wavCapFor(afmt, want);
+        let cap = wavCapFor(afmt, want);
+        // ★★ 自动降级：只在"再截就要丢字"时才换格式（详见 AUTO_ULAW8 的注释）
+        if (AUTO_ULAW8 && afmt === 'pcm16' && reply.length > cap) {
+          const cap8 = wavCapFor('ulaw8', want);
+          if (reply.length <= cap8) {
+            log(`voice-chat: 回复 ${reply.length} 字 > pcm16 上限 ${cap} 字 ⇒ 自动降级 ulaw8（设备端按 RIFF fmt 自适应 ✓）`);
+            afmt = 'ulaw8';
+            cap = cap8;
+          }
+        }
         if (reply.length > cap) {
           log(`voice-chat: 回复 ${reply.length} 字 > ${afmt} 上限 ${cap} 字 ⇒ 截断（避免设备端 WAV 缓冲溢出）`);
           reply = reply.slice(0, cap) + '…';
@@ -1451,18 +1470,29 @@ function validateSetConfig(o) {
 
         // ★ 全过程都要留证据：否则出事故时只看到"回复很短"，分不清是
         //   "知识库没命中"（正常）还是"模型没答"（异常）
-        log(`voice-chat ✓ device=${device || '-'} d=${detail}${selfA ? ' SELF' : ''} kb=${kb.ok ? kb.results.length : 'DOWN'} ` +
+        log(`voice-chat ✓ device=${device || '-'} d=${detail} fmt=${afmt}${selfA ? ' SELF' : ''} kb=${kb.ok ? kb.results.length : 'DOWN'} ` +
             `rel=${kb.reliable ? 'Y' : 'N'}(${kb.maxScore}) ` +
             `heard="${heard.slice(0, 20)}" reply=${reply.length}字 ` +
             `tokens=${usage ? (usage.prompt_tokens + '/' + usage.completion_tokens) : '-'} ` +
             `耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        // ★ 回报**实际**格式（字段名与流式头一致：format/bits/sample_rate/channels）——
+        //   设备端本来按下载到的 WAV 的 fmt 块自适应，这里是给"不想解析 WAV 头"的消费端兜底，
+        //   并且让"服务端自己换了格式"这件事**在响应里看得见**（不靠猜）
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Dyz-Format': afmt
+        });
         res.end(JSON.stringify({
           success: true,
           text: heard,
           reply: reply,
           audio: audioPath,
+          // ★ 实际音频格式（可能被服务端自动降级过 —— 见 AUTO_ULAW8）
+          format: afmt === 'ulaw8' ? 'ulaw8' : 'pcm_s16le',
+          bits: afmt === 'ulaw8' ? 8 : 16,
+          sample_rate: 16000,
+          channels: 1,
           session: device ? (device + '#' + Math.ceil((chatHistoryOf(device) || []).length / 2)) : ''
         }, null, 0));
       } catch (e) {
