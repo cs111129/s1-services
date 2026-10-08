@@ -234,18 +234,29 @@ def fetch_cam_config():
         log(f"cam-config 拉取异常: {e}，用默认提示词")
 
 
-def fetch_sop(sop_id):
-    """从 S2 拉取 SOP 标准内容（33号 /api/cam-sop）。失败或空返回 None。"""
+def fetch_sop(sop_id, device_id=""):
+    """从 S2 拉取 SOP 标准内容（33号 /api/cam-sop）。失败或空返回 None。
+
+    ★ 2026-10-07（CR-20261007-01）：带上 device_id —— S2 会做**二次校验**
+      （这台设备绑定的岗位能不能用这条 SOP）。不在范围内 ⇒ S2 返回 {id:null}
+      ⇒ 本函数返回 None ⇒ 分析照跑，只是**没有 SOP 标准可比**（降级，不报错）✓
+    """
     if not sop_id or not CAM_INGEST_TOKEN or not S2_DBAPI:
         return None
     try:
-        r = requests.get(f"{S2_DBAPI}{SOP_PATH}", params={"id": sop_id},
+        params = {"id": sop_id}
+        if device_id:
+            params["device"] = device_id
+        r = requests.get(f"{S2_DBAPI}{SOP_PATH}", params=params,
                          headers={"Authorization": f"Bearer {CAM_INGEST_TOKEN}"}, timeout=10)
         if r.status_code == 200:
             d = r.json()
             if d.get("id"):
                 log(f"已拉取 SOP: {d.get('name') or sop_id} (content {len(d.get('content',''))} 字)")
                 return d
+            if d.get("error") == "scope_denied":
+                log(f"⚠️ SOP {sop_id} 不在设备 {device_id or '(未给)'} 的岗位范围内 ⇒ 本轮无标准可比（降级）")
+                return None
         else:
             log(f"拉取 SOP {sop_id} 失败({r.status_code})")
     except Exception as e:
@@ -749,7 +760,7 @@ def main():
     log(f"录音转写: {audio_text or '(空)'}")
 
     # SOP 标准内容（合并模式 / 老流程都要用，提前拉）
-    sop_doc = fetch_sop(sop_id) if sop_id else None
+    sop_doc = fetch_sop(sop_id, device_id) if sop_id else None
     if sop_id and not sop_doc:
         log(f"未找到 SOP（sop_id={sop_id}）")
 

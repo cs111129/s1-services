@@ -528,7 +528,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     logAuthSource(req, dev, 'sop');
-    fetch(CAM_S2_DBAPI + '/api/cam-sop', {
+    // ★ 2026-10-07（CR-20261007-01）：**把设备号一起转发给 S2** ——
+    //   S2 要按"这台设备绑定学员的岗位"过滤 SOP 列表（★ 设备密钥已在本函数上面校验过
+    //   ⇒ 这个 dev 是可信的，设备无法冒充别人 ✓）
+    //   ✗ 不带 device 时 S2 会**不过滤**（兼容老固件）—— 所以这一行不能漏
+    const sopUrl = CAM_S2_DBAPI + '/api/cam-sop' + (dev ? '?device=' + encodeURIComponent(dev) : '');
+    fetch(sopUrl, {
       headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN }
     }).then(function(r) { return r.json(); }).then(function(data) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
