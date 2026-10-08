@@ -111,6 +111,8 @@ SOP_COMPARE_PROMPT = (
 vision_prompt = VISION_PROMPT
 summary_prompt = SUMMARY_PROMPT
 sop_compare_prompt = SOP_COMPARE_PROMPT
+# ★ 新增：按步骤逐项判定的模板（只含人格/框架）。None ⇒ 老路径按老行为（零窗口回退 ✓）
+sop_compare_steps_prompt = None
 SOP_PATH = "/api/cam-sop"
 # 34号问题4：DeepSeek 文本模型输出上限 + 失败重试次数（S2 cam-config 可配置，默认兜底）
 max_tokens = 2000
@@ -169,20 +171,94 @@ DEFAULT_MERGED_PROMPT = """你是「胤隆会」实操考核的评分分析员�
   "sop_compare": "第三步的表格（含表头行），SOP 含话术要求时在后面接一段「话术评估」"
 }"""
 
-# 第三步的两种写法（有 SOP / 设备端没选 SOP）
-SOP_BLOCK_WITH = """流程名：{{sop_name}}
-SOP 标准：
-{{sop_content}}
+# ══════════════════════════════════════════════════════════════════════
+# SOP 标准块 + 输出格式要求（CR-20261008-01 期2：按步骤逐项判定）
+#
+# ★★ 为什么不把「输出格式要求」放进 cam-config.json 的可配置提示词：
+#   它和**数据模型绑死**（steps 有哪些字段 ⇒ 矩阵有哪些列）。
+#   一旦放进配置，就会出现"改了代码默认值、线上仍是旧配置"的静默失效 ✗
+#   —— 2026-10-08 实测：线上 mergedPrompt / sopComparePrompt **两个都被覆盖**，
+#      只改本文件的默认值等于没改（这是本 CR 最容易踩的坑，故在此写明）。
+#   ⇒ 规范：**人格/框架可配置，输出格式不可配置**（格式跟着数据模型走，只在代码里维护一份）。
+#
+# ★ 必须与 xydck/server/student-data.js 的同名实现**逐字节一致**
+#   （两条判定链路：S1 首次分析 / 学员端「换个 SOP 重新分析」）
+#   校验脚本：xydck/scripts/verify-sop-prompt-consistency.js ✓
+# ══════════════════════════════════════════════════════════════════════
+SOP_STEP_FIELDS = (("action", "动作"), ("speech", "话术"), ("tool", "工具"),
+                   ("note", "注意事项"), ("duration", "完成时间"))
 
-对 SOP 里**每一条**标准逐条判断，输出表格（表头固定，不要改）：
+SOP_SPEC_STEPS = """请按【每一步 × 每一项】逐项判定，先输出矩阵表（表头固定，一个字都不要改）：
+| 序号 | 步骤 | 动作 | 话术 | 工具 | 注意 | 时间 |
+|---|---|---|---|---|---|---|
+| 1 | （步骤名原样照抄） | ✅ | — | ✅ | ✅ | ✅ |
+
+矩阵里的列名含义：「注意」= 注意事项，「时间」= 完成时间。判定值只能用这 4 个符号：
+✅ 做到 ｜ ❌ 未做到 ｜ — 这一步没有这项要求（标准里没写） ｜ ❓ 画面或录音没覆盖到，无法判断
+★ ❓ 和 ❌ 不是一回事：**没拍到、没录到就填 ❓**，不要因为"我没看到"就判「未做到」。
+★ 步骤名原样照抄，不要改写、不要合并、不要漏掉任何一步。
+
+矩阵之后必须再写两段（某段没有内容就写「无」）：
+## 需要改进
+- **第 N 步 <步骤名> · <项目>**：差在哪 + 判断依据（具体到画面时间点或录音原话）
+## 无法判断
+- **第 N 步 <步骤名> · <项目>**：为什么无法判断
+
+不要打分、不要评分、不要给总分；也不要再单独写「话术评估」段落（话术已经在矩阵里逐项判定过了）。
+若画面内容与 SOP 场景无关，如实写明「画面内容与 SOP 场景无关」，**不要编造画面里没有的动作或对话**。"""
+
+SOP_SPEC_PLAIN = """请逐条比对员工演示与 SOP 标准，输出表格（表头固定，不要改）：
 | 序号 | 标准项 | 是否做到 | 说明 |
 |---|---|---|---|
 | 1 | （SOP 第 1 条标准原样照抄） | 做到 / 未做到 | （判断依据：要具体到画面或录音里的什么） |
 
-判断值只用「做到」或「未做到」两个。若 SOP 标准里包含话术要求，在表格后补一段「话术评估」；若 SOP 没有话术要求，则不写话术评估。不要打分、不要评分。"""
+判断值只用「做到」或「未做到」两个。某一项如果画面/录音没覆盖到，在「说明」里写明「无法判断：…」，**不要直接算成未做到**。
+若 SOP 标准里包含话术要求，在表格后补一段「话术评估」；若 SOP 没有话术要求，则不写话术评估。不要打分、不要评分。"""
 
 SOP_BLOCK_NONE = """本次未指定 SOP 标准（设备端没选流程）。
 请在 sop_compare 字段里只写一句：「本次未选择 SOP 流程，未做标准比对。」不要编造标准。"""
+
+
+def render_steps_for_prompt(steps):
+    """结构化步骤 → 给模型看的文本。空字段【不输出】= 该步对此项无要求（对应矩阵里的「—」）。
+
+    ★ 与 student-data.js 的 renderStepsForPrompt() 逐字节一致（有校验脚本比对）。
+    """
+    out = []
+    for i, st in enumerate(steps, 1):
+        st = st or {}
+        lines = ["【步骤 %d】%s" % (i, st.get("name") or "")]
+        for key, label in SOP_STEP_FIELDS:
+            v = str(st.get(key) or "").strip()
+            if v:
+                lines.append("  %s：%s" % (label, v))
+        out.append("\n".join(lines))
+    return "\n".join(out)
+
+
+def sop_standard_text(sop_doc):
+    """SOP 标准正文：有 steps 按步骤渲染；没有就用原文（老 SOP 不中断 ✓）"""
+    steps = sop_doc.get("steps") or []
+    if steps:
+        head = ("流程名：%s\n共 %d 个步骤（每步只列出**有要求**的项目；"
+                "没列出的项 = 该步对此项无要求）\n" % (sop_doc.get("name") or "", len(steps)))
+        return head + render_steps_for_prompt(steps)
+    return "流程名：%s\nSOP 标准：\n%s" % (sop_doc.get("name") or "", sop_doc.get("content") or "")
+
+
+def sop_spec_for(sop_doc):
+    """输出格式要求：有 steps ⇒ 逐项矩阵；没有 steps ⇒ 老的四列表格"""
+    return SOP_SPEC_STEPS if (sop_doc.get("steps") or []) else SOP_SPEC_PLAIN
+
+
+def sop_content_with_spec(sop_doc):
+    """给 {sop_content} 占位用：标准正文 + 输出要求（**整块都由代码生成**，配置里不再写格式 ✗）"""
+    return sop_standard_text(sop_doc) + "\n\n" + sop_spec_for(sop_doc)
+
+
+def sop_block_for_prompt(sop_doc):
+    """合并流程用的整块（占位符 {{sop_block}} 的值）= 标准 + 输出要求"""
+    return sop_content_with_spec(sop_doc)
 
 
 def fill_prompt(tpl, **kw):
@@ -198,8 +274,13 @@ def fetch_cam_config():
     """从 S2 拉取实操考核配置（提示词/参数）。失败用默认值，不阻塞分析。
     参数配置化（30/31 号）：后台配置提示词 + interval_ms/max_seconds，分析前拉取提示词。
     34号问题4：新增 maxTokens（DeepSeek 输出上限）+ retryCount（失败重试次数）。
-    2026-09-14：新增 mergedPrompt —— 非空则走「一次调用完成三段分析」的合并模式。"""
-    global vision_prompt, summary_prompt, sop_compare_prompt, max_tokens, retry_count, merged_prompt
+    2026-09-14：新增 mergedPrompt —— 非空则走「一次调用完成三段分析」的合并模式。
+    2026-10-08（CR-20261008-01 期2）：新增 sopCompareStepsPrompt ——
+      **只放人格/框架，不含输出格式**（格式由代码按数据模型生成，见文件上方说明）。
+      没配这个键时**完全退回老行为**（用 sopComparePrompt 的原文 + 平铺 content）
+      ⇒ 配置与代码的部署先后都不会出现中间态 ✗（零窗口）✓"""
+    global vision_prompt, summary_prompt, sop_compare_prompt, sop_compare_steps_prompt
+    global max_tokens, retry_count, merged_prompt
     try:
         if not CAM_INGEST_TOKEN or not S2_DBAPI:
             return
@@ -218,6 +299,10 @@ def fetch_cam_config():
                 summary_prompt = c["summaryPrompt"]
             if c.get("sopComparePrompt"):
                 sop_compare_prompt = c["sopComparePrompt"]
+            # ★ 2026-10-08：新的「按步骤逐项判定」模板（只含人格/框架，不含输出格式）
+            #   没配 ⇒ 保持 None ⇒ 老路径完全按老行为跑（零窗口回退 ✓）
+            if c.get("sopCompareStepsPrompt"):
+                sop_compare_steps_prompt = c["sopCompareStepsPrompt"]
             # 34号问题4：读 maxTokens / retryCount
             if c.get("maxTokens"):
                 max_tokens = int(c["maxTokens"])
@@ -414,11 +499,11 @@ def call_merged(key, image_paths, audio_text, sop_doc, interval_sec=5):
         log(f"抽帧降本: {len(image_paths)} 帧 → {len(sampled)} 帧（等间隔，上限 {MAX_MERGED_FRAMES}）")
         image_paths = sampled
 
-    # 第三步：有 SOP 就逐条比对，没选就如实说明（不编造标准）
+    # 第三步：有 SOP 就逐项比对（标准 + 输出格式都由代码生成），没选就如实说明（不编造标准）
     if sop_doc:
-        sop_block = fill_prompt(SOP_BLOCK_WITH,
-                                sop_name=sop_doc.get("name") or sop_doc.get("id") or "",
-                                sop_content=sop_doc.get("content") or "")
+        sop_block = sop_block_for_prompt(sop_doc)
+        log("SOP 块：%s（%d 步）" % ("按步骤逐项判定" if (sop_doc.get("steps") or []) else "纯文本条目判定",
+                                  len(sop_doc.get("steps") or [])))
     else:
         sop_block = SOP_BLOCK_NONE
 
@@ -823,9 +908,18 @@ def main():
         if sop_id:
             if sop_doc:
                 try:
-                    sop_compare = call_chat(chat_key, sop_compare_prompt.format(
+                    # ★ 2026-10-08：配了 sopCompareStepsPrompt（只含人格/框架）时，
+                    #   把「标准 + 输出格式」整块塞进 {sop_content} —— 格式只在代码里维护一份 ✓
+                    #   没配 ⇒ 老行为（原文-content 进 {sop_content}），零窗口回退 ✓
+                    if sop_compare_steps_prompt:
+                        tpl = sop_compare_steps_prompt
+                        sop_content_val = sop_content_with_spec(sop_doc)
+                    else:
+                        tpl = sop_compare_prompt
+                        sop_content_val = sop_doc.get("content") or ""
+                    sop_compare = call_chat(chat_key, tpl.format(
                         sop_name=sop_doc.get("name") or sop_id,
-                        sop_content=sop_doc.get("content") or "",
+                        sop_content=sop_content_val,
                         vision=vision_prompt_text,
                         audio=audio_text or "(无有效录音内容)",
                     ), max_tokens=max_tokens)
