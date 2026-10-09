@@ -956,9 +956,19 @@ const server = http.createServer(async (req, res) => {
         });
         if (o.ota_state === 'ok') camDeviceState[dev].ota_at = Date.now();
         if (otaTouched) {
-          log(`cam 升级上报 -> ${dev}: fw=${camDeviceState[dev].fw || '-'}`
-            + ` ota_state=${camDeviceState[dev].ota_state || '-'}`
-            + ` ota_from=${camDeviceState[dev].ota_from || '-'}`);
+          // ★★ 为什么必须分两类日志（2026-10-09 实测踩到）：
+          //   设备端发 1.2.2 起，**常规上报（每 5 分钟一次）也会带上 `fw`** ——
+          //   而上面 `otaTouched` 对 `fw` 同样置真 ⇒ 若一律记成「升级上报」，
+          //   日志就会**每分钟满屏"升级上报"**，而实际上**没有任何设备在升级** ✗✗
+          //   （同族：**日志说谎比不记更糟** —— 读日志的人会据此做错误判断 ✓）
+          const isResult = (o.ota_state !== undefined && o.ota_state !== null && String(o.ota_state).trim() !== '')
+            || (o.ota_from !== undefined && o.ota_from !== null && String(o.ota_from).trim() !== '');
+          log(isResult
+            ? `cam 升级结果上报 -> ${dev}: fw=${camDeviceState[dev].fw || '-'}`
+              + ` ota_state=${camDeviceState[dev].ota_state || '-'}`
+              + ` ota_from=${camDeviceState[dev].ota_from || '-'}`
+            : `cam 版本上报（常规）-> ${dev}: fw=${camDeviceState[dev].fw || '-'}`
+              + `（未带 ota_state/ota_from ⇒ 按合并语义保留旧值 ✓）`);
           // ★ 落 S2 台账（做持久化：S1 是内存态，重启就没了）
           //   ★ 失败必须**留日志**，不许静默（"降级可用"的 catch 一定要留证据 ✗）
           fetch(`${CAM_S2_DBAPI}/api/cam-ota-report`, {
