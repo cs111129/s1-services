@@ -1613,13 +1613,21 @@ function validateSetConfig(o) {
     if (!device) return null;
     const now = Date.now();
     let s = _chatSessions.get(device);
+    // ★ 插桩（排查"每轮条数都回到 0"✓ 一行、信息量大，平时也看得出上下文有没有在涨 ✓）
+    const _before = (s && Array.isArray(s.msgs)) ? s.msgs.length : -1;
+    const _why = (!s ? 'new-noentry' : (!Array.isArray(s.msgs) ? 'new-badshape' : 'reuse'));
     if (!s || !Array.isArray(s.msgs)) { s = { msgs: [], at: now }; _chatSessions.set(device, s); }
+    let _ttl = false;
     if (now - (s.at || 0) > CHAT_CTX_TTL_MS) {           // ① 服务端按时间过期
       if (s.msgs.length) log(`voice-chat: 上下文过期（${Math.round((now - s.at) / 1000)}s 无请求）⇒ 当新会话（device=${device}）`);
-      s.msgs.length = 0;
+      s.msgs.length = 0; _ttl = true;
     }
-    if (reset === '1') s.msgs.length = 0;                 // ② 设备说"新话题" ⇒ 清空
+    let _rst = false;
+    if (reset === '1') { s.msgs.length = 0; _rst = true; }  // ② 设备说"新话题" ⇒ 清空
     s.at = now;
+    if (_before !== s.msgs.length || reset === '1' || _why !== 'reuse') {
+      log(`voice-chat: ctx[${device}] ${_why} 前=${_before} 后=${s.msgs.length} ttl=${_ttl} reset=${_rst}（收到 reset="${reset}"）`);
+    }
     if (_chatSessions.size > 500) {                       // 防无界增长
       const first = _chatSessions.keys().next().value;
       if (first !== device) _chatSessions.delete(first);
