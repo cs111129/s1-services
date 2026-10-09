@@ -1870,7 +1870,7 @@ function validateSetConfig(o) {
             `rel=${kb.reliable ? 'Y' : 'N'}(${kb.maxScore}) ` +
             // ★ 打出上下文深度（设备端 2026-09-29 报「session 恒 #1」时，光看响应看不出是"没记"还是"记了但被上限压住" ✗
             //   ⇒ 把"此刻表里有几条 / 深度几"打进日志，这类问题一眼可判 ✓（对后续任何多轮问题都有用 ✓）
-            `ctx=${chatDepthOf(device)}条数=${(device && _chatSessions.get(device) ? _chatSessions.get(device).msgs.length : 0)} ` +
+            `ctx=${chatDepthOf(device)}条数=${(device && _chatSessions.get(device) ? _chatSessions.get(device).msgs.length : 0)}表内=${_chatSessions.size} ` +
             `heard="${heard.slice(0, 20)}" reply=${reply.length}字 ` +
             `tokens=${usage ? (usage.prompt_tokens + '/' + usage.completion_tokens) : '-'} ` +
             `耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
