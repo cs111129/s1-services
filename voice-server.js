@@ -202,6 +202,11 @@ function pickDeviceId(req, q, o) {
  */
 const SEC_SYNC_MS = 5 * 60 * 1000;
 let _secSyncAt = 0, _secSyncing = false;
+// ★★ 为什么要单独记一个"同步状态"：第一版**只在内容变化时打日志**，
+//   结果"同步成功但内容没变"完全看不见 —— 日志里只剩一条失败，
+//   读日志的人（我自己）当场误判成"密钥表从来没同步成功" ✗✗
+//   ⇒ 状态迁移（never→ok / ok→fail / 内容变化）都要留痕，"成功"与"从没跑过"必须分得开 ✓
+let _secSyncState = 'never';
 function syncCamSecrets(force) {
   if (_secSyncing) return Promise.resolve(false);
   if (!force && Date.now() - _secSyncAt < SEC_SYNC_MS) return Promise.resolve(false);
@@ -216,6 +221,7 @@ function syncCamSecrets(force) {
     try { cur = JSON.parse(fs.readFileSync(CAM_SECRET_FILE, 'utf8')); } catch (e) {}
     const same = cur && JSON.stringify([cur.devices || {}, cur.prev || {}, cur.revoked || []])
       === JSON.stringify([d.devices || {}, d.prev || {}, d.revoked || []]);
+    const nDev = Object.keys(d.devices || {}).length, nRev = (d.revoked || []).length;
     if (!same) {
       const next = Object.assign({}, cur || {}, {
         version: 2,
@@ -229,11 +235,16 @@ function syncCamSecrets(force) {
         updated: d.updated || (cur && cur.updated) || '',
       });
       fs.writeFileSync(CAM_SECRET_FILE, JSON.stringify(next, null, 2), { mode: 0o600 });
-      log(`cam 密钥表已同步: 一机一密 ${Object.keys(next.devices).length} 台 / 已吊销 ${next.revoked.length} 台`);
+      log(`cam 密钥表已更新: 一机一密 ${nDev} 台 / 已吊销 ${nRev} 台`);
+    } else if (_secSyncState !== 'ok') {
+      // 内容没变但这是第一次成功（或刚从失败里恢复）⇒ 必须留一行，否则分不清"没变"和"没跑" ✗
+      log(`cam 密钥表同步正常（内容无变化）: 一机一密 ${nDev} 台 / 已吊销 ${nRev} 台`);
     }
+    _secSyncState = 'ok';
     _secSyncAt = Date.now();
     return true;
   }).catch(e => {
+    _secSyncState = 'fail';
     log(`cam 密钥表同步失败（继续用现有表，不清空）：${e.message}`);
     _secSyncAt = Date.now() - SEC_SYNC_MS + 30000;   // 30 秒后重试
     return false;
