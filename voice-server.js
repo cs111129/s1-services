@@ -153,8 +153,18 @@ function secretEq(a, b) {
 function checkDeviceSecret(secret, deviceId) {
   if (!secret) return false;
   const want = deviceSecretOf(deviceId);
-  if (!want) return false;                       // 已吊销 ⇒ 谁都不匹配 ✓
-  return secretEq(secret, want);
+  if (want && secretEq(secret, want)) return true;
+  // ★★ 兼容窗口（dual）：新密钥刚发放、而设备还在发公共兜底的那段时间，**公共兜底也认** ✓
+  //   为什么必须要它 ✗：一发放就只认它自己的密钥 ⇒ 还没升级到"会领取"的固件立刻 401、彻底不能用 ✗
+  //   而设备要能领取又必须先有新固件 ⇒ 先有鸡还是先有蛋
+  //   ⇒ S2 发放时记一个到期时间，到期后公共兜底对该设备彻底失效（那才是一机一密真正生效的时刻 ✓）
+  const c = camSecrets();
+  const until = c.dual && c.dual[deviceId];
+  if (until && Date.now() < until) {
+    const fb = c.fallbackSecret || CAM_DEVICE_SECRET;
+    if (fb && secretEq(secret, fb)) return true;
+  }
+  return false;
 }
 /** 按密钥反查设备号（查不到返回 '' —— 共用公共密钥的设备查不到，属正常） */
 function deviceIdBySecret(secret) {
@@ -219,15 +229,18 @@ function syncCamSecrets(force) {
   }).then(d => {
     let cur = null;
     try { cur = JSON.parse(fs.readFileSync(CAM_SECRET_FILE, 'utf8')); } catch (e) {}
-    const same = cur && JSON.stringify([cur.devices || {}, cur.prev || {}, cur.revoked || []])
-      === JSON.stringify([d.devices || {}, d.prev || {}, d.revoked || []]);
+    const same = cur && JSON.stringify([cur.devices || {}, cur.prev || {}, cur.revoked || [], cur.dual || {}])
+      === JSON.stringify([d.devices || {}, d.prev || {}, d.revoked || [], d.dual || {}]);
     const nDev = Object.keys(d.devices || {}).length, nRev = (d.revoked || []).length;
+    const nDual = Object.keys(d.dual || {}).length;
     if (!same) {
       const next = Object.assign({}, cur || {}, {
         version: 2,
         devices: d.devices || {},
         prev: d.prev || {},
         revoked: d.revoked || [],
+        // ★ 新密钥的"兼容窗口"（见 checkDeviceSecret）：到期后公共兜底对该设备彻底失效 ✓
+        dual: d.dual || {},
         // ★ 本机策略，不被 S2 覆盖
         fallbackSecret: (cur && cur.fallbackSecret) || CAM_DEVICE_SECRET,
         requireSecretOnUpload: cur ? !!cur.requireSecretOnUpload : true,
@@ -235,10 +248,10 @@ function syncCamSecrets(force) {
         updated: d.updated || (cur && cur.updated) || '',
       });
       fs.writeFileSync(CAM_SECRET_FILE, JSON.stringify(next, null, 2), { mode: 0o600 });
-      log(`cam 密钥表已更新: 一机一密 ${nDev} 台 / 已吊销 ${nRev} 台`);
+      log(`cam 密钥表已更新: 一机一密 ${nDev} 台 / 兼容窗口 ${nDual} 台 / 已吊销 ${nRev} 台`);
     } else if (_secSyncState !== 'ok') {
       // 内容没变但这是第一次成功（或刚从失败里恢复）⇒ 必须留一行，否则分不清"没变"和"没跑" ✗
-      log(`cam 密钥表同步正常（内容无变化）: 一机一密 ${nDev} 台 / 已吊销 ${nRev} 台`);
+      log(`cam 密钥表同步正常（内容无变化）: 一机一密 ${nDev} 台 / 兼容窗口 ${nDual} 台 / 已吊销 ${nRev} 台`);
     }
     _secSyncState = 'ok';
     _secSyncAt = Date.now();
