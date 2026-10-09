@@ -210,7 +210,11 @@ function pickDeviceId(req, q, o) {
  *      fallbackSecret / requireSecretOnUpload 是 S1 本地策略，保持不动 ✓
  *   ③ **拉取失败绝不清空**（继续用现有表）—— 否则 S2 抖一下，全机队认证就崩 ✗
  */
-const SEC_SYNC_MS = 5 * 60 * 1000;
+// ★ 兜底周期从 5 分钟收紧到 60 秒：正常路径是后台改完**主动通知重载**
+//   （见 /api/cam/secrets-reload），这个周期只是"万一通知失败"的兜底
+//   ⇒ 越短越安全，代价只是每分钟一次内部 GET（可忽略 ✓）
+//   ★ 动因：实测"revoke 后 1 秒再打，S1 还按老表放行" ⇒ 吊销有 5 分钟窗口，不能接受 ✗
+const SEC_SYNC_MS = 60 * 1000;
 let _secSyncAt = 0, _secSyncing = false;
 // ★★ 为什么要单独记一个"同步状态"：第一版**只在内容变化时打日志**，
 //   结果"同步成功但内容没变"完全看不见 —— 日志里只剩一条失败，
@@ -770,6 +774,39 @@ const server = http.createServer(async (req, res) => {
       if (cbody.length > 4096) { try { req.destroy(); } catch (e) {} }   // 这个端点不需要大 body
     });
     req.on('end', () => { let o = {}; try { o = JSON.parse(cbody || '{}'); } catch (e) {} doClaim(o); });
+    return;
+  }
+
+  /* ══════════ CR-20261009-01：密钥表【主动重载】（后台改完立刻生效）══════════
+   * ★★ 为什么必须有它：S1 的密钥表本来是**每 5 分钟**拉一次，
+   *   而"吊销"是安全动作 —— 设备丢了/泄露了，**不能等 5 分钟**才失效 ✗✗
+   *   （2026-10-09 实测：revoke 后 1 秒再打，S1 还按老表放行 ⇒ 返回 204 而不是 401，
+   *     即"吊销了但没生效" —— 这种静默延迟比报错还危险）
+   * ⇒ 后台改完（预登记/轮换/吊销/删除）**同步调这个端点**，等它回 ok 才算生效 ✓
+   *   ★ 鉴权用内部 ingest token（这是"触发一次同步"，滥用最多是让 S1 多拉一次）
+   */
+  if (req.method === 'POST' && req.url === '/api/cam/secrets-reload') {
+    const tok = String(req.headers['x-ingest-token'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '')).trim();
+    if (tok !== CAM_INGEST_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    // ★ 等同步真的跑完再回 —— 否则调用方以为生效了，其实还在路上 ✗
+    _secSyncAt = 0;                                  // 清掉节流，强制本次真的去拉
+    syncCamSecrets(true).then(() => {
+      const c = camSecrets();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: _secSyncState === 'ok',
+        devices: Object.keys(c.devices || {}).length,
+        dual: Object.keys(c.dual || {}).length,
+        revoked: (c.revoked || []).length,
+      }));
+    }).catch(e => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    });
     return;
   }
 
