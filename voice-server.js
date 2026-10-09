@@ -268,7 +268,11 @@ function syncCamSecrets(force) {
   }).finally(() => { _secSyncing = false; });
 }
 setInterval(() => { syncCamSecrets(false); }, SEC_SYNC_MS).unref();
-setTimeout(() => { syncCamSecrets(true); }, 20 * 1000).unref();
+// ★ 启动后**尽快**同步（2 秒，原来是 20 秒）：
+//   S1 重启后到首次同步之间用的是**本地旧表** —— 那段时间里
+//   "刚被吊销的设备"仍会被放行（fail-open，危险方向 ✗）。
+//   本地表只是"S2 挂了时的兜底"，不该在启动后长时间当权威用 ⇒ 尽早拉一次 ✓
+setTimeout(() => { syncCamSecrets(true); }, 2 * 1000).unref();
 
 /* ══════════ CR-20261009-01：OTA（S1 只是代理，**决策只在 S2 一处** ✓）══════════
  * ★★ 为什么不把版本比较/灰度决策抄一份到 S1：那样就有两份必须永远一致的实现 ✗
