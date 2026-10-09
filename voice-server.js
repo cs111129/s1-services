@@ -944,10 +944,19 @@ const server = http.createServer(async (req, res) => {
           log(`cam 抓拍失败 -> ${dev}: ${camDeviceState[dev].shot_err}`);
         }
         // ★ CR-20261009-01：OTA 升级结果上报（fw / ota_state / ota_from）
+        // ★ CR-20261009-02 期1：新增 `ota_latest` —— 设备**查到有新版本但还没装**时带上它 ✓
         //   ⚠️ 与上面几条**同一套合并写入语义**：不带该字段的包**不许清掉已有值** ✗
-        //      （参照 vbat 那次的三条边界：老设备不带这三个字段 ⇒ 忽略、不报错、不清空 ✓）
+        //      （参照 vbat 那次的三条边界：老设备不带这些字段 ⇒ 忽略、不报错、不清空 ✓）
+        //   ★★ 为什么 `ota_latest` **单独一个字段**、不复用 `ota_state`（规格书 §4.1 ✓）：
+        //      `ota_state` = 「**上一次 OTA 的结果**」（历史事件 ✓）
+        //      `ota_latest` = 「**现在有一个新版本等你装**」（当前状态 ✓）
+        //      ⇒ 两个语义，混了就再也分不清"升完了"和"还有得升" ✗
+        //   ⚠️ 另外记一条（我方在回执 §10.2 提过）：本字段**会陈旧** ✗ ——
+        //      设备装完之后就不再发它 ⇒ 按"缺省不清旧值"服务端会**永远留着**旧版本号 ✓
+        //      ⇒ **判断"有没有可升级版本"必须用 `fw` × 服务器 target**（都是当前状态 ✓），
+        //        本字段只作"设备也已经知道了"的辅助信号 ✓
         let otaTouched = false;
-        ['fw', 'ota_state', 'ota_from'].forEach(k => {
+        ['fw', 'ota_state', 'ota_from', 'ota_latest'].forEach(k => {
           const v = o[k];
           if (v !== undefined && v !== null && String(v).trim() !== '') {
             camDeviceState[dev][k] = String(v).trim();
@@ -968,13 +977,14 @@ const server = http.createServer(async (req, res) => {
               + ` ota_state=${camDeviceState[dev].ota_state || '-'}`
               + ` ota_from=${camDeviceState[dev].ota_from || '-'}`
             : `cam 版本上报（常规）-> ${dev}: fw=${camDeviceState[dev].fw || '-'}`
+              + (camDeviceState[dev].ota_latest ? ` ota_latest=${camDeviceState[dev].ota_latest}` : '')
               + `（未带 ota_state/ota_from ⇒ 按合并语义保留旧值 ✓）`);
           // ★ 落 S2 台账（做持久化：S1 是内存态，重启就没了）
           //   ★ 失败必须**留日志**，不许静默（"降级可用"的 catch 一定要留证据 ✗）
           fetch(`${CAM_S2_DBAPI}/api/cam-ota-report`, {
             method: 'POST',
             headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ device_id: dev, fw: o.fw, ota_state: o.ota_state, ota_from: o.ota_from })
+            body: JSON.stringify({ device_id: dev, fw: o.fw, ota_state: o.ota_state, ota_from: o.ota_from, ota_latest: o.ota_latest })
           }).then(r => { if (!r.ok) log(`OTA 台账上报失败：HTTP ${r.status}（${dev}）`); })
             .catch(e => log(`OTA 台账上报异常：${e.message}（${dev}）`));
         }
@@ -1125,6 +1135,7 @@ function validateSetConfig(o) {
         fw: st.fw || null,
         ota_state: st.ota_state || null,
         ota_from: st.ota_from || null,
+        ota_latest: st.ota_latest || null,   // ★ CR-20261009-02：设备已知的可升级版本（★ 会陈旧 ⇒ 判据用 fw×target ✓）
         ota_at: st.ota_at || null,
         // ★★ 2026-09-23 新增：把【绑定状态】也报出来 —— 供 S2 判断"该清理谁"
         //   起因（S2 侧 CR-20260922-01 缺陷）：S2 清理 S1 上的陈旧绑定原来只靠自己的内存缓存，
@@ -1582,16 +1593,58 @@ function validateSetConfig(o) {
     '· 员工会照着做，编错了会出事 —— 拿不准就用【一般】【通常】这种留余地的说法'
   ].join('\n');
 
-  // 取该设备的上下文数组（没有 device 就返回 null = 无会话）
-  function chatHistoryOf(device) {
+  // 取该设备的上下文（★ 统一入口 —— 这是 2026-10-09 修的一个真 bug）
+  //
+  // ★★ 原来这里是 `chatHistoryOf(device)`，而"**清空**（reset=1）"和"**写回**"这两件事
+  //    分别嵌在 `/api/voice-chat` 与 `/api/voice-chat-stream` 的 **`else` 分支**里 ✗✗：
+  //      · `selfA`（人设固定问答，如「你是谁」）⇒ **既不写回、也不清空** ✗
+  //      · `!kb.ok`（知识库不可用）⇒ 同样 ✗
+  //    ⇒ 后果两条（设备端 2026-09-29 报的「`session` 恒为 #1」就是它）：
+  //      ① **追问接不上**：上一轮走了那两条路 ⇒ 这一轮的上下文里没有它 ✗
+  //      ② ★ **`reset=1` 会静默失效**：用户说"新话题"，但那一轮走了 selfA ⇒ **没清** ✗
+  //         下一轮（reset=0）还把旧上下文带上 ⇒ 与用户意图相反 ✗
+  //   ⇒ 修法：**把"取/清/记"收成三个纯函数**，两条端点都只调它们，
+  //     并且**在任何分支之前**就把 reset 处理掉 ✓（不依赖走哪条路 ✓）
+  //
+  // ★ 另一个能力（设备端 §16.3 建议的"双保险"）：**服务端自己按时间过期** ✓
+  //   设备端可能重烧/换固件 ⇒ **这边才是唯一真源** ✓
+  const CHAT_CTX_TTL_MS = 5 * 60 * 1000;   // 5 分钟没有新请求 ⇒ 丢上下文（当新会话）
+  function chatCtx(device, reset) {
     if (!device) return null;
+    const now = Date.now();
     let s = _chatSessions.get(device);
-    if (!s) { s = []; _chatSessions.set(device, s); }
-    if (_chatSessions.size > 500) {          // 防无界增长
+    if (!s || !Array.isArray(s.msgs)) { s = { msgs: [], at: now }; _chatSessions.set(device, s); }
+    if (now - (s.at || 0) > CHAT_CTX_TTL_MS) {           // ① 服务端按时间过期
+      if (s.msgs.length) log(`voice-chat: 上下文过期（${Math.round((now - s.at) / 1000)}s 无请求）⇒ 当新会话（device=${device}）`);
+      s.msgs.length = 0;
+    }
+    if (reset === '1') s.msgs.length = 0;                 // ② 设备说"新话题" ⇒ 清空
+    s.at = now;
+    if (_chatSessions.size > 500) {                       // 防无界增长
       const first = _chatSessions.keys().next().value;
       if (first !== device) _chatSessions.delete(first);
     }
     return s;
+  }
+  /** 取给模型用的历史（★ 会顺带处理"过期"与"新话题"✓ —— 所以必须在任何分支之前调一次 ✓） */
+  function chatMsgsFor(device, reset) {
+    const s = chatCtx(device, reset);
+    return s ? s.msgs.slice(-VOICE_CHAT_ROUNDS * 2) : null;
+  }
+  /** 记一轮问答（★ 所有"确实答过"的分支都要调 ✓ —— 见上面那段注释） */
+  function chatRecord(device, heard, reply) {
+    const s = chatCtx(device, '0');                       // ★ 传 '0'：记账时**不许**再清一次
+    if (!s) return;
+    s.msgs.push({ role: 'user', content: heard });
+    s.msgs.push({ role: 'assistant', content: reply });
+    while (s.msgs.length > VOICE_CHAT_ROUNDS * 2) s.msgs.shift();
+    s.at = Date.now();
+  }
+  /** 当前上下文深度（**只读**，供响应里的 `session` 用 ✓ 不给不存在的设备建条目 ✓） */
+  function chatDepthOf(device) {
+    if (!device) return 0;
+    const s = _chatSessions.get(device);
+    return s && Array.isArray(s.msgs) ? Math.ceil(s.msgs.length / 2) : 0;
   }
 
   // 查知识库。★ 返回 {ok, results, reliable} —— 三个状态必须分开：
@@ -1730,6 +1783,10 @@ function validateSetConfig(o) {
           res.end(JSON.stringify({ success: false, error: 'asr_empty' }));
           return;
         }
+        // ★★ 「新话题 / 过期」在**任何分支之前**统一处理（2026-10-09 修）——
+        //   原来这步嵌在 else 分支里 ⇒ 走 selfA 的那一轮**静默不清** ✗
+        //   ⇒ 用户说"新话题"，下一轮却还带着旧上下文，与意图相反 ✗
+        chatCtx(device, reset);
 
         // ② 知识库检索（★ 这一步是"先检索再回答"的核心）
         // ② ★ 固定问答（人设类）先行短路：这类问题不走知识库
@@ -1749,12 +1806,8 @@ function validateSetConfig(o) {
           reply = KB_DOWN_REPLY;
         } else {
           if (!kb.reliable) log('检索不可信 ⇒ 按用户要求交给模型凭通用经验回答（不再生硬说不知道）');
-          let history = null;
-          if (device) {
-            const s = chatHistoryOf(device);
-            if (reset === '1' && s) s.length = 0;
-            history = s ? s.slice(-VOICE_CHAT_ROUNDS * 2) : null;
-          }
+          // ★ 历史由 chatMsgsFor 给（"新话题/过期"已在上面统一处理过 ⇒ 这里传 '0' 不再清 ✓）
+          const history = chatMsgsFor(device, '0');
           try {
             const ans = await voiceChatAnswer(heard, kb.results, history, detail);
             reply = ans.reply;
@@ -1772,14 +1825,12 @@ function validateSetConfig(o) {
           // ★ 模型有时候还是会绕开"不知道"去编 ⇒ 再过一道：回复里出现明确兜底词就采用，
           //   否则要求它至少在参考内容里找得到依据（这里只做长度与空值兜底，不做语义判断）
           if (!reply) reply = NO_KB_REPLY;
-          // 写回上下文（只存真的答过的轮次）
-          if (device) {
-            const s = chatHistoryOf(device);
-            s.push({ role: 'user', content: heard });
-            s.push({ role: 'assistant', content: reply });
-            while (s.length > VOICE_CHAT_ROUNDS * 2) s.shift();
-          }
         }
+        // ★★ 记账放在**分支之外**（2026-10-09 修）——
+        //   原来它在 else 里 ⇒ `selfA`（人设自答）与 `!kb.ok`（知识库不可用）这两类轮次
+        //   **完全不进上下文** ✗ ⇒ 用户"接着追问"时模型看不见上一句 ✗
+        //   （设备端 2026-09-29 报的「`session` 恒为 #1」正是这个：数字停住 = 没在记 ✓）
+        chatRecord(device, heard, reply);
 
         // ④ ★ 服务端自己截断（别指望设备端，规格书 §4.4 写死了）
         //   ★ 按 audio_fmt 收上限：整段 WAV 要装进设备 1.5MB 缓冲（见 wavCapFor）
@@ -1838,7 +1889,7 @@ function validateSetConfig(o) {
           bits: afmt === 'ulaw8' ? 8 : 16,
           sample_rate: 16000,
           channels: 1,
-          session: device ? (device + '#' + Math.ceil((chatHistoryOf(device) || []).length / 2)) : ''
+          session: device ? (device + '#' + chatDepthOf(device)) : ''
         }, null, 0));
       } catch (e) {
         log(`⚠️ voice-chat 异常: ${e.message}`);
@@ -1973,6 +2024,8 @@ function validateSetConfig(o) {
         const asr = await handleASR(audioPart.data);
         const heard = (asr.text || '').trim();
         if (!heard) { log('voice-chat-stream: 没听清'); fail('asr_empty'); return; }
+        // ★★ 与 /api/voice-chat 同一处修正：「新话题 / 过期」在任何分支之前统一处理 ✓
+        chatCtx(device, reset);
 
         // 人设固定问答 / 知识库检索 / 三档长度 —— 与 /api/voice-chat 同一套逻辑
         const selfA = selfAnswer(heard);
@@ -1984,12 +2037,8 @@ function validateSetConfig(o) {
           reply = KB_DOWN_REPLY;
         } else {
           if (!kb.reliable) log('检索不可信 ⇒ 按用户要求交给模型凭通用经验回答（不再生硬说不知道）');
-          let history = null;
-          if (device) {
-            const s = chatHistoryOf(device);
-            if (reset === '1' && s) s.length = 0;
-            history = s ? s.slice(-VOICE_CHAT_ROUNDS * 2) : null;
-          }
+          // ★ 历史由 chatMsgsFor 给（"新话题/过期"上面已统一处理 ⇒ 传 '0' 不再清 ✓）
+          const history = chatMsgsFor(device, '0');
           try {
             const ans = await voiceChatAnswer(heard, kb.results, history, detail);
             reply = ans.reply; usage = ans.usage;
@@ -1999,13 +2048,10 @@ function validateSetConfig(o) {
             fail('llm_failed'); return;
           }
           if (!reply) reply = NO_KB_REPLY;
-          if (device) {
-            const s = chatHistoryOf(device);
-            s.push({ role: 'user', content: heard });
-            s.push({ role: 'assistant', content: reply });
-            while (s.length > VOICE_CHAT_ROUNDS * 2) s.shift();
-          }
         }
+        // ★★ 记账放在分支之外（与 /api/voice-chat 同一处修正 ✓）——
+        //   原来在 else 里 ⇒ selfA / 知识库不可用 那两类轮次不进上下文 ✗
+        chatRecord(device, heard, reply);
         const cap = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
         if (reply.length > cap) reply = reply.slice(0, cap) + '…';
         // ★★ 流式也要看**体积预算**（2026-10-07 用户实测"具体档没念完"后定位）
@@ -2027,7 +2073,7 @@ function validateSetConfig(o) {
         try { if (typeof res.flushHeaders === 'function') res.flushHeaders(); } catch (e) {}
         headLine(res, {
           success: true, text: oneLine(heard), reply: oneLine(reply),
-          session: device ? (device + '#' + Math.ceil((chatHistoryOf(device) || []).length / 2)) : '',
+          session: device ? (device + '#' + chatDepthOf(device)) : '',
           sample_rate: 16000, channels: 1,
           bits: afmt === 'ulaw8' ? 8 : 16, format: afmt === 'ulaw8' ? 'ulaw8' : 'pcm_s16le'
         });
