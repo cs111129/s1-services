@@ -1,6 +1,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');   // ★ CR-20261009-01：设备密钥定长比较（timingSafeEqual）
 const { exec, execFile, execSync } = require('child_process');
 const { promisify } = require('util');
 const WebSocket = require('ws');   // 新增：WebSocket（BOX-3 云语音）
@@ -112,17 +113,23 @@ function setCamBattery(dev, o) {
 //    "看起来日志在打"不等于"逻辑在跑"，尤其当状态被意外重置时。
 const CAM_SECRET_FILE = process.env.CAM_SECRET_FILE || '/root/cam-device-secrets.json';
 let _secCache = null, _secMtime = -1;
+// ★ CR-20261009-01：密钥 → 设备号 的**反向索引**（一机一密落地后，固件不发 X-Device-Id
+//   也能认出"是谁在请求" ✓ 顺带把「/api/cam-sop 不带 device_id ⇒ 岗位范围过滤一直失效」修掉 ✓）
+//   ⚠️ 只对**一机一密**的设备有效：还共用公共兜底密钥的设备，反向查必然查不到（那是正常的 ✓）
+let _secReverse = new Map();
 function camSecrets() {
   try {
     const st = fs.statSync(CAM_SECRET_FILE);
     if (_secCache && st.mtimeMs === _secMtime) return _secCache;   // 热加载：文件没变就用缓存
     _secCache = JSON.parse(fs.readFileSync(CAM_SECRET_FILE, 'utf8'));
     _secMtime = st.mtimeMs;
-    log(`cam 密钥表已加载: ${Object.keys(_secCache.devices || {}).length} 台设备, `
+    _secReverse = new Map();
+    Object.entries(_secCache.devices || {}).forEach(([id, s]) => { if (s) _secReverse.set(s, id); });
+    log(`cam 密钥表已加载: ${_secReverse.size} 台一机一密设备, `
+      + `已吊销 ${(_secCache.revoked || []).length} 台, `
       + `requireSecretOnUpload=${!!_secCache.requireSecretOnUpload}`);
   } catch (e) {
     if (!_secCache) {
-      // 文件不存在/坏了 → 退回旧行为（公共密钥、上传不强制），不能因此让设备全断
       _secCache = { devices: {}, fallbackSecret: CAM_DEVICE_SECRET, requireSecretOnUpload: false };
       log(`cam 密钥表读取失败(${e.message})，用公共密钥兜底`);
     }
@@ -130,21 +137,118 @@ function camSecrets() {
   return _secCache;
 }
 // 某台设备应该用的密钥：表里有就用表里的，没有就用公共兜底
+// ★★ 已吊销的设备返回 ''（= 永不匹配）—— **绝不回落公共兜底** ✗✗
+//   否则"吊销"会变成"降级成公共密钥"，等于吊销失效（同族：删掉 ≠ 停用）
 function deviceSecretOf(deviceId) {
   const c = camSecrets();
+  if (deviceId && (c.revoked || []).indexOf(deviceId) >= 0) return '';
   return ((c.devices || {})[deviceId]) || c.fallbackSecret || CAM_DEVICE_SECRET;
+}
+// 定长比较（避免按字符提前返回；密钥是 32 字节随机，这点加固很便宜）
+function secretEq(a, b) {
+  const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+  if (x.length !== y.length) return false;
+  try { return crypto.timingSafeEqual(x, y); } catch (e) { return false; }
 }
 function checkDeviceSecret(secret, deviceId) {
   if (!secret) return false;
-  return secret === deviceSecretOf(deviceId);
+  const want = deviceSecretOf(deviceId);
+  if (!want) return false;                       // 已吊销 ⇒ 谁都不匹配 ✓
+  return secretEq(secret, want);
+}
+/** 按密钥反查设备号（查不到返回 '' —— 共用公共密钥的设备查不到，属正常） */
+function deviceIdBySecret(secret) {
+  if (!secret) return '';
+  camSecrets();                                  // 确保索引是新的
+  return _secReverse.get(String(secret)) || '';
+}
+/**
+ * 凭据种类（★ 只有"领取密钥"那个端点用得上）：
+ *   'own'      自己的密钥（正常状态）
+ *   'prev'     轮换宽限期的**旧**密钥 —— ★ 只允许用来"重新领取"，不能用于任何其它接口 ✓
+ *   'fallback' 公共兜底密钥（还没一机一密的设备，首次领取走这条）
+ *   其他 ⇒ ''（拒绝）
+ */
+function credentialKind(secret, deviceId) {
+  if (!secret) return '';
+  const c = camSecrets();
+  if (deviceId && (c.revoked || []).indexOf(deviceId) >= 0) return '';   // 已吊销 ⇒ 连领取都不行
+  if (deviceId && (c.devices || {})[deviceId] && secretEq(secret, c.devices[deviceId])) return 'own';
+  if (deviceId && (c.prev || {})[deviceId] && secretEq(secret, c.prev[deviceId])) return 'prev';
+  if (c.fallbackSecret && secretEq(secret, c.fallbackSecret)) return 'fallback';
+  if (!c.fallbackSecret && secretEq(secret, CAM_DEVICE_SECRET)) return 'fallback';
+  return '';
 }
 // 从 请求头 / query / body 三处取凭据（阶段2 过渡期三处都认）
 function pickSecret(req, q, o) {
   return String(req.headers['x-device-secret'] || (q && q.secret) || (o && o.secret) || '').trim();
 }
 function pickDeviceId(req, q, o) {
-  return String(req.headers['x-device-id'] || (q && q.device_id) || (o && o.device_id) || '').trim();
+  const explicit = String(req.headers['x-device-id'] || (q && q.device_id) || (o && o.device_id) || '').trim();
+  if (explicit) return explicit;
+  // ★ CR-20261009-01：没给设备号 ⇒ **用密钥反查**（一机一密后每台密钥唯一 ⇒ 能认出来 ✓）
+  //   认不出来就返回 ''（= 保持老行为：按公共兜底校验、SOP 不过滤）⇒ 零回归 ✓
+  return deviceIdBySecret(pickSecret(req, q, o));
 }
+
+/* ══════════ CR-20261009-01：密钥表从 S2 同步 ══════════
+ * ★ 为什么是 S1 拉、不是 S2 推：S2 是唯一真源（后台在那里改），S1 只需定期同步；
+ *   拉了就写本地文件 ⇒ 复用上面那套【按 mtime 热加载】的现成逻辑，校验路径一行不用改 ✓
+ * ★ 三条纪律：
+ *   ① **只在内容变化时才写盘**（写了 mtime 就变 ⇒ 每 5 分钟刷一行重载日志）
+ *   ② **公共兜底密钥不外传**：同步只覆盖 devices/prev/revoked，
+ *      fallbackSecret / requireSecretOnUpload 是 S1 本地策略，保持不动 ✓
+ *   ③ **拉取失败绝不清空**（继续用现有表）—— 否则 S2 抖一下，全机队认证就崩 ✗
+ */
+const SEC_SYNC_MS = 5 * 60 * 1000;
+let _secSyncAt = 0, _secSyncing = false;
+function syncCamSecrets(force) {
+  if (_secSyncing) return Promise.resolve(false);
+  if (!force && Date.now() - _secSyncAt < SEC_SYNC_MS) return Promise.resolve(false);
+  _secSyncing = true;
+  return fetch(`${CAM_S2_DBAPI}/api/cam-secrets`, {
+    headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` }
+  }).then(r => {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(d => {
+    let cur = null;
+    try { cur = JSON.parse(fs.readFileSync(CAM_SECRET_FILE, 'utf8')); } catch (e) {}
+    const same = cur && JSON.stringify([cur.devices || {}, cur.prev || {}, cur.revoked || []])
+      === JSON.stringify([d.devices || {}, d.prev || {}, d.revoked || []]);
+    if (!same) {
+      const next = Object.assign({}, cur || {}, {
+        version: 2,
+        devices: d.devices || {},
+        prev: d.prev || {},
+        revoked: d.revoked || [],
+        // ★ 本机策略，不被 S2 覆盖
+        fallbackSecret: (cur && cur.fallbackSecret) || CAM_DEVICE_SECRET,
+        requireSecretOnUpload: cur ? !!cur.requireSecretOnUpload : true,
+        synced_at: new Date().toISOString(),
+        updated: d.updated || (cur && cur.updated) || '',
+      });
+      fs.writeFileSync(CAM_SECRET_FILE, JSON.stringify(next, null, 2), { mode: 0o600 });
+      log(`cam 密钥表已同步: 一机一密 ${Object.keys(next.devices).length} 台 / 已吊销 ${next.revoked.length} 台`);
+    }
+    _secSyncAt = Date.now();
+    return true;
+  }).catch(e => {
+    log(`cam 密钥表同步失败（继续用现有表，不清空）：${e.message}`);
+    _secSyncAt = Date.now() - SEC_SYNC_MS + 30000;   // 30 秒后重试
+    return false;
+  }).finally(() => { _secSyncing = false; });
+}
+setInterval(() => { syncCamSecrets(false); }, SEC_SYNC_MS).unref();
+setTimeout(() => { syncCamSecrets(true); }, 20 * 1000).unref();
+
+/* ══════════ CR-20261009-01：OTA（S1 只是代理，**决策只在 S2 一处** ✓）══════════
+ * ★★ 为什么不把版本比较/灰度决策抄一份到 S1：那样就有两份必须永远一致的实现 ✗
+ *   （刚做完的 SOP 判定提示词就是栽在这上面：两边一飘，同一个输入两个结果）
+ *   ⇒ S1 把 (device_id, ver) 转给 S2 的 `/api/cam-ota`，S2 用 ota-lib.decide() 出结论；
+ *     S1 只做协议翻译（把"无更新"翻成 **204 空 body**）✓
+ *   ⇒ S1 因此**不需要**自己拉策略表 —— 别顺手加一个没人调的 otaPolicy()（死代码 ✗）
+ */
 // 鉴权来源按【端点 + 来源】各记一次。
 // ★ 只看"有没有出现过 header"是不够的：设备可能只在 /api/cam/cmd 上加了头、
 //   而 /api/cam-upload 还没加 —— 那种情况下把 requireSecretOnUpload 置 true 会把上传全打断。
@@ -546,6 +650,105 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  /* ══════════ CR-20261009-01：OTA 版本查询 + 一机一密领取 ══════════ */
+
+  // GET /api/cam/ota?device_id=&ver=  —— 版本查询（灰度 = 服务器按 device_id 决定 ✓ 不加字段）
+  //   ★★ 这个端点的**失败语义**与别处不同，别照抄：
+  //     · 缺参       ⇒ 400（规格书 §8 明确"不要 500"）
+  //     · 没有新版本  ⇒ **204 + 空 body**（✗ 不要 {"version":null}）
+  //     · S2 不可达   ⇒ **也是 204**（= 没有更新 ⇒ 设备什么都不做，最安全）
+  //       ✗✗ 绝不能把 404/5xx 甩给设备：404 会被它当成"功能没上线 ⇒ **永久回退**"，
+  //          而 5xx 会让它每轮都重试、日志刷屏 —— 上线了就不该出现这两种 ✓
+  if (req.method === 'GET' && (req.url === '/api/cam/ota' || req.url.startsWith('/api/cam/ota?'))) {
+    const q = getQuery(req.url);
+    const dev = pickDeviceId(req, q, null);
+    const curVer = String(q.ver || '').trim();
+    const jsonOut = (code, obj) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    if (!dev) { jsonOut(400, { error: '缺少 device_id' }); return; }
+    if (!curVer) { jsonOut(400, { error: '缺少 ver（设备当前版本号）' }); return; }
+    if (!checkDeviceSecret(pickSecret(req, q, null), dev)) { jsonOut(401, { error: '设备密钥错误' }); return; }
+    logAuthSource(req, dev, 'ota');
+    // ★ 决策只在 S2 一处（ota-lib.decide）—— S1 只做协议翻译，不抄一份逻辑 ✗
+    fetch(`${CAM_S2_DBAPI}/api/cam-ota?device_id=${encodeURIComponent(dev)}&ver=${encodeURIComponent(curVer)}`, {
+      headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN }
+    }).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(d => {
+        if (!d || d.ok !== true || d.none === true || !d.version) {
+          log(`OTA 查询 ${dev} ver=${curVer} ⇒ 204（无更新）`);
+          res.writeHead(204); res.end();
+          return;
+        }
+        log(`OTA 查询 ${dev} ver=${curVer} ⇒ ${d.version}（${d.size} 字节）`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ version: d.version, url: d.url, size: d.size, sha256: d.sha256 || '' }));
+      })
+      .catch(e => {
+        log(`OTA 查询降级为 204（不打扰设备）：${e.message}`);
+        try { res.writeHead(204); res.end(); } catch (e2) {}
+      });
+    return;
+  }
+
+  // GET/POST /api/cam/device/secret?device_id=  —— 一机一密领取
+  //   ★★ 只在【后台预登记过】的设备才发（这条是防"拿公共密钥枚举设备号领完全机队密钥"的核心 ✗）
+  //   ★ 凭据可以是三种（见 credentialKind）：
+  //       自己的密钥 / 轮换宽限期的旧密钥（只允许用在这个端点 ✓）/ 公共兜底（首次领取的兼容路径）
+  //   ★ 领到后**立刻同步一次密钥表** —— 否则这台设备要等最多 5 分钟才能用上自己的新密钥 ✗
+  if ((req.method === 'GET' || req.method === 'POST') &&
+      (req.url === '/api/cam/device/secret' || req.url.startsWith('/api/cam/device/secret?'))) {
+    const q = getQuery(req.url);
+    const jsonOut = (code, obj) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    const doClaim = (o) => {
+      const dev = pickDeviceId(req, q, o);
+      const sec = pickSecret(req, q, o);
+      if (!dev) { jsonOut(400, { error: '缺少 device_id' }); return; }
+      const kind = credentialKind(sec, dev);
+      if (!kind) {
+        log(`设备领密钥被拒（凭据无效）: ${dev}`);
+        jsonOut(401, { error: '设备密钥错误' });
+        return;
+      }
+      log(`设备领密钥请求: ${dev}（现有凭据=${kind}）`);
+      fetch(`${CAM_S2_DBAPI}/api/cam-secret-claim`, {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: dev, via: kind })
+      }).then(r => r.json().then(d => ({ code: r.status, d: d })))
+        .then(out => {
+          const d = out.d;
+          if (!d || d.ok !== true || !d.secret) {
+            const code = out.code === 400 ? 400 : (out.code === 409 ? 409 : 403);
+            log(`设备领密钥被拒: ${dev} ⇒ HTTP ${out.code} ${(d && d.error) || ''}`);
+            jsonOut(code, { error: (d && d.error) || '不能领取密钥' });
+            return;
+          }
+          syncCamSecrets(true);                       // 让它马上生效
+          // ★ 日志只打**指纹**，绝不打印明文 secret（规格书 §6 硬要求）
+          const fp = crypto.createHash('sha256').update(String(d.secret)).digest('hex').slice(0, 12);
+          log(`设备已领取密钥: ${dev}（key_id=${d.key_id} fp=sha256:${fp}）`);
+          jsonOut(200, { secret: d.secret, key_id: d.key_id });
+        })
+        .catch(e => {
+          log(`设备领密钥失败: ${e.message}`);
+          jsonOut(502, { error: '领取通道暂时不可用，请稍后重试' });
+        });
+    };
+    if (req.method === 'GET') { doClaim(null); return; }
+    let cbody = '';
+    req.on('data', c => {
+      cbody += c;
+      if (cbody.length > 4096) { try { req.destroy(); } catch (e) {} }   // 这个端点不需要大 body
+    });
+    req.on('end', () => { let o = {}; try { o = JSON.parse(cbody || '{}'); } catch (e) {} doClaim(o); });
+    return;
+  }
+
   // GET /api/cam/cmd - 设备轮询待执行指令（设备每 3 秒调用）
   if (req.method === 'GET' && req.url.startsWith('/api/cam/cmd')) {
     const q = getQuery(req.url);
@@ -674,6 +877,31 @@ const server = http.createServer(async (req, res) => {
           camDeviceState[dev].shot_err = String(o.shot_err).trim();
           camDeviceState[dev].shot_err_at = Date.now();
           log(`cam 抓拍失败 -> ${dev}: ${camDeviceState[dev].shot_err}`);
+        }
+        // ★ CR-20261009-01：OTA 升级结果上报（fw / ota_state / ota_from）
+        //   ⚠️ 与上面几条**同一套合并写入语义**：不带该字段的包**不许清掉已有值** ✗
+        //      （参照 vbat 那次的三条边界：老设备不带这三个字段 ⇒ 忽略、不报错、不清空 ✓）
+        let otaTouched = false;
+        ['fw', 'ota_state', 'ota_from'].forEach(k => {
+          const v = o[k];
+          if (v !== undefined && v !== null && String(v).trim() !== '') {
+            camDeviceState[dev][k] = String(v).trim();
+            otaTouched = true;
+          }
+        });
+        if (o.ota_state === 'ok') camDeviceState[dev].ota_at = Date.now();
+        if (otaTouched) {
+          log(`cam 升级上报 -> ${dev}: fw=${camDeviceState[dev].fw || '-'}`
+            + ` ota_state=${camDeviceState[dev].ota_state || '-'}`
+            + ` ota_from=${camDeviceState[dev].ota_from || '-'}`);
+          // ★ 落 S2 台账（做持久化：S1 是内存态，重启就没了）
+          //   ★ 失败必须**留日志**，不许静默（"降级可用"的 catch 一定要留证据 ✗）
+          fetch(`${CAM_S2_DBAPI}/api/cam-ota-report`, {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device_id: dev, fw: o.fw, ota_state: o.ota_state, ota_from: o.ota_from })
+          }).then(r => { if (!r.ok) log(`OTA 台账上报失败：HTTP ${r.status}（${dev}）`); })
+            .catch(e => log(`OTA 台账上报异常：${e.message}（${dev}）`));
         }
         log(`cam 状态上报: ${dev} = ${o.status}`
           + (camDeviceState[dev].batt_pct !== undefined
@@ -817,6 +1045,12 @@ function validateSetConfig(o) {
         shot_ack_at: st.shot_ack_at || null,
         shot_err: st.shot_err || null,
         shot_err_at: st.shot_err_at || null,
+        // ★ CR-20261009-01：OTA / 固件版本（设备升级后随状态上报带上来）
+        //   ⚠️ 没上报过就是 null（前端显示"未知"），**不要显示成 0 或空版本号** ✗
+        fw: st.fw || null,
+        ota_state: st.ota_state || null,
+        ota_from: st.ota_from || null,
+        ota_at: st.ota_at || null,
         // ★★ 2026-09-23 新增：把【绑定状态】也报出来 —— 供 S2 判断"该清理谁"
         //   起因（S2 侧 CR-20260922-01 缺陷）：S2 清理 S1 上的陈旧绑定原来只靠自己的内存缓存，
         //   重启即失效 ⇒ S1 会一直留着旧绑定。S2 改用「向 S1 要设备清单」后，
