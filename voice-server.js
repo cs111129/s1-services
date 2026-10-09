@@ -1109,6 +1109,24 @@ function validateSetConfig(o) {
           return;
         }
 
+        // ★ CR-20261009-02 期3：用户手动触发升级（`ota_install`）
+        //   ★ 必须**显式加这一支** ✗ —— 本函数末尾是"其它 action 一律当 start/stop 录制"的兜底，
+        //     不写这一支的话，`action:'ota_install'` 会被当成**开始录制** ✗✗（凭空录一段）
+        //   ⚠️ 本接口只负责【入队】✓ —— "该不该给这台设备发"由 **S2** 判定
+        //     （策略与台账都在那边 ✓ 规格书 §5 #7「只对确实有可用版本的设备发」✓）
+        //   ★ 不带 version 字段：设备收到后会自己 `GET /api/cam/ota` 取版本 ✓
+        //     （塞一个设备不认识的字段没有好处 ✗ —— "缺省 = 自己查/保持原值"是本项目一贯口径 ✓）
+        if (action === 'ota_install') {
+          camCmdQueue[dev] = { cmd: 'ota_install', ts: Date.now() };
+          log(`cam 升级指令入队 -> ${dev}（用户手动触发 ✓）`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, cmd: 'ota_install' }));
+          return;
+        }
+        // ⚠️ 如实记一条隐患（不改行为，留日志）：走到这里的**未知 action** 会被当成录制 ✗
+        //   （现有调用方只有 start/stop/take_photo/set_config/ota_install ✓ 所以现在打不到 ✓）
+        if (action !== 'start' && action !== 'stop') log(`⚠️ cam cmd/send 收到未知 action="${action}" ⇒ 按录制处理（沿用旧行为 ✗ 见代码注释）`);
+
         const cmd = action === 'start' ? 'start_record' : 'stop_record';
         // 34号：透传 mode（full/video/audio）；同时保留 enable_audio 旧字段（由 mode 映射，固件优先认 mode）
         camCmdQueue[dev] = { cmd, ts: Date.now(), interval_ms: Number(o.interval_ms) || 0, max_seconds: Number(o.max_seconds) || 0, sop_id: o.sop_id || "", enable_audio: o.enable_audio !== false, mode: o.mode || "" };
