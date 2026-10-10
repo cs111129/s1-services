@@ -417,15 +417,26 @@ function matchSop(sops, text) {
 }
 
 function vcParams(sop, device) {
+  // ★★ 字段名与单位是**契约级**的事（2026-10-10 设备端自检⑦当场逮到 ✗✗）：
+  //   规格书 §4.1 写的是 `shot_interval_s`（秒 ✓）而**设备代码读的是 `shot_interval_ms`（毫秒 ✓）**
+  //   ⇒ 名字/单位对不上 ⇒ 设备**取不到** ⇒ **静默退回自己的默认节奏** ✗✗
+  //     而语音里念的是「每 5 秒一张」✓ ⇒ **显示的和实际做的不一样** ✓（他们最反对的那类 ✓）
+  //   ★ 他们已明确要求：「**`shot_interval_ms` 按数字发**（别写成字符串 ✗）」⇒ 这里照办 ✓
+  //     （**数字**类型 ✓ 毫秒 ✓）；★ §4.1 那处笔误请他们改 ✓ 否则下一个实现的人还会照错的写 ✗
+  //   ★ 一并采纳他们那条判据 ✓：**「能解析」和「解析对了」是两件事** ✗
+  //     ⇒ 自检必须**断言值**，不能只看"没报错" ✓（本次验收也照这个补了"断言值" ✓）
+  const sec = Math.round((_voiceLastInt.get(device) || (DEFAULT_SHOT_INTERVAL_S * 1000)) / 1000) || DEFAULT_SHOT_INTERVAL_S;
   return {
     sop_id: sop.id,
     sop_name: sop.name,
     mode: _voiceLastMode.get(device) || 'full',
-    shot_interval_s: Math.round((_voiceLastInt.get(device) || (DEFAULT_SHOT_INTERVAL_S * 1000)) / 1000) || DEFAULT_SHOT_INTERVAL_S
+    shot_interval_ms: sec * 1000        // ★ 数字（不带引号 ✓）· 单位毫秒 ✓
   };
 }
 function vcProposalText(p) {
-  return `按「${p.sop_name}」录制，${MODE_CN[p.mode] || p.mode}，每 ${p.shot_interval_s} 秒一张 —— 说"好"就开始，要改说"改只录音"`;
+  // ★ 给人念的是"秒"（人话 ✓）、给设备的字段是"毫秒"（契约 ✓）—— 两者刻意不同 ✗
+  //   ⇒ 换算只在这一处做 ✓（否则会念出"每 5000 秒一张"这种荒唐话 ✓）
+  return `按「${p.sop_name}」录制，${MODE_CN[p.mode] || p.mode}，每 ${Math.round(p.shot_interval_ms / 1000)} 秒一张 —— 说"好"就开始，要改说"改只录音"`;
 }
 
 /**
@@ -497,7 +508,7 @@ async function voiceCmdHandle(device, heard) {
     let sop = list.sops.find(s => s.id === list.last) || list.sops[0];
     const p = vcParams(sop, device);
     _voiceCmd.set(device, { params: p, at: Date.now() });
-    log(`语音命令: 「${heard}」⇒ 提议（${p.sop_name} / ${p.mode} / ${p.shot_interval_s}s）等确认`);
+    log(`语音命令: 「${heard}」⇒ 提议（${p.sop_name} / ${p.mode} / ${p.shot_interval_ms}ms）等确认`);
     return { reply: vcProposalText(p), action: 'ask_confirm', params: p };
   }
   return null;   // ── ③ 不是命令 ⇒ 交给原来的 LLM 流程 ✓ ──
