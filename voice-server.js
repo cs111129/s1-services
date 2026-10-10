@@ -215,6 +215,11 @@ function pickDeviceId(req, q, o) {
 //   ⇒ 越短越安全，代价只是每分钟一次内部 GET（可忽略 ✓）
 //   ★ 动因：实测"revoke 后 1 秒再打，S1 还按老表放行" ⇒ 吊销有 5 分钟窗口，不能接受 ✗
 const SEC_SYNC_MS = 60 * 1000;
+// ★ CR-20261010-01：语音命令总开关 —— **声明必须在这里**（就在 syncCamSecrets 上方 ✓）
+//   ⚠️ 别挪到下面那个大注释块里 ✗：`syncCamSecrets` 在下面会读写它，
+//      而 `let` 在**模块求值到那一行之前**是 TDZ ⇒ 一旦哪天有人在启动早期同步密钥就 ReferenceError ✓
+//      （现在只是"因为模块先求值完"才侥幸成立 ✗ —— 靠巧合的时序不是设计 ✓）
+let VOICE_CMD_ENABLED = false;
 let _secSyncAt = 0, _secSyncing = false;
 // ★★ 为什么要单独记一个"同步状态"：第一版**只在内容变化时打日志**，
 //   结果"同步成功但内容没变"完全看不见 —— 日志里只剩一条失败，
@@ -259,6 +264,12 @@ function syncCamSecrets(force) {
     }
     _secSyncState = 'ok';
     _secSyncAt = Date.now();
+    // ★ CR-20261010-01：顺带更新【语音命令】总开关（搭这条 60 秒同步的车 ✓ 不新增机制 ✓）
+    //   ★ 缺省/读不到 ⇒ **一律当关** ✗（fail-closed ✓ 绝不因为拿不到就默认打开 ✓）
+    //   ★ 状态迁移才打日志 —— "成功但没变"不该每分钟刷屏 ✓（同 _secSyncState 那套判据 ✓）
+    const vc = !!(d.flags && d.flags.voice_cmd_enabled);
+    if (vc !== VOICE_CMD_ENABLED) log(`cam 语音命令开关: ${VOICE_CMD_ENABLED ? '开' : '关'} → ${vc ? '开' : '关'}`);
+    VOICE_CMD_ENABLED = vc;
     return true;
   }).catch(e => {
     _secSyncState = 'fail';
@@ -333,6 +344,164 @@ const _voiceRate = {};   // ip -> { n, t }
 //   ★ 判据：**"每请求一次的局部变量"不能承担跨请求的状态** ——
 //     这类错误不报错、不崩，只是"记忆"永远为空 ✓（靠读响应看不出来，必须看变量的作用域 ✓）
 const _chatSessions = new Map();
+
+// ══════════════════════════════════════════════════════════════════════
+// ★ CR-20261010-01 期1：语音直接下命令（说「开始录制」就开录）
+//
+//   ★★ 为什么逻辑整条放这里（而不是"服务器推一条 start_record 指令"）✗：
+//      设备**播放期间收不到远程指令**（语音流程占住 cmd_task ✓ 长回答能占几十秒 ✓）
+//      ⇒ 推指令那条路会被拖到"播完之后" ✗ 用户体感"喊了半天没动" ✓
+//      ⇒ 所以用**响应里带 action**（与 `reply` 同一趟回来 ✓ 零额外往返 ✓）
+//
+//   ★ 定稿是用户拍板的「**一句话陈述 + 一次确认**」✓：
+//      没有 SOP 名 ⇒ 服务器一口气把三个参数**报出来**（`ask_confirm` ✓）等一句「好」
+//      带了 SOP 名且**匹配可信** ⇒ 直接开录 ✓ 不可信 ⇒ **必须反问，绝不许猜** ✗✗
+//      ★ 「拍照频率」**不问只报**（它是质量/成本旋钮 ✓ 不是"这次录什么" ✓）
+//
+//   ★ 消歧（词表里最容易出事的地方 ✗）：「开始」「好」在**等确认窗口内**是**应答** ✓，
+//      在窗口外才是**命令** ✓ ⇒ 必须靠状态区分，不能只靠词 ✓（否则闲聊里的"好"会误开录 ✗）
+//
+//   ★ 命令回合**不叫 LLM** ✗ —— `reply` 用模板拼 ✓ ⇒ 这就是 ≤3 秒目标的来源 ✓
+// ══════════════════════════════════════════════════════════════════════
+const VOICE_CMD_TTL_MS = 8000;        // "等回答"窗口，与设备端一致 ✓
+const _voiceCmd = new Map();          // device -> { params, at }   待确认的提议
+const _voiceLastMode = new Map();     // device -> 上次下发的 mode（提议默认值 ✓）
+const _voiceLastInt = new Map();      // device -> 上次下发的 interval_ms ✓
+const _sopCache = new Map();          // device -> { sops, last, at }  设备可见 SOP（60 秒缓存 ✓）
+const SOP_CACHE_MS = 60 * 1000;
+const DEFAULT_SHOT_INTERVAL_S = 5;    // ★ 期1 先用全局默认（"每个 SOP 自己的默认"SOP 数据里还没有 ✗ 已记进回执 ✓）
+
+// ── 词表（★ 与回执 §9.2 给设备端的那份一一对应 ✓ 改这里要同步改文档 ✗）──
+const VC_RE = {
+  // ★ 命令形状：句首是"开始/来/帮我"这类祈使，且必须落到"录制/录像/录音/记录"
+  //   ⚠️ 故意**不认**"录音怎么弄""录制要注意什么"这类问句 ⇒ 用"问句词"做负向过滤 ✓
+  start: /^(现在|马上|帮我|帮忙|来|请)?\s*(开始|启动|进行)?\s*(录制|录像|录音|录一段|录一个|录一下|记录拍摄)/,
+  stop: /^(现在|马上|帮我|帮忙|请)?\s*(结束|停止|停|别录|不要录|录完|收工|关掉录制)/,
+  affirm: /^(好|好的|好啊|行|可以|嗯|对|没问题|开始|开始吧|就这样|是的|OK|ok)[。！!，,\s]*$/,
+  deny: /^(不|不用|不要|取消|算了|等一下|先不|先别|暂停)[。！!，,\s]*$/,
+  modify: /(改成?|换成?|改一下|只录音|只录像|不要录像|不要录音|不拍照|换一个|换一个流程|不是这个)/
+};
+const VC_ASK_WORDS = /(怎么|如何|为什么|啥|什么|吗|呢|哪|要不要|能不能|可不可以)/;   // 问句 ⇒ 不当命令 ✓
+const MODE_CN = { full: '录像+录音', video: '只录像', audio: '只录音' };
+
+/** 归一化：去掉空白与常见标点（词表匹配前统一处理 ✓） */
+function vcNorm(s) { return String(s || '').replace(/[\s，。！？!?、,.：:；;"'“”‘’()（）]/g, ''); }
+
+/** 取"这台设备可见的 SOP 名单"（★ 从 S2 拿，60 秒缓存 ✓；失败 ⇒ 返回 null，调用方一律当"不可用" ✗） */
+function fetchSopList(device) {
+  const c = _sopCache.get(device);
+  if (c && Date.now() - c.at < SOP_CACHE_MS) return Promise.resolve(c);
+  return fetch(`${CAM_S2_DBAPI}/api/cam-sop-list?device_id=${encodeURIComponent(device)}`, {
+    headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` }
+  }).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(d => {
+      const v = { sops: (d && d.sops) || [], last: (d && d.last_sop_id) || '', at: Date.now() };
+      _sopCache.set(device, v);
+      return v;
+    })
+    .catch(e => {
+      log(`语音命令：取 SOP 名单失败（本次按"不可用"处理 ✗，绝不猜 SOP）：${e.message}`);
+      return null;
+    });
+}
+
+/** 在"设备可见名单"里按名字匹配（★ 命中唯一才叫可信 ✓ 命中多条 ⇒ 不可信 ✗） */
+function matchSop(sops, text) {
+  const t = vcNorm(text);
+  const hit = sops.filter(s => { const n = vcNorm(s.name); return n && t.indexOf(n) >= 0; });
+  if (hit.length === 1) return { ok: true, sop: hit[0] };
+  if (hit.length > 1) return { ok: false, why: '命中多条', hit };
+  // 退一步：名字里**包含**用户说到的关键词（≥2 字），同样要求唯一 ✓
+  const loose = sops.filter(s => { const n = vcNorm(s.name); return n.length >= 2 && [...new Set(n)].some(ch => t.includes(ch) && n.includes(ch)); });
+  return { ok: false, why: hit.length === 0 ? '没听出流程名' : '多义', hit: hit.length ? hit : loose };
+}
+
+function vcParams(sop, device) {
+  return {
+    sop_id: sop.id,
+    sop_name: sop.name,
+    mode: _voiceLastMode.get(device) || 'full',
+    shot_interval_s: Math.round((_voiceLastInt.get(device) || (DEFAULT_SHOT_INTERVAL_S * 1000)) / 1000) || DEFAULT_SHOT_INTERVAL_S
+  };
+}
+function vcProposalText(p) {
+  return `按「${p.sop_name}」录制，${MODE_CN[p.mode] || p.mode}，每 ${p.shot_interval_s} 秒一张 —— 说"好"就开始，要改说"改只录音"`;
+}
+
+/**
+ * ★ 语音命令总入口：**在 ASR 之后、KB/LLM 之前**调 ✓
+ * @returns {null}                       ⇒ 不是命令 ⇒ 走原来的流程（LLM ✓ 且响应里**不加** action ✓）
+ *          {reply, action, params}      ⇒ 是命令 ⇒ **直接回，不叫 LLM** ✓
+ */
+async function voiceCmdHandle(device, heard) {
+  if (!VOICE_CMD_ENABLED || !device) return null;
+  const t = vcNorm(heard);
+  if (!t) return null;
+  const pending = _voiceCmd.get(device);
+  const fresh = pending && (Date.now() - pending.at < VOICE_CMD_TTL_MS);
+  if (pending && !fresh) _voiceCmd.delete(device);      // ★ 超时 ⇒ 当作"没有待确认"✓
+
+  // ── ① 正在等确认 ⇒ 这句话优先当【应答】解释 ✓ ──
+  if (fresh) {
+    if (VC_RE.affirm.test(t)) {                          // 「好」⇒ 开录 ✓
+      _voiceCmd.delete(device);
+      log(`语音命令: 「${heard}」⇒ 确认开录（${pending.params.sop_name} / ${pending.params.mode}）`);
+      return { reply: '开始录制', action: 'start_record', params: pending.params };
+    }
+    if (VC_RE.deny.test(t)) {                             // 「不用了」⇒ 取消 ✓
+      _voiceCmd.delete(device);
+      log(`语音命令: 「${heard}」⇒ 用户取消`);
+      return { reply: '好，已取消', action: null, params: null };
+    }
+    if (VC_RE.modify.test(t)) {                           // 「改只录音」⇒ 重述一遍再确认 ✓
+      const p = Object.assign({}, pending.params);
+      if (/只录音|不要录像|不录像|改录音/.test(t)) p.mode = 'audio';
+      else if (/只录像|不要录音|不录音|改录像/.test(t)) p.mode = 'video';
+      else if (/录像录?音|都录|全录/.test(t)) p.mode = 'full';
+      const sp = matchSop((await fetchSopList(device) || {}).sops || [], t);   // 「换成XX」⇒ 换 SOP ✓
+      if (sp.ok) { p.sop_id = sp.sop.id; p.sop_name = sp.sop.name; }
+      _voiceCmd.set(device, { params: p, at: Date.now() });
+      log(`语音命令: 「${heard}」⇒ 改参数后重述（${p.sop_name} / ${p.mode}）`);
+      return { reply: vcProposalText(p), action: 'ask_confirm', params: p };
+    }
+    // 其它话 ⇒ 不当应答（窗口留着等超时 ✓），按普通对话回答 ✓
+    return null;
+  }
+
+  // ── ② 没有待确认 ⇒ 这句话可能是【命令】✓ ──
+  if (VC_RE.stop.test(t) && !VC_ASK_WORDS.test(t)) {
+    log(`语音命令: 「${heard}」⇒ 结束录制`);
+    return { reply: '结束录制', action: 'stop_record', params: null };
+  }
+  if (VC_RE.start.test(t) && !VC_ASK_WORDS.test(t)) {
+    const list = await fetchSopList(device);
+    if (!list || !list.sops.length) {
+      // ★ 拿不到名单 ⇒ **绝不猜** ✗（判据同设备端 §4.3 第 6 条 ✓）
+      log(`语音命令: 「${heard}」⇒ 匹配不可信（${list ? '该设备可见 SOP 为 0' : 'SOP 名单取不到'}）⇒ 反问，不开录 ✗`);
+      return { reply: '我这边暂时查不到你可以录的流程，请在屏幕上选一下', action: null, params: null };
+    }
+    // ① 用户**说出了流程名** ⇒ 匹配 ✓ 可信就直接开录，不可信就反问 ✓
+    const named = list.sops.some(s => vcNorm(s.name) && t.indexOf(vcNorm(s.name)) >= 0);
+    if (named) {
+      const m = matchSop(list.sops, t);
+      if (m.ok) {
+        const p = vcParams(m.sop, device);
+        _voiceCmd.set(device, { params: p, at: Date.now() });   // 也存一份：用户可能还要改 ✓
+        log(`语音命令: 「${heard}」⇒ 匹配可信「${m.sop.name}」⇒ 直接开录`);
+        return { reply: '开始录制', action: 'start_record', params: p };
+      }
+      log(`语音命令: 「${heard}」⇒ 匹配不可信（${m.why}）⇒ 反问，不开录 ✗`);
+      return { reply: '没听清是哪个流程，请说一遍流程名，或者在屏幕上选一下', action: null, params: null };
+    }
+    // ② 没报流程名 ⇒ **提议**（默认值：上次那台录过的 ✓ 没有就第一条 ✓）
+    let sop = list.sops.find(s => s.id === list.last) || list.sops[0];
+    const p = vcParams(sop, device);
+    _voiceCmd.set(device, { params: p, at: Date.now() });
+    log(`语音命令: 「${heard}」⇒ 提议（${p.sop_name} / ${p.mode} / ${p.shot_interval_s}s）等确认`);
+    return { reply: vcProposalText(p), action: 'ask_confirm', params: p };
+  }
+  return null;   // ── ③ 不是命令 ⇒ 交给原来的 LLM 流程 ✓ ──
+}
 // ★★ 取客户端 IP：**必须优先 X-Real-IP，不能用 X-Forwarded-For 的第一个** ✗
 //   原因：nginx 那边两个头来源不同 ——
 //     · `X-Real-IP $remote_addr`        = nginx 拿到的真实对端地址，**客户端伪造不了** ✓
@@ -1128,6 +1297,13 @@ function validateSetConfig(o) {
         if (action !== 'start' && action !== 'stop') log(`⚠️ cam cmd/send 收到未知 action="${action}" ⇒ 按录制处理（沿用旧行为 ✗ 见代码注释）`);
 
         const cmd = action === 'start' ? 'start_record' : 'stop_record';
+        // ★ CR-20261010-01：记住这台设备上次用的 mode / 拍照频率
+        //   ⇒ 语音提议时拿来做默认值（规格书 §3.2「设置里的上次选择」✓）
+        //   ★ 只记内存、不落盘：丢了就退回 full / 5 秒 ✓（默认值而已，不是事实 ✓）
+        if (action === 'start') {
+          _voiceLastMode.set(dev, String(o.mode || 'full'));
+          if (Number(o.interval_ms) > 0) _voiceLastInt.set(dev, Number(o.interval_ms));
+        }
         // 34号：透传 mode（full/video/audio）；同时保留 enable_audio 旧字段（由 mode 映射，固件优先认 mode）
         camCmdQueue[dev] = { cmd, ts: Date.now(), interval_ms: Number(o.interval_ms) || 0, max_seconds: Number(o.max_seconds) || 0, sop_id: o.sop_id || "", enable_audio: o.enable_audio !== false, mode: o.mode || "" };
         log(`cam 指令入队: ${cmd} -> ${dev}`);
@@ -1830,6 +2006,19 @@ function validateSetConfig(o) {
         //   ⇒ 用户说"新话题"，下一轮却还带着旧上下文，与意图相反 ✗
         chatCtx(device, reset);
 
+        // ★ CR-20261010-01 期1：语音命令优先（★ 在 KB/LLM **之前** ✓ 命中就**不叫模型** ✓ ⇒ 这才是 ≤3 秒的来源 ✓）
+        const vcOld = await voiceCmdHandle(device, heard);
+        if (vcOld) {
+          if (vcOld.action) chatRecord(device, heard, vcOld.reply);   // 命令也算一轮对话 ✓
+          log(`voice-chat ✓ device=${device || '-'} ★命令回合(不叫LLM) action=${vcOld.action || '-'} heard="${heard.slice(0, 20)}"`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(Object.assign({
+            success: true, text: oneLine(heard), reply: vcOld.reply,
+            session: device ? (device + '#' + chatDepthOf(device)) : ''
+          }, vcOld.action ? { action: vcOld.action } : {}, vcOld.params ? { params: vcOld.params } : {})));
+          return;
+        }
+
         // ② 知识库检索（★ 这一步是"先检索再回答"的核心）
         // ② ★ 固定问答（人设类）先行短路：这类问题不走知识库
         const selfA = selfAnswer(heard);
@@ -2072,11 +2261,20 @@ function validateSetConfig(o) {
         // ★★ 与 /api/voice-chat 同一处修正：「新话题 / 过期」在任何分支之前统一处理 ✓
         chatCtx(device, reset);
 
+        // ★ CR-20261010-01 期1：语音命令优先（与 /api/voice-chat 同一份判定 ✓ 只是这里**不能早退** ✗
+        //   —— 流式端点是"一行 JSON 头 + 裸 PCM"✓ 早退会让设备等不到音频 ✓
+        //   ⇒ 做法：命中命令时**跳过 KB/LLM**，但仍然走下面的"发头 + 合成" ✓）
+        const vcS = await voiceCmdHandle(device, heard);
+
         // 人设固定问答 / 知识库检索 / 三档长度 —— 与 /api/voice-chat 同一套逻辑
-        const selfA = selfAnswer(heard);
-        const kb = selfA ? { ok: true, results: [], reliable: false } : await kbSearchForVoice(heard);
+        const selfA = vcS ? null : selfAnswer(heard);
+        const kb = vcS ? { ok: true, results: [], reliable: true, maxScore: 0 }
+                       : (selfA ? { ok: true, results: [], reliable: false } : await kbSearchForVoice(heard));
         let reply, usage = null;
-        if (selfA) {
+        if (vcS) {
+          reply = vcS.reply;                                  // ★ 命令回合不叫 LLM ✓
+          log(`voice-chat-stream ✓ device=${device || '-'} ★命令回合(不叫LLM) action=${vcS.action || '-'} heard="${heard.slice(0, 20)}"`);
+        } else if (selfA) {
           reply = selfA;
         } else if (!kb.ok) {
           reply = KB_DOWN_REPLY;
@@ -2120,7 +2318,10 @@ function validateSetConfig(o) {
           success: true, text: oneLine(heard), reply: oneLine(reply),
           session: device ? (device + '#' + chatDepthOf(device)) : '',
           sample_rate: 16000, channels: 1,
-          bits: afmt === 'ulaw8' ? 8 : 16, format: afmt === 'ulaw8' ? 'ulaw8' : 'pcm_s16le'
+          bits: afmt === 'ulaw8' ? 8 : 16, format: afmt === 'ulaw8' ? 'ulaw8' : 'pcm_s16le',
+          // ★ CR-20261010-01：命令回合才带这两个字段 ✓（不是命令 ⇒ 一个都不加 ⇒ 老固件 behavior 完全不变 ✓）
+          ...(vcS && vcS.action ? { action: vcS.action } : {}),
+          ...(vcS && vcS.params ? { params: vcS.params } : {})
         });
         await new Promise(r => setImmediate(r));   // ★ 让 libuv 把上面这一行真正写到 socket 再继续
         const tHead = Date.now();
