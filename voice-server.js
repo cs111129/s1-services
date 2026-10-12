@@ -794,6 +794,94 @@ function parseReadMemoCmd(heard) {
   return { index: 0 };                                            // ★ 只有"最后一条" ✓ 同上 ✗
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// ★★ CR-20261012-01 期3：**倒计时**（`set_timer` / `stop_timer`）✓
+//
+//   ★ 与期1「定闹钟」的边界（**刻意不混** ✗）：
+//     · 带「**倒计时 / 计时**」字样的 ⇒ 走 `set_timer` ✓（例：「定个五分钟的倒计时」✓）
+//     · 「**N 分钟后提醒我**」⇒ ★ **仍然走 `add_alarm`** ✗（期1 已定的口径 ✓ 设备端已验过 ✓）
+//       ⇒ 理由：那条是"到点提醒"（进闹钟列表 ✓ 界面上是一条 15:41 的闹钟 ✓）
+//         而倒计时是**看着剩余时间走**✓ —— 两者语义不同 ✓ 别混 ✓
+//       ⚠️ 但用户可能更想要后者 ⇒ ★ 这条**留给用户拍板** ✗（改起来是一行 ✓ 不擅自改 ✗）
+//
+//   ★★ 又一处**顺序陷阱**（与期2 同族 ✗）：「**取消倒计时**」里也有"倒计时" ✗
+//     ⇒ 必须先判 **stop** 再判 **set** ✓（动词优先 ✓ 见 `extraCmdHandle` ✓）
+//
+//   ★ `seconds` 的上下限：设备端口径**还没给** ✗（回执里问了 ✓）
+//     ⇒ 我方先按 **1 秒 ~ 24 小时** ✓ 并把界限**收在一个常量里** ✓（他们一答就改一行 ✓）
+//     ★ 越界 ⇒ **不下发** ✗ ＋ 说清楚 ✓（★ 绝不像闹钟那样"按一个我自己挑的时长定下去" ✗）
+// ══════════════════════════════════════════════════════════════════════
+const TIMER_MIN_SEC = 1;
+const TIMER_MAX_SEC = 24 * 3600;      // ★ 上限先拍 24 小时 —— 等设备端口径 ✓
+
+/** 秒数说成人话 ✓（★ 与 `clockCn` 同一路数：**只此一处** ✗ 别处再写必然写歪 ✓）
+ *  ⚠️ 分钟要用 **floor** 不是 round ✗✗：90 秒 = 1 分 30 秒 ✓
+ *     第一版写 `Math.round(sec%3600/60)` ⇒ 1.5 被四舍五入成 **2** ⇒ 「二分三十秒」✗（单测逮到 ✓）
+ *  ★ 有余秒时优先说"X 分 Y 秒" ✓（比"二分钟"精确 ✓ 用户能对上 ✓）*/
+function durCn(sec) {
+  sec = Math.round(Number(sec) || 0);
+  if (sec < 60) return cnStr(sec) + '秒';
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), r = sec % 60;
+  if (h && (m || r)) return cnStr(h) + '小时' + (m ? cnStr(m) + '分钟' : '') + (r ? cnStr(r) + '秒' : '');
+  if (h) return cnStr(h) + '小时';
+  if (r) return cnStr(m) + '分' + cnStr(r) + '秒';        // 90 ⇒ 一分三十秒 ✓
+  if (m === 30) return '半小时';
+  return cnStr(m) + '分钟';
+}
+
+/** ★ 意图⑥：定倒计时 ⇒ `set_timer {seconds[, label]}` ✓
+ *  ★ 形态：「定个五分钟的倒计时」/「倒计时五分钟」/「计时十分钟」/「定个五分钟的倒计时，煮鸡蛋」✓
+ *  ★ 时长数字**复用同一个 `NUM_RE` + `cnNum`** ✓（★ 不另写词表 ✗ —— 实测 ASR 中文/阿拉伯混着来 ✓）
+ *  ⚠️ 两个**单测逮到**的坑 ✗：
+ *    ① 「**一个半小时**」必须**先**判 ✗ —— 否则通用正则先匹配到「半小时」⇒ 只算 0.5h ✗（5400 变 1800 ✓）
+ *    ② label 里必须把「**倒计时/计时/定时**」也摘掉 ✗ —— 否则回复会念成
+ *       「好，五分钟倒计时开始了，**倒计时**」✗（第一版就是这样 ✓ 荒唐但很难自己看出来 ✓）
+ */
+function parseSetTimerCmd(heard) {
+  const t = vcNorm(heard);
+  if (!/(倒计时|计时|定时)/.test(t)) return null;
+  if (VC_ASK_WORDS.test(t)) return null;                        // "倒计时怎么用"不是命令 ✓
+  if (/(取消|停|停止|关掉|结束|不要了)/.test(t)) return null;    // 带"停/取消"的交给 stop ✓
+  const cuts = [];
+  let sec = null;
+  // ① 先判「N 个半小时」✗（必须在通用式之前 ✓）
+  const mh = t.match(new RegExp('(' + NUM_RE + ')\\s*个?\\s*半\\s*(个)?\\s*(小时|钟头)'));
+  if (mh) {
+    const n = cnNum(mh[1]);
+    if (n === null) return null;
+    sec = Math.round(n * 3600) + 1800;
+    cuts.push(mh[0]);
+  } else {
+    // ② 通用：N(个)(小时|分钟|分|秒) / 半小时
+    const m = t.match(new RegExp('(' + NUM_RE + '|半)\\s*个?\\s*(小时|钟头|分钟|分|秒)'));
+    if (!m) return null;
+    const n = m[1] === '半' ? 0.5 : cnNum(m[1]);
+    if (n === null || !(n > 0)) return null;
+    const unit = m[2];
+    sec = /小时|钟头/.test(unit) ? Math.round(n * 3600) : (/秒/.test(unit) ? Math.round(n) : Math.round(n * 60));
+    cuts.push(m[0]);
+    // ★「一小时**半**」这种（不是"N个半小时"）⇒ 补上 ✓
+    if (!/半/.test(m[1]) && /小时|钟头/.test(unit) && /半/.test(t)) sec += 1800;
+  }
+  if (sec === null) return null;
+  if (sec < TIMER_MIN_SEC || sec > TIMER_MAX_SEC) return { outOfRange: true, seconds: sec };
+  // ③ label = 原文去掉时长 + 去掉触发词 ✓（★ 触发词不摘 ⇒ 会念出"…开始了，倒计时"✗）
+  const label = stripWhen(heard, cuts.concat(['倒计时', '计时', '定时']))
+    .replace(/^(的|，|,|、)+/, '').replace(/(的|，|,|、)+$/, '').trim();
+  const p = { seconds: sec };
+  if (label) p.label = label;                                    // ★ 没标签就不带这个字段 ✗
+  return p;
+}
+
+/** ★ 意图⑦：停倒计时 ⇒ `stop_timer`（无参数 ✓）*/
+function parseStopTimerCmd(heard) {
+  const t = vcNorm(heard);
+  if (!/(倒计时|计时)/.test(t)) return null;
+  if (!/(取消|停掉|停止|停|关掉|结束|不要了|别响)/.test(t)) return null;
+  if (VC_ASK_WORDS.test(t)) return null;
+  return { stop: true };
+}
+
 /** 把新意图接进总入口 ✓（★ 顺序见上面那条铁律 ✗ 动词优先 ✓）*/
 function extraCmdHandle(heard) {
   // ── ① 先判**删闹钟**（"取消九点的闹钟"必须在这里被吃掉 ✗ 晚一步就被当成新增 ✓）──
@@ -820,7 +908,27 @@ function extraCmdHandle(heard) {
     log(`语音命令: 「${heard}」⇒ read_memo ${JSON.stringify(rm)}｜reply="${reply}"（★ 正文由设备念 ✓ 我方不抢话 ✓）`);
     return { reply, action: 'read_memo', params: rm };
   }
-  // ── ④ 定闹钟 / 记备忘（**新增**一律排最后 ✓ 它们只凭名词就能命中 ✗）──
+  // ── ④ ★ 期3：**先判"停倒计时"、再判"定倒计时"** ✗（"取消倒计时"里也有"倒计时" ✓ 同一条铁律 ✓）──
+  const stp = parseStopTimerCmd(heard);
+  if (stp) {
+    const reply = '好，取消倒计时';
+    log(`语音命令: 「${heard}」⇒ stop_timer（无参数 ✓）｜reply="${reply}"`);
+    return { reply, action: 'stop_timer', params: null };
+  }
+  const st = parseSetTimerCmd(heard);
+  if (st) {
+    if (st.outOfRange) {
+      // ★★ 越界 ⇒ **不下发** ✗ ＋ 说清楚 ✓ —— 绝不按一个我自己挑的时长定下去 ✗
+      //   （对比："定闹钟"那条也有越界，但那边设备会拒绝 ✓；倒计时这边**先由我拦住** ✓ 省一趟 ✓）
+      const reply = '倒计时' + (st.seconds > TIMER_MAX_SEC ? '最长只能定一天，这个我没法定' : '太短了，这个我没法定');
+      log(`语音命令: 「${heard}」⇒ set_timer 越界（${st.seconds}s，界限 ${TIMER_MIN_SEC}~${TIMER_MAX_SEC}s）⇒ **不下发** ✗｜reply="${reply}"`);
+      return { reply, action: null, params: null };
+    }
+    const reply = '好，' + durCn(st.seconds) + '倒计时开始了' + (st.label ? '，' + st.label : '');
+    log(`语音命令: 「${heard}」⇒ set_timer ${JSON.stringify(st)}｜reply="${reply}"`);
+    return { reply, action: 'set_timer', params: st };
+  }
+  // ── ⑤ 定闹钟 / 记备忘（**新增**一律排最后 ✓ 它们只凭名词就能命中 ✗）──
   const a = parseAlarmCmd(heard);
   if (a) {
     const reply = alarmReply(a);
