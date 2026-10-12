@@ -972,6 +972,121 @@ function extraCmdHandle(heard) {
   }
   return null;
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// ★★★ CR-20261012-03 §9 期0：**影子模式**（shadow）—— 只记录，绝不执行 ✓
+//
+//   ★ 目的：在**不改线上任何行为**的前提下，拿到"**模型会怎么判**" vs "**现在代码怎么判**"的真实数据 ✓
+//     ⇒ 再决定"哪些交给模型、哪些必须留确定性" ✓ 而不是凭感觉全换 ✗
+//
+//   ★★★ 三条红线（违反任何一条都会伤到线上 ✗）：
+//     ① **绝不 await** ✓ —— fire-and-forget，请求该多快还多快 ✓
+//     ② **绝不改任何返回值** ✓ —— 只读 `heard` 与"已知的旧判定" ✓ 不碰响应/设备状态 ✓
+//     ③ **抛错只吞** ✓ —— 影子坏了不能影响主流程 ✓（整个函数体包 try/catch ✓）
+//
+//   ★ 成本控制：滑动窗口限频（`SHADOW_MAX_PER_MIN` ✓ 默认 30 ✓）
+//     ★★ 被丢弃的调用要**计数并打日志** ✗ —— 否则"样本被限频削过"会让指标**系统性失真** ✗
+//
+//   ★ 开关：`SHADOW_MODE=on`（默认 **off** ✓ ⇒ 关掉即回退，不用改代码 ✓）
+//   ★ 日志格式：`SHADOW {json}` 一行 ✓（给 `shadow-report.js` 聚合 ✓ 别改字段名 ✗）
+// ══════════════════════════════════════════════════════════════════════
+const SHADOW_MODE = process.env.SHADOW_MODE === 'on';
+const SHADOW_MODEL = process.env.SHADOW_MODEL || 'deepseek-chat';
+const SHADOW_MAX_PER_MIN = Math.max(1, parseInt(process.env.SHADOW_MAX_PER_MIN || '30', 10));
+const SHADOW_TIMEOUT_MS = parseInt(process.env.SHADOW_TIMEOUT_MS || '9000', 10);
+// ★ 工具表 = 规格书 §5 ✓：★★ 参数**只填原话片段**（`time_text` / `duration_text`）✗
+//   探针实测：让模型填结构化数字 ⇒ 它会自己造名字（`set_alarm(time,date)` ✗）⇒ 必须只给"原话槽位" ✓
+const SHADOW_TOOLS = [
+  { type: 'function', function: { name: 'search_kb', description: '查店里的 SOP / 标准 / 流程 / 规定（问"怎么做""标准是什么"时用）',
+    parameters: { type: 'object', properties: { query: { type: 'string', description: '检索词' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'start_record', description: '让设备开始录制（用户说开始录制 / 开始录XX）',
+    parameters: { type: 'object', properties: { sop_text: { type: 'string', description: '用户说的 SOP 名字原话，没提就不填' } } } } },
+  { type: 'function', function: { name: 'stop_record', description: '让设备停止录制', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'set_alarm', description: '定闹钟 / 到点提醒',
+    parameters: { type: 'object', properties: { time_text: { type: 'string', description: '时间原话，如"明天九点""15分钟后"' }, label: { type: 'string', description: '提醒什么事，可空' } }, required: ['time_text'] } } },
+  { type: 'function', function: { name: 'cancel_alarm', description: '取消闹钟',
+    parameters: { type: 'object', properties: { time_text: { type: 'string', description: '时间原话；说"最后那个"就别填' }, which: { type: 'string', enum: ['last'], description: '指"最后一个"时填 last' } } } } },
+  { type: 'function', function: { name: 'add_memo', description: '记一条备忘',
+    parameters: { type: 'object', properties: { text: { type: 'string', description: '要记的内容本身' } }, required: ['text'] } } },
+  { type: 'function', function: { name: 'delete_memo', description: '删备忘（只支持最后一条）',
+    parameters: { type: 'object', properties: { which: { type: 'string', enum: ['last'] } } } } },
+  { type: 'function', function: { name: 'read_memo', description: '念一条备忘（只支持最后一条）', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'set_timer', description: '定倒计时',
+    parameters: { type: 'object', properties: { duration_text: { type: 'string', description: '时长原话，如"五分钟""一个半小时"' }, label: { type: 'string' } }, required: ['duration_text'] } } },
+  { type: 'function', function: { name: 'stop_timer', description: '取消倒计时', parameters: { type: 'object', properties: {} } } },
+];
+const SHADOW_SYS = [
+  '你是门店带教助手「小星」，在「赋能02」设备上帮一线员工。',
+  '先判断用户这句话属于哪一类，然后【只调用对应的工具】，不要解释、不要闲聊：',
+  '1. 问店里的 SOP／标准／流程／规定／怎么做 ⇒ 调 search_kb',
+  '2. 要操作设备本身（录制／闹钟／备忘／倒计时）⇒ 调对应的那个工具',
+  '3. 只是闲聊、打招呼、问你是谁 ⇒ ★ **不要调任何工具** ✓',
+].join('\n');
+// ★ 写操作集合（用于判"危险分歧"✗ —— 分歧 + 写操作 = 会误操作 ⇒ 要逐条人工看 ✓）
+const SHADOW_WRITE_ACTIONS = new Set(['start_record', 'stop_record', 'set_timer', 'stop_timer',
+  'add_alarm', 'add_memo', 'del_alarm', 'del_memo']);
+let _shadowCalls = [];      // 滑动窗口（只存时间戳 ✓）
+let _shadowDone = 0, _shadowDropped = 0, _shadowErr = 0;
+/** ★ 影子判定（★ 绝不 await ✓ 绝不改任何状态 ✓ 抛错只吞 ✓）
+ *  @param heard     ASR 文本
+ *  @param oldV     现有路径的判定（由调用方在**已知之后**传进来 ✓ 不重复跑旧逻辑 ✗ 免得重复打日志 ✓）
+ *  @param device    设备码（只进日志 ✓） */
+function shadowJudge(heard, oldV, device) {
+  if (!SHADOW_MODE) return;
+  try {
+    const now = Date.now();
+    _shadowCalls = _shadowCalls.filter(t => now - t < 60000);
+    if (_shadowCalls.length >= SHADOW_MAX_PER_MIN) {
+      _shadowDropped++;
+      if (_shadowDropped % 20 === 1) log(`SHADOW ⚠️ 限频丢弃中（已丢 ${_shadowDropped} 条，上限 ${SHADOW_MAX_PER_MIN}/分）★ 指标会被削，聚合时注意 ✓`);
+      return;
+    }
+    _shadowCalls.push(now);
+    const t0 = Date.now();
+    const ac = new AbortController();
+    const tid = setTimeout(() => ac.abort(), SHADOW_TIMEOUT_MS);
+    fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Authorization': `Bearer ${DEEPSEEK_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: SHADOW_MODEL, temperature: 0, max_tokens: 160,
+        messages: [{ role: 'system', content: SHADOW_SYS }, { role: 'user', content: String(heard || '') }],
+        tools: SHADOW_TOOLS, tool_choice: 'auto',
+      }),
+    }).then(r => r.json()).then(j => {
+      clearTimeout(tid);
+      const m = j && j.choices && j.choices[0] && j.choices[0].message;
+      const tc = m && m.tool_calls && m.tool_calls[0];
+      let nv;
+      if (tc) {
+        let args = {};
+        try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) { args = { __parse_error: String(tc.function.arguments).slice(0, 80) }; }
+        nv = { tool: tc.function.name, args };
+      } else {
+        nv = { tool: null, text: String((m && m.content) || '').slice(0, 60) };   // ★ 不调工具 = 直接回话 ✓
+      }
+      const diverge = oldV.kind === 'command'
+        ? (nv.tool === null || !SHADOW_TOOL_TO_OLD[nv.tool] || SHADOW_TOOL_TO_OLD[nv.tool] !== oldV.action)
+        : (nv.tool !== null);
+      // ★★ 危险分歧 = 分歧 且 任一侧涉及写操作 ✗（会误操作 ⇒ 逐条人工看 ✓）
+      const dangerous = diverge && (SHADOW_WRITE_ACTIONS.has(oldV.action) || SHADOW_WRITE_ACTIONS.has(nv.tool));
+      // ★ 漏检索 = 旧路径判"知识库问答" 而 模型没调 search_kb ✗（★ 本 CR 最担心的新失败模式 ✓）
+      const missedKb = oldV.kind === 'kb' && nv.tool !== 'search_kb';
+      _shadowDone++;
+      log(`SHADOW ${JSON.stringify({ asr: String(heard || '').slice(0, 60), dev: device || '-',
+        old: oldV, new: nv, diverge, dangerous, missedKb, ms: Date.now() - t0,
+        n: _shadowDone, drop: _shadowDropped })}`);
+    }).catch(e => { clearTimeout(tid); _shadowErr++; log(`SHADOW ✗ 判定失败（${_shadowErr}）: ${e.message}`); });
+  } catch (e) { _shadowErr++; try { log(`SHADOW ✗ 外层异常: ${e.message}`); } catch (e2) {} }
+}
+// ★ 工具名 → 现有 action 名（判分歧用 ✓ ★ 只用于比较，不参与执行 ✓）
+const SHADOW_TOOL_TO_OLD = {
+  start_record: 'start_record', stop_record: 'stop_record',
+  set_alarm: 'add_alarm', cancel_alarm: 'del_alarm',
+  add_memo: 'add_memo', delete_memo: 'del_memo', read_memo: 'read_memo',
+  set_timer: 'set_timer', stop_timer: 'stop_timer',
+  search_kb: '__kb__',
+};
 // ★★ 取客户端 IP：**必须优先 X-Real-IP，不能用 X-Forwarded-For 的第一个** ✗
 //   原因：nginx 那边两个头来源不同 ——
 //     · `X-Real-IP $remote_addr`        = nginx 拿到的真实对端地址，**客户端伪造不了** ✓
@@ -2537,6 +2652,8 @@ function validateSetConfig(o) {
 
         // ★ CR-20261010-01 期1：语音命令优先（★ 在 KB/LLM **之前** ✓ 命中就**不叫模型** ✓ ⇒ 这才是 ≤3 秒的来源 ✓）
         const vcOld = await voiceCmdHandle(device, heard);
+        // ★ 期0 影子：命令回合的判定（★ 不 await ✓ 不改下面任何一行 ✓）
+        if (vcOld) shadowJudge(heard, { kind: 'command', action: vcOld.action || null }, device);
         if (vcOld) {
           if (vcOld.action) chatRecord(device, heard, vcOld.reply);   // 命令也算一轮对话 ✓
           log(`voice-chat ✓ device=${device || '-'} ★命令回合(不叫LLM) action=${vcOld.action || '-'} heard="${heard.slice(0, 20)}"`);
@@ -2557,6 +2674,8 @@ function validateSetConfig(o) {
         const selfA = selfAnswer(heard);
         // ③ 知识库检索（先检索再回答的核心；自问自答时跳过，省一次调用）
         const kb = selfA ? { ok: true, results: [], reliable: false } : await kbSearchForVoice(heard);
+        // ★ 期0 影子：非命令回合的判定（人设短路 / 知识库问答 ✓ 都不 await ✓）
+        shadowJudge(heard, selfA ? { kind: 'self_qa' } : { kind: 'kb', reliable: !!kb.reliable, maxScore: kb.maxScore || 0 }, device);
 
         // ③ 决定回答：检索服务挂了 / 检索结果不可信 / 没这条知识 ⇒ 直接用兜底话术，**不叫模型**
         //    ★★ 这是防"编答案"的关键闸门。实测（2026-09-29）：只靠提示词说"不许编"是不够的 ——
@@ -2808,6 +2927,9 @@ function validateSetConfig(o) {
         const selfA = vcS ? null : selfAnswer(heard);
         const kb = vcS ? { ok: true, results: [], reliable: true, maxScore: 0 }
                        : (selfA ? { ok: true, results: [], reliable: false } : await kbSearchForVoice(heard));
+        // ★ 期0 影子（流式端点 = 设备主路径 ✓）：只记录，不 await、不改任何返回值 ✓
+        if (vcS) shadowJudge(heard, { kind: 'command', action: vcS.action || null }, device);
+        else shadowJudge(heard, selfA ? { kind: 'self_qa' } : { kind: 'kb', reliable: !!kb.reliable, maxScore: kb.maxScore || 0 }, device);
         let reply, usage = null;
         if (vcS) {
           reply = vcS.reply;                                  // ★ 命令回合不叫 LLM ✓
