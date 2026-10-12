@@ -660,17 +660,26 @@ function cnStr(n) {
   const t = Math.floor(n / 10), o = n % 10;
   return CN_STR[t] + '十' + (o ? CN_STR[o] : '');
 }
+/** ★★ 把一个 24 小时时刻说成**人话** ✓ —— **只此一处** ✗（别处再写一遍必然写歪 ✓）
+ *  ★ 为什么要有它：期2 的「取消九点的闹钟」第一版念成了「取消**十五**点的闹钟」✗
+ *    中文里 15 点只能念「**下午三点**」✓（说"十五点"像机器 ✓ 用户听着别扭 ✓）
+ *  ⇒ 时段分档 + 12 小时制 + 中文数字 ⇒「下午三点」「上午九点半」「晚上八点」✓
+ *  ⚠️ 30 分念「半」✓（口语 ✓）；其它分钟念「X 分」✓ */
+function clockCn(hh, mm) {
+  const part = hh < 6 ? '凌晨' : hh < 12 ? '上午' : hh === 12 ? '中午' : hh < 18 ? '下午' : '晚上';
+  const h12 = hh % 12 === 0 ? 12 : hh % 12;
+  const s = cnStr(h12) + '点' + (mm === 0 ? '' : (mm === 30 ? '半' : cnStr(mm) + '分'));
+  return part + s;
+}
 /** 闹钟的确认文案 —— ★★ **必须由 params 生成** ✗（"用户确认的对象 = 设备执行的对象" ✓ 老规矩 ✓）
  *  ★★ 措辞照设备端规格书 §5 第 1 条的期望：「**闹钟设在明天九点**」✓（联演时用户听到的就是这句 ✓）
- *  ★ 第一版写错过 ✗：把 20 点说成「下午8点」✗（中文里 20 点只能是"晚上八点"✓）⇒
- *    按时段分档 ✓：<6 凌晨 / <12 上午 / =12 中午 / <18 下午 / 其余 晚上 ✓
+ *  ★ 第一版写错过 ✗：把 20 点说成「下午8点」✗（中文里 20 点只能是"晚上八点"✓）⇒ 现已收进 `clockCn` ✓
  */
 function alarmReply(p) {
   const day = p.day_offset === 0 ? '今天' : p.day_offset === 1 ? '明天'
             : p.day_offset === 2 ? '后天' : (cnStr(p.day_offset) + '天后');
   const part = p.hh < 6 ? '凌晨' : p.hh < 12 ? '上午' : p.hh === 12 ? '中午' : p.hh < 18 ? '下午' : '晚上';
-  const h12 = p.hh % 12 === 0 ? 12 : p.hh % 12;
-  const t = cnStr(h12) + '点' + (p.mm === 0 ? '' : (p.mm === 30 ? '半' : cnStr(p.mm) + '分'));
+  const t = clockCn(p.hh, p.mm).replace(/^(凌晨|上午|中午|下午|晚上)/, '');   // ★ 时段只留一处 ✓
   const repCn = p.rep === 'daily' ? '每天' : p.rep === 'workday' ? '每个工作日' : p.rep === 'weekend' ? '周末' : '';
   const when = repCn ? (repCn + part) : (day + part);
   return '闹钟设在' + when + t + (p.label ? '，提醒你' + p.label : '');
@@ -731,8 +740,87 @@ function parseMemoCmd(heard) {
   return { text: clipped, truncated: clipped !== text };
 }
 
-/** 把新意图接进总入口 ✓（★ 放在 start/stop 之后 ⇒ 两边词表不打架 ✓）*/
+// ══════════════════════════════════════════════════════════════════════
+// ★★ CR-20261012-01 期2：**删 / 读**（`del_alarm` / `del_memo` / `read_memo`）✓
+//
+//   ★★★ 一条**顺序铁律**（不遵守必错 ✗✗）：
+//     「**取消九点的闹钟**」里也有"闹钟"二字 ✗ ⇒ 期1 的 `parseAlarmCmd` 会把它当**新增** ✗
+//     ⇒ 判据：**动词（取消/删/念）优先于名词（闹钟/备忘）** ✗
+//     ⇒ 所以 `extraCmdHandle` 里的顺序是：**删闹钟 → 删备忘 → 读备忘 → 定闹钟 → 记备忘** ✓
+//       （新增一律排最后 ✓ 因为它只凭名词就能命中 ✓）
+//
+//   ★ `index` 的基准：规格书 §3.2 写的是 `0 = **最后一条**` ✓（最新那条 ✓）
+//     ⇒ 我方按此发 ✓ —— ★ 但"第 N 条"这种说法**我方不发** ✗：
+//       数组从哪头数是**设备侧的实现细节** ✓ 我方不知道 ⇒ **绝不猜** ✗（说"第N条"就交给 LLM ✓）
+//
+//   ★★ `reply` 的**语义**（这条要跟设备端对齐 ✗）：
+//     设备是"**先播 reply、后执行**"还是"执行完再播"？按 `voice.c` 的流程 ⇒ `reply` 播在前 ✓
+//     ⇒ ★ 所以 reply **不能宣称结果** ✗（"已取消"✗ 万一没这条闹钟就打脸了 ✓）
+//     ⇒ 我方一律用**意图口径**：「好，取消九点的闹钟」✓（成没成由**设备自己的**表情/提示去说 ✓）
+// ══════════════════════════════════════════════════════════════════════
+
+/** ★ 意图③：取消闹钟 ⇒ `del_alarm {hh,mm}` 或 `{index:0}`（最后一条 ✓）*/
+function parseDelAlarmCmd(heard) {
+  const t = vcNorm(heard);
+  if (!/(闹钟|叫我|叫醒|提醒)/.test(t)) return null;
+  if (!/(取消|删掉|删除|去掉|撤销|关掉|不要了|别响)/.test(t)) return null;   // ★ 必须**有删除动词** ✗
+  if (VC_ASK_WORDS.test(t)) return null;
+  // ① 报了钟点 ⇒ 按 hh:mm 删 ✓（"取消九点的闹钟" ✓）
+  const w = parseWhen(t);
+  if (w && !w.relMinutes && w.hh !== null) return { hh: w.hh, mm: w.mm };
+  // ② 说的是"最后/最新那个" ⇒ index:0 ✓（★ 与 §3.2 的 memo 基准一致 ✓）
+  if (/(最后|最新|末尾|刚定|刚才那)/.test(t)) return { index: 0 };
+  // ③ ★ 其它（"第几个"这种）⇒ **不发** ✗ —— 序号基准是设备侧细节，我方不猜 ✓
+  return null;
+}
+
+/** ★ 意图④：删备忘 ⇒ `del_memo {index:0}`（**只有"最后一条"这一种** ✓ 见上面 §index 基准）*/
+function parseDelMemoCmd(heard) {
+  const t = vcNorm(heard);
+  if (!/备忘/.test(t)) return null;
+  if (!/(删掉|删除|去掉|消掉|清掉|不要了)/.test(t)) return null;
+  if (!/(最后|最新|末尾|刚记|刚才那|上一条)/.test(t)) return null;   // ★ 只有这一种形态才发 ✗
+  if (VC_ASK_WORDS.test(t)) return null;
+  return { index: 0 };
+}
+
+/** ★ 意图⑤：读备忘 ⇒ `read_memo {index:0}`（设备侧复用 `voice_speak_text()` 念出来 ✓）*/
+function parseReadMemoCmd(heard) {
+  const t = vcNorm(heard);
+  if (!/备忘/.test(t)) return null;
+  if (!/(念|读|说给我听|念念|读一下|念一下)/.test(t)) return null;
+  if (/(怎么|如何|在哪|哪里)/.test(t)) return null;              // "备忘怎么用"不是命令 ✓
+  if (/(删|去掉|清)/.test(t)) return null;                        // 带删的不当读 ✓（前面已处理 ✓）
+  return { index: 0 };                                            // ★ 只有"最后一条" ✓ 同上 ✗
+}
+
+/** 把新意图接进总入口 ✓（★ 顺序见上面那条铁律 ✗ 动词优先 ✓）*/
 function extraCmdHandle(heard) {
+  // ── ① 先判**删闹钟**（"取消九点的闹钟"必须在这里被吃掉 ✗ 晚一步就被当成新增 ✓）──
+  const da = parseDelAlarmCmd(heard);
+  if (da) {
+    // ★ 用共用的 clockCn ✓ —— 第一版直接 `cnStr(hh)+'点'` ⇒ 15 点被念成「十五点」✗（应为"下午三点"✓）
+    const reply = (da.hh !== undefined)
+      ? ('好，取消' + clockCn(da.hh, da.mm) + '的闹钟')
+      : '好，取消最后那个闹钟';
+    log(`语音命令: 「${heard}」⇒ del_alarm ${JSON.stringify(da)}｜reply="${reply}"`);
+    return { reply, action: 'del_alarm', params: da };
+  }
+  // ── ② 删备忘 ──
+  const dm = parseDelMemoCmd(heard);
+  if (dm) {
+    const reply = '好，删掉最后一条备忘';
+    log(`语音命令: 「${heard}」⇒ del_memo ${JSON.stringify(dm)}｜reply="${reply}"`);
+    return { reply, action: 'del_memo', params: dm };
+  }
+  // ── ③ 读备忘（★ reply 要**极短** ✗：设备紧接着会把备忘正文念出来 ✓ 别抢话 ✓）──
+  const rm = parseReadMemoCmd(heard);
+  if (rm) {
+    const reply = '好';
+    log(`语音命令: 「${heard}」⇒ read_memo ${JSON.stringify(rm)}｜reply="${reply}"（★ 正文由设备念 ✓ 我方不抢话 ✓）`);
+    return { reply, action: 'read_memo', params: rm };
+  }
+  // ── ④ 定闹钟 / 记备忘（**新增**一律排最后 ✓ 它们只凭名词就能命中 ✗）──
   const a = parseAlarmCmd(heard);
   if (a) {
     const reply = alarmReply(a);
