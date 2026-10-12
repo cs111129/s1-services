@@ -738,13 +738,19 @@ function clipUtf8(s, maxBytes) {
  */
 function parseMemoCmd(heard) {
   const raw = String(heard || '').replace(/[。！!？?，,、\s]+$/, '');
-  const m = raw.match(/^(?:帮我)?(?:记一下|记一笔|记一条|记住|记录一下|记下|备忘一下|备忘|添加备忘|新增备忘)[：:，,]?\s*(.+)$/);
+  // ★★ 2026-10-12 第二条实测缺陷 ✗：只说「**备忘录**」⇒ 被当成"记备忘"，正文成了「**录**」✗
+  //   根因：触发词只列到「备忘」✗ ⇒ 剩下的"录"就被当正文 ✓
+  //   ⇒ 把「备忘录 / 备忘条」也列为触发词 ✓（它们是同一个词的不同说法 ✓）
+  const m = raw.match(/^(?:帮我)?(?:记一下|记一笔|记一条|记住|记录一下|记下|备忘一下|备忘录|备忘条|备忘|添加备忘|新增备忘)[：:，,]?\s*(.+)$/);
   if (!m) return null;
   const text = m[1]
     .replace(/^[：:，,、\s]+/, '')
     .replace(/^(备忘录|备忘条|备忘)[：:，,、。\.\s]*/, '')      // ★ 摘掉开头的宾语名词 ✓
     .trim();
   if (!text) return null;                                      // 没内容 ⇒ 不当作命令 ✓（别塞空备忘 ✗）
+  // ★ 正文至少 2 个字符 ✗ —— 1 个字的"备忘"没有意义 ✓ 而且基本都是**切错词**的产物 ✓
+  //   （判据：**"看起来像个词"不等于"是个能存的内容"** ✗）
+  if (text.length < 2) return null;
   if (VC_ASK_WORDS.test(text) && text.length <= 6) return null; // "记一下怎么弄"这类问句别当备忘 ✓
   const clipped = clipUtf8(text, MEMO_TEXT_MAX_BYTES);
   return { text: clipped, truncated: clipped !== text };
