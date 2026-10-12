@@ -379,43 +379,44 @@ const _voiceRate = {};   // ip -> { n, t }
 const _chatSessions = new Map();
 
 // ══════════════════════════════════════════════════════════════════════
-// ★ CR-20261010-01 期1：语音直接下命令（说「开始录制」就开录）
+// ★ CR-20261010-01：语音直接下命令（说「开始录制」就开录）
 //
 //   ★★ 为什么逻辑整条放这里（而不是"服务器推一条 start_record 指令"）✗：
 //      设备**播放期间收不到远程指令**（语音流程占住 cmd_task ✓ 长回答能占几十秒 ✓）
 //      ⇒ 推指令那条路会被拖到"播完之后" ✗ 用户体感"喊了半天没动" ✓
 //      ⇒ 所以用**响应里带 action**（与 `reply` 同一趟回来 ✓ 零额外往返 ✓）
 //
-//   ★ 定稿是用户拍板的「**一句话陈述 + 一次确认**」✓：
-//      没有 SOP 名 ⇒ 服务器一口气把三个参数**报出来**（`ask_confirm` ✓）等一句「好」
-//      带了 SOP 名且**匹配可信** ⇒ 直接开录 ✓ 不可信 ⇒ **必须反问，绝不许猜** ✗✗
-//      ★ 「拍照频率」**不问只报**（它是质量/成本旋钮 ✓ 不是"这次录什么" ✓）
+//   ★★★ 2026-10-12 **用户改设计**（推翻原先的「一句话陈述 + 一次确认」✗）：
+//     · **情况一**：说「开始录制」⇒ **直接开录** ✓ **不播报任何内容** ✗
+//       全部用**默认** ✓ **SOP 默认不选** ✓
+//     · **情况二**：说「开始录制 仪容仪表自查」⇒ 按**指定那条 SOP** 开录 ✓
+//     · ★★ **两种情况都直接开录** ✗ —— **不需要用户回任何话** ✓
+//   用户原话：「总之，不管是哪种情况，都不需要用户做回复，直接开始录制」✓
 //
-//   ★ 消歧（词表里最容易出事的地方 ✗）：「开始」「好」在**等确认窗口内**是**应答** ✓，
-//      在窗口外才是**命令** ✓ ⇒ 必须靠状态区分，不能只靠词 ✓（否则闲聊里的"好"会误开录 ✗）
+//   ★ 因此本文件里的**状态机整套撤掉** ✗（原来的：提议 `ask_confirm` → 等 8 秒 →
+//     「好」确认 / 「不用了」取消 / 「改只录音」改参数 ✓ 全部不要了 ✓）
+//     ⇒ 命令判定从此**不需要跨轮状态** ✓（只靠这一句的词表 ✓ 更简单、更不容易错 ✓）
 //
-//   ★ 命令回合**不叫 LLM** ✗ —— `reply` 用模板拼 ✓ ⇒ 这就是 ≤3 秒目标的来源 ✓
+//   ★ 「不带 SOP」的语义**变了** ✗（这点很关键 ✓ 见下）：
+//     · 旧设计：不带 SOP = 服务器**没听出来/没报** ⇒ 必须反问（绝不猜 ✗）
+//     · 新设计：不带 SOP = **用户明确没指定** ⇒ 用默认（不选 SOP）✓ **不是猜** ✓
+//     ⇒ ★ 设备端那句 `!has_sop ⇒ 拒绝开录`（依据旧规格书 §4.3 第 6 条）**需要放宽** ✗
+//       （已出递件说明 ✓）—— 而"**按名字匹配**"这条仍然**绝不猜** ✓：
+//       名字对不上 ⇒ 就当"没有 SOP"处理 ✓ 而不是硬塞一条 ✗
+//
+//   ★ 命令回合**不叫 LLM** ✗ ⇒ 直接回，最快 ✓（这次连 `reply` 都不拼了 ⇒ **零播报等待** ✓）
 // ══════════════════════════════════════════════════════════════════════
-const VOICE_CMD_TTL_MS = 8000;        // "等回答"窗口，与设备端一致 ✓
-const _voiceCmd = new Map();          // device -> { params, at }   待确认的提议
-const _voiceLastMode = new Map();     // device -> 上次下发的 mode（提议默认值 ✓）
-const _voiceLastInt = new Map();      // device -> 上次下发的 interval_ms ✓
 const _sopCache = new Map();          // device -> { sops, last, at }  设备可见 SOP（60 秒缓存 ✓）
 const SOP_CACHE_MS = 60 * 1000;
-const DEFAULT_SHOT_INTERVAL_S = 5;    // ★ 期1 先用全局默认（"每个 SOP 自己的默认"SOP 数据里还没有 ✗ 已记进回执 ✓）
 
-// ── 词表（★ 与回执 §9.2 给设备端的那份一一对应 ✓ 改这里要同步改文档 ✗）──
+// ── 词表（★ 2026-10-12 用户改设计后**只剩两类** ✓ 肯定/否定/改参数三组已撤 ✗）──
 const VC_RE = {
   // ★ 命令形状：句首是"开始/来/帮我"这类祈使，且必须落到"录制/录像/录音/记录"
   //   ⚠️ 故意**不认**"录音怎么弄""录制要注意什么"这类问句 ⇒ 用"问句词"做负向过滤 ✓
   start: /^(现在|马上|帮我|帮忙|来|请)?\s*(开始|启动|进行)?\s*(录制|录像|录音|录一段|录一个|录一下|记录拍摄)/,
-  stop: /^(现在|马上|帮我|帮忙|请)?\s*(结束|停止|停|别录|不要录|录完|收工|关掉录制)/,
-  affirm: /^(好|好的|好啊|行|可以|嗯|对|没问题|开始|开始吧|就这样|是的|OK|ok)[。！!，,\s]*$/,
-  deny: /^(不|不用|不要|取消|算了|等一下|先不|先别|暂停)[。！!，,\s]*$/,
-  modify: /(改成?|换成?|改一下|只录音|只录像|不要录像|不要录音|不拍照|换一个|换一个流程|不是这个)/
+  stop: /^(现在|马上|帮我|帮忙|请)?\s*(结束|停止|停|别录|不要录|录完|收工|关掉录制)/
 };
 const VC_ASK_WORDS = /(怎么|如何|为什么|啥|什么|吗|呢|哪|要不要|能不能|可不可以)/;   // 问句 ⇒ 不当命令 ✓
-const MODE_CN = { full: '录像+录音', video: '只录像', audio: '只录音' };
 
 /** 归一化：去掉空白与常见标点（词表匹配前统一处理 ✓） */
 function vcNorm(s) { return String(s || '').replace(/[\s，。！？!?、,.：:；;"'“”‘’()（）]/g, ''); }
@@ -449,105 +450,67 @@ function matchSop(sops, text) {
   return { ok: false, why: hit.length === 0 ? '没听出流程名' : '多义', hit: hit.length ? hit : loose };
 }
 
-function vcParams(sop, device) {
-  // ★★ 字段名与单位是**契约级**的事（2026-10-10 设备端自检⑦当场逮到 ✗✗）：
-  //   规格书 §4.1 写的是 `shot_interval_s`（秒 ✓）而**设备代码读的是 `shot_interval_ms`（毫秒 ✓）**
-  //   ⇒ 名字/单位对不上 ⇒ 设备**取不到** ⇒ **静默退回自己的默认节奏** ✗✗
-  //     而语音里念的是「每 5 秒一张」✓ ⇒ **显示的和实际做的不一样** ✓（他们最反对的那类 ✓）
-  //   ★ 他们已明确要求：「**`shot_interval_ms` 按数字发**（别写成字符串 ✗）」⇒ 这里照办 ✓
-  //     （**数字**类型 ✓ 毫秒 ✓）；★ §4.1 那处笔误请他们改 ✓ 否则下一个实现的人还会照错的写 ✗
-  //   ★ 一并采纳他们那条判据 ✓：**「能解析」和「解析对了」是两件事** ✗
-  //     ⇒ 自检必须**断言值**，不能只看"没报错" ✓（本次验收也照这个补了"断言值" ✓）
-  const sec = Math.round((_voiceLastInt.get(device) || (DEFAULT_SHOT_INTERVAL_S * 1000)) / 1000) || DEFAULT_SHOT_INTERVAL_S;
+function vcStartParams(sop) {
+  // ★★★ 2026-10-12 用户改设计：**全部默认** ✓、**SOP 默认不选** ✓
+  //   ★ 空值就是"默认"，这是**对方代码里写着的**语义（不是我猜的 ✓ 见 `voice.c`）：
+  //     · `sop_id` 空 ⇒ 他们 `has_sop = (sop_id[0] != '\0')` = false ⇒ 日志打「（未指定 ✓）」
+  //     · `mode`   空 ⇒ 他们日志打「（未给 ⇒ 设备默认 ✓）」+ `rec_mode_from_str(mode, REC_MODE_FULL)`
+  //       （★ `downlink.h:49` `REC_MODE_FULL = 0 /* 拍照 + 录音（默认）*/` ⇒ 默认就是 full ✓）
+  //     · `shot_interval_ms` = **0** ⇒ 他们注释：「0=指令未带→用设备默认 PHOTO_INTERVAL_MS」✓
+  //   ★ 判据：**"默认"必须有对方代码作依据** ✗ —— 拍一个数字过去不叫默认，那叫"我替你定了" ✓
+  //   ★★ 字段仍然**全给**（不省略 ✗）：他们规格书 §4.3 第 6 条写着「params 缺失 ⇒ 不发车」✗
+  //     ⇒ 给全字段、值留空 ⇒ 既能表达"默认"，又不会踩"缺失"那条 ✓
   return {
-    sop_id: sop.id,
-    sop_name: sop.name,
-    mode: _voiceLastMode.get(device) || 'full',
-    shot_interval_ms: sec * 1000        // ★ 数字（不带引号 ✓）· 单位毫秒 ✓
+    sop_id: sop ? sop.id : '',
+    sop_name: sop ? sop.name : '',
+    mode: '',                 // ★ 空 = 设备默认（full ✓）
+    shot_interval_ms: 0       // ★ 0 = 设备默认（他们 `downlink.h:81` 明写 ✓）· 数字类型 ✓
   };
-}
-function vcProposalText(p) {
-  // ★ 给人念的是"秒"（人话 ✓）、给设备的字段是"毫秒"（契约 ✓）—— 两者刻意不同 ✗
-  //   ⇒ 换算只在这一处做 ✓（否则会念出"每 5000 秒一张"这种荒唐话 ✓）
-  // ★★ 2026-10-12（设备端 §11.9.1 提的 ✓）：**别用 ASCII 双引号** ✗
-  //   原来这里是 `说"好"就开始` ✓ —— JSON 里它变成 `\"好\"` ✗
-  //   而他们那份取值器**以前会在 `\` 处砍断整个 reply** ✗（抓图当场看到的 ✓）
-  //   ⇒ 他们已加容错（认 `\"` ✓）⇒ 不改也不会再断 ✓ 但**「」更好读**（屏上等宽中文 ✓）
-  //     而且**少一层转义 = 少一处能出错** ✓ ⇒ 改用中文引号 ✓
-  return `按「${p.sop_name}」录制，${MODE_CN[p.mode] || p.mode}，每 ${Math.round(p.shot_interval_ms / 1000)} 秒一张 —— 说「好」就开始，要改说「改只录音」`;
 }
 
 /**
  * ★ 语音命令总入口：**在 ASR 之后、KB/LLM 之前**调 ✓
- * @returns {null}                       ⇒ 不是命令 ⇒ 走原来的流程（LLM ✓ 且响应里**不加** action ✓）
- *          {reply, action, params}      ⇒ 是命令 ⇒ **直接回，不叫 LLM** ✓
+ * ★★ 2026-10-12 用户改设计：**只有两类命令，且都直接执行、都不播报、都不需要用户回话** ✓
+ *   ①「开始录制」           ⇒ `start_record` ＋ **全默认**（SOP 不选 ✓）
+ *   ②「开始录制 <SOP 名>」  ⇒ `start_record` ＋ 指定那条 SOP ✓
+ *   ★ 名字匹配**不可信时不再反问** ✗ ⇒ 按"没指定 SOP"处理（仍然开录 ✓）——
+ *     理由：用户的主诉求是"**开录**" ✓ SOP 只是细化 ✓ 为了细化而**拒绝开录**是本末倒置 ✗
+ *     ★ 但仍然**绝不猜** ✗ —— 对不上就当没指定 ✓ 绝不硬塞一条 ✓
+ * @returns {null}                              ⇒ 不是命令 ⇒ 走原来的流程（LLM ✓ 且响应里**不加** action ✓）
+ *          {reply:'', action, params}          ⇒ 是命令 ⇒ **直接回，不叫 LLM、不合成语音** ✓
  */
 async function voiceCmdHandle(device, heard) {
   if (!VOICE_CMD_ENABLED || !device) return null;
   const t = vcNorm(heard);
   if (!t) return null;
-  const pending = _voiceCmd.get(device);
-  const fresh = pending && (Date.now() - pending.at < VOICE_CMD_TTL_MS);
-  if (pending && !fresh) _voiceCmd.delete(device);      // ★ 超时 ⇒ 当作"没有待确认"✓
 
-  // ── ① 正在等确认 ⇒ 这句话优先当【应答】解释 ✓ ──
-  if (fresh) {
-    if (VC_RE.affirm.test(t)) {                          // 「好」⇒ 开录 ✓
-      _voiceCmd.delete(device);
-      log(`语音命令: 「${heard}」⇒ 确认开录（${pending.params.sop_name} / ${pending.params.mode}）`);
-      return { reply: '开始录制', action: 'start_record', params: pending.params };
-    }
-    if (VC_RE.deny.test(t)) {                             // 「不用了」⇒ 取消 ✓
-      _voiceCmd.delete(device);
-      log(`语音命令: 「${heard}」⇒ 用户取消`);
-      return { reply: '好，已取消', action: null, params: null };
-    }
-    if (VC_RE.modify.test(t)) {                           // 「改只录音」⇒ 重述一遍再确认 ✓
-      const p = Object.assign({}, pending.params);
-      if (/只录音|不要录像|不录像|改录音/.test(t)) p.mode = 'audio';
-      else if (/只录像|不要录音|不录音|改录像/.test(t)) p.mode = 'video';
-      else if (/录像录?音|都录|全录/.test(t)) p.mode = 'full';
-      const sp = matchSop((await fetchSopList(device) || {}).sops || [], t);   // 「换成XX」⇒ 换 SOP ✓
-      if (sp.ok) { p.sop_id = sp.sop.id; p.sop_name = sp.sop.name; }
-      _voiceCmd.set(device, { params: p, at: Date.now() });
-      log(`语音命令: 「${heard}」⇒ 改参数后重述（${p.sop_name} / ${p.mode}）`);
-      return { reply: vcProposalText(p), action: 'ask_confirm', params: p };
-    }
-    // 其它话 ⇒ 不当应答（窗口留着等超时 ✓），按普通对话回答 ✓
-    return null;
-  }
-
-  // ── ② 没有待确认 ⇒ 这句话可能是【命令】✓ ──
+  // ── ① 结束录制 ──
   if (VC_RE.stop.test(t) && !VC_ASK_WORDS.test(t)) {
     log(`语音命令: 「${heard}」⇒ 结束录制`);
     return { reply: '结束录制', action: 'stop_record', params: null };
   }
+
+  // ── ② 开始录制（可不带 SOP 名 ✓）──
   if (VC_RE.start.test(t) && !VC_ASK_WORDS.test(t)) {
+    // ★ 只有"用户确实报了名字"时才去查名单（省一次 S2 调用 ✓ 也让"没带名字"这条最快 ✓）
+    let sop = null, why = '没报流程名 ⇒ 不选 SOP（全默认 ✓）';
     const list = await fetchSopList(device);
-    if (!list || !list.sops.length) {
-      // ★ 拿不到名单 ⇒ **绝不猜** ✗（判据同设备端 §4.3 第 6 条 ✓）
-      log(`语音命令: 「${heard}」⇒ 匹配不可信（${list ? '该设备可见 SOP 为 0' : 'SOP 名单取不到'}）⇒ 反问，不开录 ✗`);
-      return { reply: '我这边暂时查不到你可以录的流程，请在屏幕上选一下', action: null, params: null };
-    }
-    // ① 用户**说出了流程名** ⇒ 匹配 ✓ 可信就直接开录，不可信就反问 ✓
-    const named = list.sops.some(s => vcNorm(s.name) && t.indexOf(vcNorm(s.name)) >= 0);
-    if (named) {
-      const m = matchSop(list.sops, t);
-      if (m.ok) {
-        const p = vcParams(m.sop, device);
-        _voiceCmd.set(device, { params: p, at: Date.now() });   // 也存一份：用户可能还要改 ✓
-        log(`语音命令: 「${heard}」⇒ 匹配可信「${m.sop.name}」⇒ 直接开录`);
-        return { reply: '开始录制', action: 'start_record', params: p };
+    if (list && list.sops.length) {
+      // ★ 名单可用 ⇒ 看看用户有没有报名字（只在**该设备可见范围内**匹配 ✓）
+      const named = list.sops.some(s => vcNorm(s.name) && t.indexOf(vcNorm(s.name)) >= 0);
+      if (named) {
+        const m = matchSop(list.sops, t);
+        if (m.ok) { sop = m.sop; why = `匹配到「${m.sop.name}」`; }
+        else { why = `报了名字但匹配不可信（${m.why}）⇒ 当没指定 ✓（绝不猜 ✗）`; }
       }
-      log(`语音命令: 「${heard}」⇒ 匹配不可信（${m.why}）⇒ 反问，不开录 ✗`);
-      return { reply: '没听清是哪个流程，请说一遍流程名，或者在屏幕上选一下', action: null, params: null };
+    } else {
+      why = list ? '该设备可见 SOP 为 0 ⇒ 当没指定 ✓' : 'SOP 名单取不到 ⇒ 当没指定 ✓（仍开录 ✓）';
     }
-    // ② 没报流程名 ⇒ **提议**（默认值：上次那台录过的 ✓ 没有就第一条 ✓）
-    let sop = list.sops.find(s => s.id === list.last) || list.sops[0];
-    const p = vcParams(sop, device);
-    _voiceCmd.set(device, { params: p, at: Date.now() });
-    log(`语音命令: 「${heard}」⇒ 提议（${p.sop_name} / ${p.mode} / ${p.shot_interval_ms}ms）等确认`);
-    return { reply: vcProposalText(p), action: 'ask_confirm', params: p };
+    const params = vcStartParams(sop);
+    log(`语音命令: 「${heard}」⇒ **直接开录**（${why}）`
+      + `｜params: sop_id="${params.sop_id}" mode="${params.mode}" shot_interval_ms=${params.shot_interval_ms}`
+      + `（空值/0 = 用设备默认 ✓）★ 无播报 ✓`);
+    return { reply: '', action: 'start_record', params };   // ★ reply 空 ⇒ 设备不播报任何内容 ✓
   }
   return null;   // ── ③ 不是命令 ⇒ 交给原来的 LLM 流程 ✓ ──
 }
@@ -828,6 +791,54 @@ function handleVoiceWS(ws) {
   });
   ws.on('close', () => log('BOX-3 voice closed'));
   ws.on('error', (e) => log('voice WS error ' + e.message));
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ★★ 2026-10-12：命令回合的「静音垫」—— 为什么需要它 ✗
+//
+//   用户要求：说「开始录制」⇒ **不播报任何内容** ✓
+//   ⇒ 我方自然想到"reply 空 ⇒ 不发音频" ✗ —— **但设备端会判为失败** ✗✗：
+//     他们 `voice.c` 的流式收尾是 `if (s_stream.audio_bytes > 0) { 成功 } `
+//     否则「**一个字节都没播 ⇒ 退回老端点**」✓（这是他们的"永不比老版差"设计 ✓ 本身没错 ✓）
+//     ⇒ 0 字节音频 = 被判失败 ⇒ 白跑一轮回退 + `action` 可能被应用两次 ✗
+//
+//   ⇒ 做法：命令回合送 **~40 ms 静音** ✓ ⇒ `audio_bytes > 0` ⇒ 判成功 ✓
+//     而**人耳听不到任何内容** ✓ ⇒ 与用户要求一致 ✓
+//   ★ 判据：**"不播报"不能用"不发音频"来表达** ✗ —— 在对方协议里，
+//     "没有音频"是一个**错误信号**，不是一个**空信号** ✓（这两者不能混 ✓）
+// ══════════════════════════════════════════════════════════════════════
+const SILENCE_MS = 40;
+/** 生成一段静音 PCM（按当前格式 ✓ 16k/单声道 ⇒ pcm16 = 32000 B/s，ulaw8 = 16000 B/s ✓） */
+function silencePcm(afmt) {
+  const bytes = Math.round((afmt === 'ulaw8' ? 16000 : 32000) * (SILENCE_MS / 1000));
+  // ★ μ-law 的**静音不是 0** ✗✗ —— 0x00 解出来是满幅负值（很响 ✗）
+  //   查表：μ-law 里 0xFF 才是"接近 0" ✓（他们解码器照标准表 ✓）⇒ 该填 0xFF ✓
+  return Buffer.alloc(bytes, afmt === 'ulaw8' ? 0xff : 0);
+}
+/** 命令回合给老端点（非流式）用的静音音频文件（懒创建一次 ✓ 之后复用同一个 URL ✓） */
+let _silenceUrl = '';
+function silenceAudioUrl() {
+  if (_silenceUrl) return _silenceUrl;
+  try {
+    const name = 'silence-16k-mono.wav';
+    const p = path.join(AUDIO_DIR, name);
+    if (!fs.existsSync(p)) {
+      const n = Math.round(16000 * (SILENCE_MS / 1000));      // 16 kHz / 16 bit / 单声道
+      const data = Buffer.alloc(n * 2);
+      const h = Buffer.alloc(44);
+      h.write('RIFF', 0); h.writeUInt32LE(36 + data.length, 4); h.write('WAVE', 8);
+      h.write('fmt ', 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+      h.writeUInt32LE(16000, 24); h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
+      h.write('data', 36); h.writeUInt32LE(data.length, 40);
+      fs.writeFileSync(p, Buffer.concat([h, data]));
+      log(`命令回合静音垫已生成: ${name}（${44 + data.length} B ✓ ${SILENCE_MS}ms ✓）`);
+    }
+    _silenceUrl = '/api/voice-audio/' + name;
+    return _silenceUrl;
+  } catch (e) {
+    log(`⚠️ 静音垫生成失败（命令回合将不带音频）: ${e.message}`);
+    return '';
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1357,13 +1368,13 @@ function validateSetConfig(o) {
         if (action !== 'start' && action !== 'stop') log(`⚠️ cam cmd/send 收到未知 action="${action}" ⇒ 按录制处理（沿用旧行为 ✗ 见代码注释）`);
 
         const cmd = action === 'start' ? 'start_record' : 'stop_record';
-        // ★ CR-20261010-01：记住这台设备上次用的 mode / 拍照频率
-        //   ⇒ 语音提议时拿来做默认值（规格书 §3.2「设置里的上次选择」✓）
-        //   ★ 只记内存、不落盘：丢了就退回 full / 5 秒 ✓（默认值而已，不是事实 ✓）
-        if (action === 'start') {
-          _voiceLastMode.set(dev, String(o.mode || 'full'));
-          if (Number(o.interval_ms) > 0) _voiceLastInt.set(dev, Number(o.interval_ms));
-        }
+        // ★★ 2026-10-12 用户改设计后，这两行**删掉了** ✗ ——
+        //   原来在这里记"上次用的 mode / 频率"，给语音**提议**当默认值 ✓
+        //   而新设计是「**全部默认**」⇒ 由**设备**决定默认（我方发空值/0 ✓ 见 vcStartParams ✓）
+        //   ⇒ 再记一份就变成"我替你定了" ✗（正如当时的注释所警示的 ✓）⇒ 整段撤掉 ✓
+        //   ★ 教训：**改了上游语义，要顺手把只为它存在的状态删干净** ✗
+        //     （这两行当时没人引用 —— 只有 `_voiceLastMode` 那两个 Map ✗ 而它们已随状态机一起删掉 ✓
+        //       ⇒ 不删就是**运行时 ReferenceError** ✓ 语法检查抓不到 ✓ 靠的是"删符号后全文件回查" ✓）
         // 34号：透传 mode（full/video/audio）；同时保留 enable_audio 旧字段（由 mode 映射，固件优先认 mode）
         camCmdQueue[dev] = { cmd, ts: Date.now(), interval_ms: Number(o.interval_ms) || 0, max_seconds: Number(o.max_seconds) || 0, sop_id: o.sop_id || "", enable_audio: o.enable_audio !== false, mode: o.mode || "" };
         log(`cam 指令入队: ${cmd} -> ${dev}`);
@@ -2072,10 +2083,14 @@ function validateSetConfig(o) {
           if (vcOld.action) chatRecord(device, heard, vcOld.reply);   // 命令也算一轮对话 ✓
           log(`voice-chat ✓ device=${device || '-'} ★命令回合(不叫LLM) action=${vcOld.action || '-'} heard="${heard.slice(0, 20)}"`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
+          // ★ 2026-10-12：命令回合（reply 空）**也要给一个音频** ✗ ——
+          //   给的是 40ms 静音垫 ✓（人耳听不到 ✓ 但对方/老端点不会把它当"没有音频" ✗ 详见上面那段注释 ✓）
+          const silUrl = String(vcOld.reply || '').trim() ? '' : silenceAudioUrl();
           res.end(JSON.stringify(Object.assign({
             success: true, text: oneLine(heard), reply: vcOld.reply,
             session: device ? (device + '#' + chatDepthOf(device)) : ''
-          }, vcOld.action ? { action: vcOld.action } : {}, vcOld.params ? { params: vcOld.params } : {})));
+          }, silUrl ? { audio: silUrl, audio_is_silence: true } : {},
+             vcOld.action ? { action: vcOld.action } : {}, vcOld.params ? { params: vcOld.params } : {})));
           return;
         }
 
@@ -2144,6 +2159,11 @@ function validateSetConfig(o) {
         if (!reply) reply = NO_KB_REPLY;
 
         // ⑤ TTS
+        // ★ 2026-10-12 用户改设计后，**命令回合不会走到这里** ✓ ——
+        //   它在上面 `voiceCmdHandle` 命中时**已经提前 return** 了（带 action/params、不带音频 ✓
+        //   见"★ CR-20261010-01"那段早退 ✓）⇒ 所以这里**不需要**为命令回合加空 reply 分支 ✓
+        //   ★ 判据：**改语义前先确认代码走哪条路** ✗ —— 我一度在这里加了个"空 reply 跳过 TTS"的守卫，
+        //     后来发现那一整段对命令回合**不可达** ✓ ⇒ 撤掉（不留永远不执行的分支 ✗）
         let audioPath = '';
         try {
           const t = await handleTTS(reply, afmt);
@@ -2393,6 +2413,16 @@ function validateSetConfig(o) {
         const sents = splitSents(reply);
         const bytesPerSec = afmt === 'ulaw8' ? 16000 : 32000;
         let pushed = 0, pieceN = 0, si = 0, carry = '';
+        // ★★ 2026-10-12 命令回合：reply 空 ⇒ **送 40ms 静音垫** ✗
+        //   ★ 为什么不能"什么都不送"：他们 `voice.c` 判成功的条件是 `audio_bytes > 0` ✓
+        //     0 字节 ⇒ 判「一个字节都没播 ⇒ 退回老端点」✗（白跑一轮 + action 可能被应用两次 ✗）
+        //   ⇒ 静音 40ms ⇒ 判成功 ✓ 而**人耳听不到** ✓（用户要的"不播报"仍然成立 ✓）
+        if (vcS && !String(reply || '').trim()) {
+          const sil = silencePcm(afmt);
+          res.write(sil); pushed += sil.length; pieceN = 1;
+          log(`voice-chat-stream ★命令回合 ⇒ 送静音垫 ${sil.length} 字节（${SILENCE_MS}ms ✓ 无播报 ✓）`
+            + `（★ 不发的话他们那侧会判"0 字节 = 失败"并回退老端点 ✗）`);
+        }
         while (si < sents.length || carry) {
           const queuedSec = pushed / bytesPerSec;            // 已推的音频还能播多少秒
           const target = Math.min(STREAM_REST_CAP,
