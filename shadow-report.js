@@ -1,14 +1,11 @@
 #!/usr/bin/env node
 /**
- * shadow-report.js —— CR-20261012-03 §9 期0 影子模式的**聚合报告**
- *
- * ★ 为什么要有它（✗）：影子模式的日志是**一行一条 JSON** ✓，
- *   若只靠"翻日志看看" ⇒ 结论全靠印象 ✓ 而本 CR 要的是**可执行指标** ✓
- *   ⇒ 分歧率 / ★危险分歧（逐条） / ★漏检索率 / 误检索率 四个数 ✓
- *
  * 用法：
- *   node shadow-report.js [日志文件] [--since=HH:MM] [--top=60]
- *   默认读 /tmp/voice-server.log ✓
+ *   node shadow-report.js [样本文件] [--since=HH:MM] [--top=60]
+ *   ★ 默认读 **`/tmp/shadow.jsonl`**（影子模式另写的专用样本文件 ✓）
+ *     —— ★ 为什么不用 /tmp/voice-server.log ✗：`deploy.sh` 每次都 `>` 清空它 ✓
+ *        样本会被一次次清掉（"攒了一天，一部署全没了"✗）✓
+ *     旧格式（服务日志里带 `SHADOW ` 前缀的行）也兼容 ✓ 传日志路径即可 ✓
  *
  * ★★ 两条纪律（否则数字会骗人 ✗）：
  *   ① 必须同时报 **限频丢弃数**（`drop`）✓ —— 样本被削过，指标就有系统性偏差 ✓
@@ -16,7 +13,9 @@
  */
 const fs = require('fs');
 
-const LOG = (process.argv[2] && !process.argv[2].startsWith('--')) ? process.argv[2] : '/tmp/voice-server.log';
+const arg = (process.argv[2] && !process.argv[2].startsWith('--')) ? process.argv[2] : null;
+const DEF = '/tmp/shadow.jsonl';
+const LOG = arg || (fs.existsSync(DEF) ? DEF : '/tmp/voice-server.log');
 let since = null, top = 60;
 for (const a of process.argv.slice(2)) {
   if (a.startsWith('--since=')) since = a.split('=')[1];
@@ -24,22 +23,31 @@ for (const a of process.argv.slice(2)) {
 }
 if (!fs.existsSync(LOG)) { console.error(`✗ 日志不存在: ${LOG}`); process.exit(1); }
 
-// ★ 只认 SHADOW 开头且后面是合法 JSON 的行 ✓（其它行一律忽略 ✓）
+// ★ 只认两种形状 ✓：专用文件里是**裸 JSON 一行** ✓；服务日志里是 `… SHADOW {json}` ✓
 const rows = [];
 let bad = 0, fails = 0, drops = 0, lines = 0;
-for (const line of fs.readFileSync(LOG, 'utf8').split('\n')) {
+for (const raw of fs.readFileSync(LOG, 'utf8').split('\n')) {
   lines++;
-  const i = line.indexOf('SHADOW ');
-  if (i < 0) continue;
-  const rest = line.slice(i + 7);
+  // ★ 容忍 BOM ✗（本项目老坑：PS `Set-Content -Encoding UTF8` 会给文件加 BOM ✓
+  //   带头 BOM 时 `startsWith('{')` 恒假 ⇒ 一条都解析不出来，而且**看起来像"没有样本"** ✓）
+  const line = raw.replace(/^\uFEFF/, '').replace(/\r$/, '');
+  let rest = null, iso = null;
+  if (line.startsWith('{')) {                       // ← 专用样本文件 /tmp/shadow.jsonl ✓
+    rest = line;
+  } else {
+    const i = line.indexOf('SHADOW ');
+    if (i < 0) continue;
+    rest = line.slice(i + 7);
+    iso = (line.match(/\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/) || [])[1] || null;
+  }
   if (rest.startsWith('⚠️')) { const m = rest.match(/已丢 (\d+)/); if (m) drops = Math.max(drops, +m[1]); continue; }
   if (rest.startsWith('✗')) { fails++; continue; }
   let j;
   try { j = JSON.parse(rest); } catch (e) { bad++; continue; }
   if (!j || !j.old || !j.new) { bad++; continue; }
-  if (since) {                                   // ★ 只看 HH:MM 之后（日志里是 ISO 时间 ✓）
-    const t = (line.match(/\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/) || [])[1];
-    if (t && t.slice(11) < since) continue;
+  if (since) {                                      // ★ 只看 HH:MM 之后 ✓（jsonl 用记录自己的 t ✓）
+    const t = iso || String(j.t || '').slice(11, 16);
+    if (t && t < since) continue;
   }
   rows.push(j);
   if (typeof j.drop === 'number') drops = Math.max(drops, j.drop);

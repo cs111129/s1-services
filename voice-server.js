@@ -994,6 +994,8 @@ const SHADOW_MODE = process.env.SHADOW_MODE === 'on';
 const SHADOW_MODEL = process.env.SHADOW_MODEL || 'deepseek-chat';
 const SHADOW_MAX_PER_MIN = Math.max(1, parseInt(process.env.SHADOW_MAX_PER_MIN || '30', 10));
 const SHADOW_TIMEOUT_MS = parseInt(process.env.SHADOW_TIMEOUT_MS || '9000', 10);
+// ★★ 专用样本文件 ✗（理由见下面 appendFileSync 那段注释：日志会被 deploy.sh 清空 ✓）
+const SHADOW_FILE = process.env.SHADOW_FILE || '/tmp/shadow.jsonl';
 // ★ 工具表 = 规格书 §5 ✓：★★ 参数**只填原话片段**（`time_text` / `duration_text`）✗
 //   探针实测：让模型填结构化数字 ⇒ 它会自己造名字（`set_alarm(time,date)` ✗）⇒ 必须只给"原话槽位" ✓
 const SHADOW_TOOLS = [
@@ -1023,8 +1025,17 @@ const SHADOW_SYS = [
   '3. 只是闲聊、打招呼、问你是谁 ⇒ ★ **不要调任何工具** ✓',
 ].join('\n');
 // ★ 写操作集合（用于判"危险分歧"✗ —— 分歧 + 写操作 = 会误操作 ⇒ 要逐条人工看 ✓）
-const SHADOW_WRITE_ACTIONS = new Set(['start_record', 'stop_record', 'set_timer', 'stop_timer',
-  'add_alarm', 'add_memo', 'del_alarm', 'del_memo']);
+//   ★★ 第一版写错了 ✗（本地假样本逮到 ✓）：只放了【旧 action 名】✗
+//     而模型给的是【工具名】（`cancel_alarm` ✗ 不在集合里 ✓）
+//     ⇒ 后果：**凡"模型提议写操作"的分歧都被漏标** ✗✗ —— 而那正是最该人工看的一类 ✓
+//   ★ 判据：**判据里出现两个命名空间时，必须两边都收** ✗（否则漏掉的是"对方那一侧" ✓）
+const SHADOW_WRITE_ACTIONS = new Set([
+  // 旧 action 名
+  'start_record', 'stop_record', 'set_timer', 'stop_timer',
+  'add_alarm', 'add_memo', 'del_alarm', 'del_memo',
+  // ★ 工具名（与上面一一对应 ✓ 别只写一边 ✗）
+  'set_alarm', 'cancel_alarm', 'delete_memo',
+]);
 let _shadowCalls = [];      // 滑动窗口（只存时间戳 ✓）
 let _shadowDone = 0, _shadowDropped = 0, _shadowErr = 0;
 /** ★ 影子判定（★ 绝不 await ✓ 绝不改任何状态 ✓ 抛错只吞 ✓）
@@ -1083,9 +1094,18 @@ function shadowJudge(heard, oldV, device) {
       // ★ 漏检索 = 旧路径判"知识库问答" 而 模型没调 search_kb ✗（★ 本 CR 最担心的新失败模式 ✓）
       const missedKb = oldV.kind === 'kb' && nv.tool !== 'search_kb';
       _shadowDone++;
-      log(`SHADOW ${JSON.stringify({ asr: String(heard || '').slice(0, 60), dev: device || '-',
+      const rec = { t: new Date().toISOString(), asr: String(heard || '').slice(0, 60), dev: device || '-',
         old: oldV, new: nv, diverge, dangerous, missedKb, ms: Date.now() - t0,
-        n: _shadowDone, drop: _shadowDropped })}`);
+        n: _shadowDone, drop: _shadowDropped };
+      const line = JSON.stringify(rec);
+      // ★★ 另写一份**专用文件** ✗✗ —— 为什么必须有：
+      //   `deploy.sh` 每次都用 `> /tmp/voice-server.log` **清空日志** ✓
+      //   而设备端部署很频繁 ⇒ ★ 只写日志的话，**样本会被一次次清掉** ✓
+      //   （"攒了一天数据，一部署全没了" ✗ —— 而且看不出是丢了，只觉得"样本怎么这么少" ✓）
+      //   ★ 判据：**要跨时间积累的数据，不能只放在会被轮转/清空的通道里** ✗
+      //   ★ appendFileSync 很小很稀（≤30/分 ✓）且**出错只吞** ✓ 不影响主流程 ✓
+      try { fs.appendFileSync(SHADOW_FILE, line + '\n'); } catch (e) { /* 只吞 ✓ */ }
+      log(`SHADOW ${line}`);
     }).catch(e => { clearTimeout(tid); _shadowErr++; log(`SHADOW ✗ 判定失败（${_shadowErr}）: ${e.message}`); });
   } catch (e) { _shadowErr++; try { log(`SHADOW ✗ 外层异常: ${e.message}`); } catch (e2) {} }
 }
