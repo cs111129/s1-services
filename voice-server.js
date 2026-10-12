@@ -701,7 +701,25 @@ function parseAlarmCmd(heard) {
   return p;
 }
 
-/** ★ 意图②：记备忘（★ 内容是**去掉引导语之后的那句** ✓ 设备端规格书 §5 第 2 条 ✓）*/
+// ★★ 2026-10-12 设备端回执指出的一处真缺陷（**我错了** ✗）：
+//   他们 `memo.h` 写的是 `#define MEMO_TEXT_MAX 120`，单位是 **字节** UTF-8（≈40 汉字 ✓）
+//   而我第一版按 **"120 字"** 限 ✗ ⇒ **超他们上限 3 倍** ✗（120 汉字 = 360 字节 ✓）
+//   ⇒ ★ 判据（同 #101 那一族）：**跨端说长度必须带单位** ✗ —— 同一个 120，
+//     "字"和"字节"差了 3 倍 ✓ 而这类不一致**不会报错**，只会被下游**静默截断** ✓
+//   ★ 可用上限取 **119**（不是 120 ✗）—— 他们那边是 `char text[MEMO_TEXT_MAX]`，
+//     120 里要有 1 字节给结尾 NUL ✓（他们自己的校验也是 `tl >= MEMO_TEXT_MAX ⇒ 拒绝` ✓）
+const MEMO_TEXT_MAX_BYTES = 119;
+/** 按**字节**安全截断 UTF-8（不切碎半个汉字 ✓ —— 与 SOP 名称那道守卫同一套路 ✓）*/
+function clipUtf8(s, maxBytes) {
+  let out = String(s || '');
+  while (out.length && Buffer.byteLength(out, 'utf8') > maxBytes) out = out.slice(0, -1);
+  return out;
+}
+
+/** ★ 意图②：记备忘（★ 内容是**去掉引导语之后的那句** ✓ 设备端规格书 §5 第 2 条 ✓）
+ *  ★ 超长 ⇒ **我方先按字节截断**（而不是丢给设备去截 ✗）：设备截断时**只打日志** ✓
+ *    用户看不到 ✗ ⇒ 由我方截 + **在 reply 里如实说一句** ✓（"太长，后面的没记住"✓）
+ *  ⇒ 返回 { text, truncated } ✓ —— ★ `truncated` **不进 params** ✗（别塞协议外的字段 ✓）*/
 function parseMemoCmd(heard) {
   const raw = String(heard || '').replace(/[。！!？?，,、\s]+$/, '');
   const m = raw.match(/^(?:帮我)?(?:记一下|记一笔|记一条|记住|记录一下|记下|备忘一下|备忘|添加备忘|新增备忘)[：:，,]?\s*(.+)$/);
@@ -709,7 +727,8 @@ function parseMemoCmd(heard) {
   const text = m[1].replace(/^[：:，,、\s]+/, '').trim();
   if (!text) return null;                                      // 没内容 ⇒ 不当作命令 ✓（别塞空备忘 ✗）
   if (VC_ASK_WORDS.test(text) && text.length <= 6) return null; // "记一下怎么弄"这类问句别当备忘 ✓
-  return { text: text.slice(0, 120) };                         // ★ 限长：设备侧有容量上限 ✓
+  const clipped = clipUtf8(text, MEMO_TEXT_MAX_BYTES);
+  return { text: clipped, truncated: clipped !== text };
 }
 
 /** 把新意图接进总入口 ✓（★ 放在 start/stop 之后 ⇒ 两边词表不打架 ✓）*/
@@ -722,9 +741,17 @@ function extraCmdHandle(heard) {
   }
   const memo = parseMemoCmd(heard);
   if (memo) {
-    const reply = '好，记住了：' + memo.text;
-    log(`语音命令: 「${heard}」⇒ add_memo ${JSON.stringify(memo)}｜reply="${reply}"`);
-    return { reply, action: 'add_memo', params: memo };
+    // ★★ reply 由 params **同源生成** ✓ —— 而且**超长时如实说** ✗：
+    //   设备截断只打日志、用户看不到 ✓ ⇒ 我方先截（≤119 字节 ✓）＋ 这句提示 ✓
+    //   ⇒ 用户听到的"记下了什么" = 实际存进去的东西 ✓（不会出现"说的和存的不一样" ✓）
+    const reply = memo.truncated
+      ? '有点长，我只记住了前半句：' + memo.text
+      : '好，记住了：' + memo.text;
+    const params = { text: memo.text };
+    log(`语音命令: 「${heard}」⇒ add_memo ${JSON.stringify(params)}`
+      + `${memo.truncated ? `（★ 原文 ${Buffer.byteLength(String(heard), 'utf8')} 字节 ⇒ 按设备上限 ${MEMO_TEXT_MAX_BYTES} 字节截断 ✓）` : ''}`
+      + `｜reply="${reply}"`);
+    return { reply, action: 'add_memo', params };   // ★ truncated **不进 params** ✗（协议外字段一律不加 ✓）
   }
   return null;
 }
