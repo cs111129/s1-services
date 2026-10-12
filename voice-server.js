@@ -29,8 +29,12 @@ const TTS_SCRIPT = '/root/.openclaw/陈盛工作区/脚本/语音/tts.py';
 //     ★ 判据：**外部服务的"模型/音色名"是契约，会变** ✗ —— 它一变，症状是"合成失败"，
 //       而旧代码里 `tts.py` **全失败仍退出 0** ✗ ⇒ 上层只看到"输出文件不存在"（误导 ✓）
 //       ⇒ 所以下面顺手把**脚本原话**带进错误里 ✓（下次一眼看得出是服务商的问题 ✓）
+//   ★★★ 2026-10-12 用户点单：**换成 `longwan`（龙婉）** ✓
+//     实测（同一把钥匙，v2 模型 ✓）：`longwan` **无产出** ✗ ／ **`longwan_v2` ✅ 52317 B · 3.24 s** ✓
+//     ⇒ ★ 规律再确认一次：**v2 模型下音色名要带 `_v2`** ✗（不带就是"无产出/empty_response"✓）
+//     ★ 判据：**改音色名 = 改契约** ✗ ⇒ **必须先实测再改** ✓，别照文档抄（文档里通常不带后缀 ✓）
 const TTS_MODEL = process.env.TTS_MODEL || 'cosyvoice-v2';   // ★ v1 已下线 ✓ 别改回 v1 ✗
-const TTS_VOICE = process.env.TTS_VOICE || 'longyuan_v2';    // ★ CosyVoice **v2** 音色名（带 _v2 ✓）
+const TTS_VOICE = process.env.TTS_VOICE || 'longwan_v2';     // ★ 龙婉（2026-10-12 用户点单 ✓）·带 _v2 ✓
 const ASR_SCRIPT = path.join(__dirname, 'asr_recognition.py');
 
 // 确保 DASHSCOPE_API_KEY 环境变量可用
