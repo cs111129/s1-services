@@ -50,7 +50,23 @@ if (!fs.existsSync(AUDIO_DIR)) {
 const CAM_DEVICE_SECRET = 'lingmu-cam-2026-secret';
 // S2 db-api 地址 + ingest token（S1 转发拉 SOP 列表用，与 cam_analyze.py 一致）
 const CAM_S2_DBAPI = 'http://8.136.146.89:18903';
-const CAM_INGEST_TOKEN = 'cam-ingest-token-2026';
+// ★★ 2026-10-12：ingest token 改为**从文件读**（`/root/.cam-ingest-token`，0600 ✓ 不进 git ✗）
+//   优先级：**环境变量 > 文件 > 旧默认值** ✓
+//   ★ 旧默认值保留为**过渡期兜底** ✗ —— 等 S2 那边也切完、并确认线上没有旧 token 流量后再删 ✓
+//   ★ 判据：**密钥不该躺在 git 里** ✗（这个默认值从 2026-09 起就在两个仓库的源码里 ✓ 该收了 ✓）
+function loadIngestToken() {
+  const env = String(process.env.CAM_INGEST_TOKEN || '').trim();
+  if (env) return env;
+  try {
+    const v = String(require('fs').readFileSync('/root/.cam-ingest-token', 'utf8') || '').trim();
+    if (v) return v;
+  } catch (e) { /* 文件不存在 ⇒ 走兜底 ✓（不报错：本机可能还没铺 ✓） */ }
+  return 'cam-ingest-token-2026';
+}
+const CAM_INGEST_TOKEN = loadIngestToken();
+// ★ 过渡期"旧 token"：S1 校验**别人发来的** ingest token 时要同时认它 ✓
+//   （调用方是 S2 那边的脚本：ota-admin.js / cam-flags.js 提示的命令 ✓）
+const CAM_INGEST_TOKEN_LEGACY = 'cam-ingest-token-2026';
 // 设备离线判定间隔：超过此毫秒无状态上报视为离线（前端判在线/离线）
 const CAM_OFFLINE_MS = 15000;
 // 待下发指令缓存：device_id -> { cmd, ts }
@@ -984,7 +1000,10 @@ const server = http.createServer(async (req, res) => {
    */
   if (req.method === 'POST' && req.url === '/api/cam/secrets-reload') {
     const tok = String(req.headers['x-ingest-token'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '')).trim();
-    if (tok !== CAM_INGEST_TOKEN) {
+    // ★ 2026-10-12：过渡期同时认【新 token】与【旧默认值】✓（S2 那边的脚本还在用旧的 ✓）
+    //   ⇒ 换 token 期间不会出现"发出去的 reload 被打 401" ✗
+    //   ★ 收尾动作（我自己记着）：S2 侧脚本改完 ⇒ 把 LEGACY 这一支删掉 ✓
+    if (tok !== CAM_INGEST_TOKEN && tok !== CAM_INGEST_TOKEN_LEGACY) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;

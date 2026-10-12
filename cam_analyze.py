@@ -69,8 +69,23 @@ DB_PATH = os.path.join(SCRIPT_DIR, "cam-analysis.db")
 S2_DBAPI = os.environ.get("S2_DBAPI", "http://8.136.146.89:18903")
 INGEST_PATH = "/api/cam-records/ingest"
 BINDING_PATH = "/api/cam-devices/current-binding"
-# CAM_INGEST_TOKEN：兄弟给的默认值；正式期可用环境变量覆盖。没有则跳过推送（仅本地落库）
-CAM_INGEST_TOKEN = os.environ.get("CAM_INGEST_TOKEN", "cam-ingest-token-2026")
+# ★★ 2026-10-12：ingest token 改为**从文件读**（/root/.cam-ingest-token，0600、不进 git）
+#   优先级：环境变量 > 文件 > 旧默认值（旧值只作过渡期兜底，收尾时删掉）
+#   ★ 为什么要动：这个默认值一直躺在**源码（git）**里 ⇒ 密钥不该在版本库里
+def _load_ingest_token():
+    v = (os.environ.get("CAM_INGEST_TOKEN") or "").strip()
+    if v:
+        return v
+    try:
+        with open("/root/.cam-ingest-token", "r", encoding="utf-8") as f:
+            v = (f.read() or "").strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    return "cam-ingest-token-2026"
+
+CAM_INGEST_TOKEN = _load_ingest_token()
 # CAM_DRYRUN=1：只分析、只写本地库，**不往 S2 推任何数据**。
 # 用途：在生产上安全复跑验证（比如改了提示词想拿真实批次试，又不想往生产库塞记录）。
 DRYRUN = os.environ.get("CAM_DRYRUN") == "1"
