@@ -728,12 +728,22 @@ function clipUtf8(s, maxBytes) {
 /** ★ 意图②：记备忘（★ 内容是**去掉引导语之后的那句** ✓ 设备端规格书 §5 第 2 条 ✓）
  *  ★ 超长 ⇒ **我方先按字节截断**（而不是丢给设备去截 ✗）：设备截断时**只打日志** ✓
  *    用户看不到 ✗ ⇒ 由我方截 + **在 reply 里如实说一句** ✓（"太长，后面的没记住"✓）
- *  ⇒ 返回 { text, truncated } ✓ —— ★ `truncated` **不进 params** ✗（别塞协议外的字段 ✓）*/
+ *  ⇒ 返回 { text, truncated } ✓ —— ★ `truncated` **不进 params** ✗（别塞协议外的字段 ✓）
+ *
+ *  ★★ 2026-10-12 端到端实测逮到的一条 ✗：
+ *    「记一下**备忘录**要买牛奶」⇒ ASR 给「记一下备忘录。要买牛奶。」⇒ 正文存成
+ *    「**备忘录**。要买牛奶」✗（把"备忘录"三个字也当正文存进去了 ✓ 用户会看见 ✓）
+ *    ⇒ 修法：正文再去掉**开头**的「备忘录/备忘」这类词 ✓（它们是"这是什么"、不是"内容" ✓）
+ *    ★ 判据：**触发词与"宾语名词"要一起摘** ✗ —— 只摘动词（"记一下"✓）会漏掉后面的名词 ✓
+ */
 function parseMemoCmd(heard) {
   const raw = String(heard || '').replace(/[。！!？?，,、\s]+$/, '');
   const m = raw.match(/^(?:帮我)?(?:记一下|记一笔|记一条|记住|记录一下|记下|备忘一下|备忘|添加备忘|新增备忘)[：:，,]?\s*(.+)$/);
   if (!m) return null;
-  const text = m[1].replace(/^[：:，,、\s]+/, '').trim();
+  const text = m[1]
+    .replace(/^[：:，,、\s]+/, '')
+    .replace(/^(备忘录|备忘条|备忘)[：:，,、。\.\s]*/, '')      // ★ 摘掉开头的宾语名词 ✓
+    .trim();
   if (!text) return null;                                      // 没内容 ⇒ 不当作命令 ✓（别塞空备忘 ✗）
   if (VC_ASK_WORDS.test(text) && text.length <= 6) return null; // "记一下怎么弄"这类问句别当备忘 ✓
   const clipped = clipUtf8(text, MEMO_TEXT_MAX_BYTES);
