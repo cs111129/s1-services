@@ -852,13 +852,18 @@ function parseSetTimerCmd(heard) {
     sec = Math.round(n * 3600) + 1800;
     cuts.push(mh[0]);
   } else {
-    // ② 通用：N(个)(小时|分钟|分|秒) / 半小时
-    const m = t.match(new RegExp('(' + NUM_RE + '|半)\\s*个?\\s*(小时|钟头|分钟|分|秒)'));
+    // ② 通用：N(个)(天|小时|分钟|分|秒) / 半小时
+    //   ★ 单位里**必须有"天"** ✗ —— 不是为了让两天能用（上限 24h ✓ 它会被下面的范围检查拦 ✓）
+    //     而是为了**让越界由我方来说** ✓：少了它，「定个两天的倒计时」⇒ 压根不算倒计时命令 ✗
+    //     ⇒ 交给 LLM 随口答 ✓（端到端实测就是这样 ✓ 效果不差、但**口径不确定** ✓）
+    //     ★ 判据：**该由我拦的输入，必须先进我的解析器** ✗ —— 进不来就谈不上"拦" ✓
+    const m = t.match(new RegExp('(' + NUM_RE + '|半)\\s*个?\\s*(天|小时|钟头|分钟|分|秒)'));
     if (!m) return null;
     const n = m[1] === '半' ? 0.5 : cnNum(m[1]);
     if (n === null || !(n > 0)) return null;
     const unit = m[2];
-    sec = /小时|钟头/.test(unit) ? Math.round(n * 3600) : (/秒/.test(unit) ? Math.round(n) : Math.round(n * 60));
+    sec = /天/.test(unit) ? Math.round(n * 86400)
+        : (/小时|钟头/.test(unit) ? Math.round(n * 3600) : (/秒/.test(unit) ? Math.round(n) : Math.round(n * 60)));
     cuts.push(m[0]);
     // ★「一小时**半**」这种（不是"N个半小时"）⇒ 补上 ✓
     if (!/半/.test(m[1]) && /小时|钟头/.test(unit) && /半/.test(t)) sec += 1800;
