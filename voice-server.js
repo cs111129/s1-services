@@ -516,7 +516,217 @@ async function voiceCmdHandle(device, heard) {
       + `（空值/0 = 用设备默认 ✓）★ 无播报 ✓`);
     return { reply: '', action: 'start_record', params };   // ★ reply 空 ⇒ 设备不播报任何内容 ✓
   }
-  return null;   // ── ③ 不是命令 ⇒ 交给原来的 LLM 流程 ✓ ──
+
+  // ── ③ ★ CR-20261012-01 期1：闹钟 / 备忘（★ 这两条**要播报** ⇒ reply 就是"确认"本身 ✓）──
+  const extra = extraCmdHandle(heard);
+  if (extra) return extra;
+
+  return null;   // ── ④ 不是命令 ⇒ 交给原来的 LLM 流程 ✓ ──
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ★★ CR-20261012-01 期1：语音控制的更多操作（**闹钟** / **备忘**）✓
+//
+//   ★ 架构不变（设备端规格书 §2 ✓）：**服务器判定意图 ⇒ 下发 `action`+`params`+一句 `reply`**
+//     ⇒ 设备执行并**把 `reply` 念出来** ✓ —— ★★ 与「开始录制」**刻意不同** ✗：
+//        那条用户要求「不播报任何内容」⇒ `reply` 为空 ✓；
+//        这条**要靠那句 reply 做确认** ✓（用户 2026-10-12 拍板的口径是"不要用户回话"，
+//        不是"不要它说话" ✓ ⇒ **它念、用户不用答** ✓）
+//
+//   ★★ 时间语义**必须在服务器算成 `day_offset`** ✗（设备端规格书 §3.1 ✓）：
+//     · 服务器知道**真实日期**（"明天"是几号 ✓），设备只知道"现在是星期几/第几天" ✓
+//     · 设备拿到 offset ⇒ 自己算 `due_dk` ⇒ **仍然只有一处实现** ✓
+//     · ⚠️ 设备**时钟没同步（SNTP 没对上）时必须拒绝** ✓（那条在设备侧 ✓）
+//
+//   ★★★ 实测发现的硬事实（决定了下面的写法 ✗）：
+//     **ASR 会把中文数字和阿拉伯数字【混着】给** ✓ —— 同一批测试里：
+//       「定个明天九点的闹钟」⇒ `九点`（中文 ✓）
+//       「十五分钟后提醒我」 ⇒ `15分钟后`（**阿拉伯** ✗✗）
+//     ⇒ ★ **两种形态都必须收** ✓；★ 判据：**别假设 ASR 的数字形态** ✗ —— 跑一遍真实录音再写正则 ✓
+//     ★ 另一条：ASR 回来**带句号**（「定个明天九点的闹钟。」✓）⇒ 先做标点归一化 ✓
+// ══════════════════════════════════════════════════════════════════════
+
+/** 中文数字（含"两"）→ 整数；纯数字串原样 ✓；认不出返回 null（**绝不猜** ✗）*/
+function cnNum(s) {
+  const t = String(s || '').trim();
+  if (!t) return null;
+  if (/^\d+$/.test(t)) return parseInt(t, 10);
+  const D = { '零': 0, '〇': 0, '一': 1, '两': 2, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+  if (!/^[零〇一两二三四五六七八九十]+$/.test(t)) return null;
+  // 十 / 十X / X十 / X十Y（例：十=10 十五=15 二十=20 二十三=23）
+  const i = t.indexOf('十');
+  if (i < 0) return t.length === 1 ? D[t] : null;
+  const head = t.slice(0, i), tail = t.slice(i + 1);
+  const h = head === '' ? 1 : D[head];
+  if (h === undefined) return null;
+  let m = 0;
+  if (tail !== '') { if (tail.length !== 1 || D[tail] === undefined) return null; m = D[tail]; }
+  return h * 10 + m;
+}
+/** 数字类字符集（正则片段 ✓ 中文 + 阿拉伯都收 ✗）*/
+const NUM_RE = '[0-9零〇一两二三四五六七八九十]+';
+
+/** 北京时间"现在"（★ 一律 +8h 后用 **UTC getter** 读 ✗ —— 别依赖服务器时区配置 ✓）*/
+function bjNow() {
+  const d = new Date(Date.now() + 8 * 3600 * 1000);
+  return { y: d.getUTCFullYear(), mo: d.getUTCMonth() + 1, day: d.getUTCDate(),
+           wd: d.getUTCDay(), h: d.getUTCHours(), m: d.getUTCMinutes() };
+}
+function bjDayStr(offset) {
+  const d = new Date(Date.now() + 8 * 3600 * 1000 + offset * 86400 * 1000);
+  return (d.getUTCMonth() + 1) + '月' + d.getUTCDate() + '日';
+}
+/** "什么时候"的说法 → { dayOffset|null, hh, mm, rep, relMinutes, label }；说不清就 null ✓
+ *  ★★ label 的算法（第一版写错过 ✗ 单测当场逮到）：
+ *    必须把**所有**"时间类碎片"都摘掉 ✓ —— 第一版只摘了「三点」✗
+ *    ⇒ 「提醒我下午三点吃药」的 label 变成了「**下午**吃药」✗
+ *    ⇒ 「每天早上七点半叫我」的 label 变成了「**每天早上**」✗
+ *    判据：**"剩下的就是 label"这种算法，必须把每一类碎片都列全** ✗
+ *    做法：**边匹配边把匹配到的片段收进 `cuts`** ✓ 最后一次性摘 ✓（比"事后清理"可靠 ✓）
+ */
+function parseWhen(text) {
+  let t = vcNorm(text);
+  const cuts = [];                                   // ★ 所有"时间类"片段（label = 原文去掉它们 ✓）
+  const cut = (s) => { if (s) { cuts.push(s); t = t.replace(s, ' '); } };
+
+  let rep = 'once';
+  const rm = t.match(/每(天|日|晚|个工作日|个周末)|工作日|上班日|周末|星期六日|周六日/);
+  if (rm) {
+    cut(rm[0]);
+    rep = /每(天|日|晚)/.test(rm[0]) ? 'daily' : (/工作日|上班日/.test(rm[0]) ? 'workday' : 'weekend');
+  }
+
+  // ① 相对时间（"15 分钟后"/"半小时后"）★ 实测 ASR 会给阿拉伯数字 ✗
+  let m = t.match(new RegExp('(' + NUM_RE + '|半)\\s*(分钟|分|小时|钟头)\\s*(后|之后|以后)'));
+  if (m) {
+    const n = m[1] === '半' ? 0.5 : cnNum(m[1]);
+    if (n === null || !(n > 0)) return null;
+    const mins = /小时|钟头/.test(m[2]) ? Math.round(n * 60) : Math.round(n);
+    cut(m[0]);
+    return { relMinutes: mins, rep, hh: null, mm: null, dayOffset: null, label: stripWhen(text, cuts) };
+  }
+
+  // ② 日偏移（今天/明天/后天…）
+  let dayOffset = null;
+  const dm = t.match(/(今天|今晚|明天|明晚|后天|大后天)/);
+  if (dm) {
+    const w = dm[1];
+    dayOffset = /大后天/.test(w) ? 3 : /后天/.test(w) ? 2 : /明天|明晚/.test(w) ? 1 : 0;
+    cut(w);
+  }
+  // ③ 上下午（★ 12 小时制 → 24 小时 ✓）
+  const pmM = t.match(/(下午|晚上|傍晚|夜里|晚间|中午|上午|早上|早晨|凌晨|一大早)/);
+  if (pmM) cut(pmM[0]);
+  const pm = /(下午|晚上|傍晚|夜里|晚间)/.test(pmM ? pmM[0] : '');
+  const noon = /中午/.test(pmM ? pmM[0] : '');
+  const am = /(上午|早上|早晨|凌晨|一大早)/.test(pmM ? pmM[0] : '');
+
+  // ④ 钟点：N点(半|M分)? / N:M
+  let hh = null, mm = 0;
+  const m2 = t.match(new RegExp('(' + NUM_RE + ')\\s*[点時时]\\s*(半|(' + NUM_RE + ')\\s*分?)?'));
+  const m3 = t.match(/(\d{1,2})\s*[:：]\s*(\d{1,2})/);
+  if (m3) { hh = parseInt(m3[1], 10); mm = parseInt(m3[2], 10); cut(m3[0]); }
+  else if (m2) {
+    hh = cnNum(m2[1]);
+    if (hh === null) return null;
+    if (m2[2] === '半') mm = 30;
+    else if (m2[3] !== undefined && m2[3] !== '') { const v = cnNum(m2[3]); if (v === null || v > 59) return null; mm = v; }
+    cut(m2[0]);
+  }
+  if (hh === null && !noon) return null;
+  if (noon && hh === null) hh = 12;
+  if (noon && hh !== null && hh < 12) hh = 12;                  // 中午十二点 ✓
+  if (pm && hh < 12) hh += 12;                                   // 下午三点 ⇒ 15 ✓
+  if (am && hh === 12) hh = 0;                                   // 凌晨十二点 ⇒ 0 ✓
+  if (hh > 23 || mm > 59) return null;
+  return { dayOffset, hh, mm, rep, relMinutes: 0, label: stripWhen(text, cuts) };
+}
+/** 从**原文**里摘掉所有时间类片段 + 触发词，剩下的当 label ✓（★ 摘不干净就返回空 ✓ 绝不硬凑 ✗）
+ *  ★ 用原文而不是被改过的 t ✗ —— 因为 t 里那些片段已经被替换成空格了 ✓（从原文摘才摘得准 ✓）*/
+function stripWhen(rawText, cuts) {
+  let s = vcNorm(rawText);
+  for (const c of (cuts || [])) s = s.split(c).join(' ');
+  return s.replace(/(定个|订个|设个|设一个|加个|添加|闹钟|提醒我|提醒|叫我|叫醒我|叫醒|记住|帮我|一下|一个|吧|谢谢|的|要|个|着|了)/g, ' ')
+          .replace(/\s+/g, '').trim();
+}
+/** 数字 → 中文（★ 给 TTS 念更自然 ✓：'9点' 会被念成"九点"多半没事，但"21点"会念成"二十一点"✓
+ *  这里统一转中文 ⇒ 念出来最稳 ✓；★ 只处理 0~60 ✓ 够用 ✓）*/
+const CN_STR = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+function cnStr(n) {
+  n = Number(n) || 0;
+  if (n < 10) return CN_STR[n];
+  if (n === 10) return '十';
+  if (n < 20) return '十' + CN_STR[n - 10];
+  const t = Math.floor(n / 10), o = n % 10;
+  return CN_STR[t] + '十' + (o ? CN_STR[o] : '');
+}
+/** 闹钟的确认文案 —— ★★ **必须由 params 生成** ✗（"用户确认的对象 = 设备执行的对象" ✓ 老规矩 ✓）
+ *  ★★ 措辞照设备端规格书 §5 第 1 条的期望：「**闹钟设在明天九点**」✓（联演时用户听到的就是这句 ✓）
+ *  ★ 第一版写错过 ✗：把 20 点说成「下午8点」✗（中文里 20 点只能是"晚上八点"✓）⇒
+ *    按时段分档 ✓：<6 凌晨 / <12 上午 / =12 中午 / <18 下午 / 其余 晚上 ✓
+ */
+function alarmReply(p) {
+  const day = p.day_offset === 0 ? '今天' : p.day_offset === 1 ? '明天'
+            : p.day_offset === 2 ? '后天' : (cnStr(p.day_offset) + '天后');
+  const part = p.hh < 6 ? '凌晨' : p.hh < 12 ? '上午' : p.hh === 12 ? '中午' : p.hh < 18 ? '下午' : '晚上';
+  const h12 = p.hh % 12 === 0 ? 12 : p.hh % 12;
+  const t = cnStr(h12) + '点' + (p.mm === 0 ? '' : (p.mm === 30 ? '半' : cnStr(p.mm) + '分'));
+  const repCn = p.rep === 'daily' ? '每天' : p.rep === 'workday' ? '每个工作日' : p.rep === 'weekend' ? '周末' : '';
+  const when = repCn ? (repCn + part) : (day + part);
+  return '闹钟设在' + when + t + (p.label ? '，提醒你' + p.label : '');
+}
+
+/** ★ 意图①：定闹钟（含"提醒我X点做Y" ✓ 也含"N分钟后"✓ 由服务器换算成绝对时刻 ✓）*/
+function parseAlarmCmd(heard) {
+  const t = vcNorm(heard);
+  if (!/(闹钟|叫我|叫醒|提醒)/.test(t)) return null;
+  if (VC_ASK_WORDS.test(t)) return null;                      // 问句 ⇒ 不当命令 ✓
+  const w = parseWhen(t);
+  if (!w) return null;
+  const now = bjNow();
+  let hh = w.hh, mm = w.mm, dayOffset = w.dayOffset;
+  if (w.relMinutes > 0) {                                     // 相对 ⇒ 换成绝对时刻 ✓
+    const total = now.h * 60 + now.m + w.relMinutes;
+    dayOffset = Math.floor(total / 1440);
+    hh = Math.floor((total % 1440) / 60);
+    mm = total % 60;
+  } else if (dayOffset === null) {
+    // ★ 没说哪天 ⇒ **取下一次**（今天这个点还没到就是今天 ✓ 过了就是明天 ✓）
+    //   ★ 这条要如实报出来（reply 里会说"今天/明天"✓）⇒ 用户听得出我理解成了哪天 ✓
+    dayOffset = (hh * 60 + mm) > (now.h * 60 + now.m) ? 0 : 1;
+  }
+  const label = (w.label || '').replace(/^[的，,、]+/, '').trim();
+  const p = { hh, mm, rep: w.rep || 'once', day_offset: dayOffset };
+  if (label) p.label = label;                                  // ★ 没标签就**别带这个字段** ✗（别用空值覆盖 ✓）
+  return p;
+}
+
+/** ★ 意图②：记备忘（★ 内容是**去掉引导语之后的那句** ✓ 设备端规格书 §5 第 2 条 ✓）*/
+function parseMemoCmd(heard) {
+  const raw = String(heard || '').replace(/[。！!？?，,、\s]+$/, '');
+  const m = raw.match(/^(?:帮我)?(?:记一下|记一笔|记一条|记住|记录一下|记下|备忘一下|备忘|添加备忘|新增备忘)[：:，,]?\s*(.+)$/);
+  if (!m) return null;
+  const text = m[1].replace(/^[：:，,、\s]+/, '').trim();
+  if (!text) return null;                                      // 没内容 ⇒ 不当作命令 ✓（别塞空备忘 ✗）
+  if (VC_ASK_WORDS.test(text) && text.length <= 6) return null; // "记一下怎么弄"这类问句别当备忘 ✓
+  return { text: text.slice(0, 120) };                         // ★ 限长：设备侧有容量上限 ✓
+}
+
+/** 把新意图接进总入口 ✓（★ 放在 start/stop 之后 ⇒ 两边词表不打架 ✓）*/
+function extraCmdHandle(heard) {
+  const a = parseAlarmCmd(heard);
+  if (a) {
+    const reply = alarmReply(a);
+    log(`语音命令: 「${heard}」⇒ add_alarm ${JSON.stringify(a)}｜reply="${reply}"（★ 由 params 生成 ✓ 同源 ✓）`);
+    return { reply, action: 'add_alarm', params: a };
+  }
+  const memo = parseMemoCmd(heard);
+  if (memo) {
+    const reply = '好，记住了：' + memo.text;
+    log(`语音命令: 「${heard}」⇒ add_memo ${JSON.stringify(memo)}｜reply="${reply}"`);
+    return { reply, action: 'add_memo', params: memo };
+  }
+  return null;
 }
 // ★★ 取客户端 IP：**必须优先 X-Real-IP，不能用 X-Forwarded-For 的第一个** ✗
 //   原因：nginx 那边两个头来源不同 ——
