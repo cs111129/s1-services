@@ -1065,9 +1065,19 @@ function shadowJudge(heard, oldV, device) {
       } else {
         nv = { tool: null, text: String((m && m.content) || '').slice(0, 60) };   // ★ 不调工具 = 直接回话 ✓
       }
-      const diverge = oldV.kind === 'command'
-        ? (nv.tool === null || !SHADOW_TOOL_TO_OLD[nv.tool] || SHADOW_TOOL_TO_OLD[nv.tool] !== oldV.action)
-        : (nv.tool !== null);
+      // ★★ 判"分歧"的规则 —— ★ 第一版写错了 ✗（上线后第一批 3 条样本就抓到 ✓）：
+      //   我原来写的是"知识库回合只要调了工具就算分歧" ✗✗
+      //   ⇒ 可模型调 **`search_kb`** 恰恰就是"**和旧路径一致**"（都去查知识库 ✓）
+      //   ⇒ 后果：**分歧率被系统性抬高** ✗（3 条样本里 2 条是假的 ✓）
+      //   ★ 判据：**"分歧"要按"两条路想不想做同一件事"定义** ✗ ——
+      //     不是按"有没有调工具"定义 ✓（工具是手段，不是目的 ✓）
+      //   · 旧=命令 ⇒ 一致 ⟺ 模型选的工具**映射到同一个 action**
+      //   · 旧=知识库 ⇒ 一致 ⟺ 模型调了 `search_kb`
+      //   · 旧=人设自答 ⇒ 一致 ⟺ 模型**没调工具**（直接回话 ✓）
+      let diverge;
+      if (oldV.kind === 'command') diverge = !(nv.tool && SHADOW_TOOL_TO_OLD[nv.tool] === oldV.action);
+      else if (oldV.kind === 'kb') diverge = (nv.tool !== 'search_kb');
+      else diverge = (nv.tool !== null);
       // ★★ 危险分歧 = 分歧 且 任一侧涉及写操作 ✗（会误操作 ⇒ 逐条人工看 ✓）
       const dangerous = diverge && (SHADOW_WRITE_ACTIONS.has(oldV.action) || SHADOW_WRITE_ACTIONS.has(nv.tool));
       // ★ 漏检索 = 旧路径判"知识库问答" 而 模型没调 search_kb ✗（★ 本 CR 最担心的新失败模式 ✓）
