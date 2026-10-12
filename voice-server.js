@@ -18,7 +18,19 @@ const TTS_SCRIPT = '/root/.openclaw/陈盛工作区/脚本/语音/tts.py';
 //   女：longwan longhua longxiaochun longxiaoxia longxiaobai longjing longmiao longyue longyuan
 //       儿童：longtong ｜ ★ `cosyvoice-v2` 本账号**未开通**（报 418 InvalidParameter）；`qwen-tts` 走兼容模式 404
 //   ★★ 2026-10-07 用户试听后拍板：**改用 `longyuan`（龙媛，女声 9 号）**（原 longzhe 龙哲，男）
-const TTS_VOICE = process.env.TTS_VOICE || 'longyuan';  // CosyVoice 音色名
+//   ★★★ 2026-10-12 **服务商把 CosyVoice v1 下线了**（用户当场报"问完不念、说语音合成没成功"✗）
+//     实测（同一密钥，9 个组合矩阵）：
+//       · `cosyvoice-v1` + longyuan/longzhe/longxiaochun ⇒ websocket `task-failed`
+//         `{"error_code":"InvalidParameter","error_message":"Model not exist."}` ✗✗
+//       · `cosyvoice-v2` + `longyuan_v2` ⇒ ✅ **11357 B 正常产出** ✓（`longxiaochun_v2` 也可以 ✓）
+//       · `cosyvoice-v2` + 旧名字 `longyuan` ⇒ `empty_response` ✗（★ 音色名也要带 `_v2` ✗）
+//     ★ 与本文件上面那条 10-07 的记载**正好相反**（当时 v2 报 418 未开通 ✓）——
+//       即：**服务商既下线了 v1、又把 v2 开通了** ✓ ⇒ 两条一起改，缺一个都不出声 ✗
+//     ★ 判据：**外部服务的"模型/音色名"是契约，会变** ✗ —— 它一变，症状是"合成失败"，
+//       而旧代码里 `tts.py` **全失败仍退出 0** ✗ ⇒ 上层只看到"输出文件不存在"（误导 ✓）
+//       ⇒ 所以下面顺手把**脚本原话**带进错误里 ✓（下次一眼看得出是服务商的问题 ✓）
+const TTS_MODEL = process.env.TTS_MODEL || 'cosyvoice-v2';   // ★ v1 已下线 ✓ 别改回 v1 ✗
+const TTS_VOICE = process.env.TTS_VOICE || 'longyuan_v2';    // ★ CosyVoice **v2** 音色名（带 _v2 ✓）
 const ASR_SCRIPT = path.join(__dirname, 'asr_recognition.py');
 
 // 确保 DASHSCOPE_API_KEY 环境变量可用
@@ -671,11 +683,20 @@ async function handleTTS(text, audioFmt) {
     //      彻底解决要改 tts.py 支持自定义前缀，另开）
     for (const oldChunk of globTtsChunks()) { try { fs.unlinkSync(oldChunk); } catch (e) {} }
 
-    await execFileAsync('python3', [TTS_SCRIPT, text, '--voice', TTS_VOICE], { env: execEnv });
+    // ★ 2026-10-12：把**模型**也显式传下去 ✗ —— 原来只传 `--voice`，
+    //   而 `tts.py` 的模型默认是写死的 `cosyvoice-v1` ⇒ 服务商下线 v1 后**全线不出声** ✗
+    //   （实测：光改音色没用，模型和音色**必须配套** ✓ 见上面 TTS_MODEL 的注释 ✓）
+    const ttsRun = await execFileAsync('python3',
+      [TTS_SCRIPT, text, '--model', TTS_MODEL, '--voice', TTS_VOICE], { env: execEnv });
 
     const chunks = globTtsChunks();
     if (!chunks.length) {
-      throw new Error('TTS 输出文件不存在');
+      // ★★ 2026-10-12：**带上脚本原话** ✗ —— `tts.py` 全段失败时**仍退出 0** ✗，
+      //   旧代码于是只报一句"输出文件不存在" ✓ ⇒ 看不出是**服务商**的问题（误导排障 ✓）
+      //   ⇒ 把 stdout/stderr 尾部拼进来，下次一眼能看出是 "Model not exist" 还是网络 ✓
+      const raw = String((ttsRun && (ttsRun.stdout || ttsRun.stderr)) || '').trim().slice(-400);
+      throw new Error('TTS 输出文件不存在（model=' + TTS_MODEL + ' voice=' + TTS_VOICE + '）'
+        + (raw ? '；脚本原话: ' + raw.replace(/\s+/g, ' ') : '；脚本无输出'));
     }
     if (chunks.length === 1) {
       fs.copyFileSync(chunks[0], mp3Target);
@@ -760,8 +781,9 @@ async function deepseekReply(text) {
 async function ttsToPcmFile(text) {
   const mp3 = '/tmp/tts-chunk-1.mp3';
   if (fs.existsSync(mp3)) fs.unlinkSync(mp3);
-  await execFileAsync('python3', [TTS_SCRIPT, text, '--voice', TTS_VOICE], { env: execEnv });
-  if (!fs.existsSync(mp3)) throw new Error('TTS 无输出');
+  // ★ 2026-10-12：与 handleTTS 一致，**模型与音色配套传** ✗（只传音色会落回写死的 v1 ✓ 已下线 ✓）
+  await execFileAsync('python3', [TTS_SCRIPT, text, '--model', TTS_MODEL, '--voice', TTS_VOICE], { env: execEnv });
+  if (!fs.existsSync(mp3)) throw new Error('TTS 无输出（model=' + TTS_MODEL + ' voice=' + TTS_VOICE + '）');
   const pcmOut = path.join(AUDIO_DIR, `box3-tts-${Date.now()}.pcm`);
   execSync(`ffmpeg -y -i "${mp3}" -acodec pcm_s16le -ar 16000 -ac 1 -f s16le "${pcmOut}"`, { stdio: 'pipe', timeout: 15000 });
   return pcmOut;
