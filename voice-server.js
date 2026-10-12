@@ -775,39 +775,68 @@ function parseMemoCmd(heard) {
 //     ⇒ 我方一律用**意图口径**：「好，取消九点的闹钟」✓（成没成由**设备自己的**表情/提示去说 ✓）
 // ══════════════════════════════════════════════════════════════════════
 
-/** ★ 意图③：取消闹钟 ⇒ `del_alarm {hh,mm}` 或 `{index:0}`（最后一条 ✓）*/
+/** ★ 意图③：取消闹钟 ⇒ `del_alarm {hh,mm}` ✓（★ 只用钟点 ✗）
+ *  ★★ 2026-10-12 晚按设备端 `回执4` §2 改 ✗：
+ *    · 原来还有一条 `{index:0}`（"取消最后那个闹钟"）✗ —— ★ **删掉了** ✓
+ *    · 理由（设备端给的 ✓ 很硬 ✗）：**闹钟表里只有槽位、没有"新旧"** ✓
+ *      新建时填的是**第一个空槽** ⇒ ★ **槽位序 ≠ 创建序** ✗
+ *      ⇒ ★★ **"最后那个闹钟""第三个闹钟"在设备侧【给不出】稳定含义** ✓
+ *    · ⇒ 遇到这种 ⇒ ★ **回一句问清** ✗（不猜 ✗ 也不静默丢弃 ✗ —— 静默丢弃会让用户以为删掉了 ✓）
+ *  ★ 判据（设备端原话 ✓ 值得记）：**"第 N 个"必须先定义"从哪头数、按什么排"** ✗ ——
+ *    不定死 ⇒ 双方各按各的算 ⇒ ★ **删错一条、两边都觉得自己对** ✓
+ *  ★ 要真支持"第 N 个闹钟" ⇒ ★ 那是一条**独立需求**（要设备端加新的排序口径 ✓）⇒ 登记 CR ✓ */
 function parseDelAlarmCmd(heard) {
   const t = vcNorm(heard);
   if (!/(闹钟|叫我|叫醒|提醒)/.test(t)) return null;
   if (!/(取消|删掉|删除|去掉|撤销|关掉|不要了|别响)/.test(t)) return null;   // ★ 必须**有删除动词** ✗
   if (VC_ASK_WORDS.test(t)) return null;
-  // ① 报了钟点 ⇒ 按 hh:mm 删 ✓（"取消九点的闹钟" ✓）
+  // ① 报了钟点 ⇒ 按 hh:mm 删 ✓（"取消九点的闹钟" ✓ —— ★ 这是我方**唯一**敢发的形态 ✓）
   const w = parseWhen(t);
   if (w && !w.relMinutes && w.hh !== null) return { hh: w.hh, mm: w.mm };
-  // ② 说的是"最后/最新那个" ⇒ index:0 ✓（★ 与 §3.2 的 memo 基准一致 ✓）
-  if (/(最后|最新|末尾|刚定|刚才那)/.test(t)) return { index: 0 };
-  // ③ ★ 其它（"第几个"这种）⇒ **不发** ✗ —— 序号基准是设备侧细节，我方不猜 ✓
+  // ② ★ 说的是"第几个 / 最后那个 / 最新那个" ⇒ **反问** ✗（★ 不猜、也不当没听见 ✓）
+  if (/(第\s*[0-9零〇一两二三四五六七八九十]+\s*(个|条)|最后|最新|末尾|刚定|刚才那|上一个)/.test(t)) {
+    return { needClarify: true };
+  }
+  // ③ 其它 ⇒ 不是命令 ✓（交给 LLM ✓）
   return null;
 }
 
-/** ★ 意图④：删备忘 ⇒ `del_memo {index:0}`（**只有"最后一条"这一种** ✓ 见上面 §index 基准）*/
+/** ★ 意图④：删备忘 ⇒ `del_memo {index:N}`
+ *  ★★ 2026-10-12 晚补：**支持"第 N 条"** ✗（设备端 `回执4` §2 给了口径 ✓）
+ *    · 口径 = **从新往旧数** ✓ `0` = **最新那条** ✓（设备侧 `memo_delete()` 本来就是这个口径 ✓）
+ *    · 口语是 1-based（"第2条"✓）⇒ ★ 转成 `index = N-1` ✗（★ 别把 1-based 直接发出去 ✓）
+ *    · 没写序号（"最后一条"✓）⇒ `index:0` ✓
+ *  ★ 判据：**口语序号与数组下标差 1 ⇒ 换算必须在一个地方做完** ✗（这里 ✓ 别让设备再猜 ✓）*/
 function parseDelMemoCmd(heard) {
   const t = vcNorm(heard);
   if (!/备忘/.test(t)) return null;
   if (!/(删掉|删除|去掉|消掉|清掉|不要了)/.test(t)) return null;
-  if (!/(最后|最新|末尾|刚记|刚才那|上一条)/.test(t)) return null;   // ★ 只有这一种形态才发 ✗
   if (VC_ASK_WORDS.test(t)) return null;
+  const m = t.match(new RegExp('第\\s*(' + NUM_RE + ')\\s*(条|个)'));
+  if (m) {
+    const n = cnNum(m[1]);
+    if (n === null || n < 1) return null;
+    return { index: n - 1 };                       // ★ 口语 1-based ⇒ 下标 n-1 ✓
+  }
+  if (!/(最后|最新|末尾|刚记|刚才那|上一条)/.test(t)) return null;   // ★ 没序号也没说"最后" ⇒ 不发 ✗
   return { index: 0 };
 }
 
-/** ★ 意图⑤：读备忘 ⇒ `read_memo {index:0}`（设备侧复用 `voice_speak_text()` 念出来 ✓）*/
+/** ★ 意图⑤：读备忘 ⇒ `read_memo {index:N}`（设备侧复用 `voice_speak_text()` 念出来 ✓）
+ *  ★★ 同样支持"第 N 条" ✓（口径与 `del_memo` **必须一致** ✗ —— 都是**从新往旧数** ✓）*/
 function parseReadMemoCmd(heard) {
   const t = vcNorm(heard);
   if (!/备忘/.test(t)) return null;
   if (!/(念|读|说给我听|念念|读一下|念一下)/.test(t)) return null;
   if (/(怎么|如何|在哪|哪里)/.test(t)) return null;              // "备忘怎么用"不是命令 ✓
   if (/(删|去掉|清)/.test(t)) return null;                        // 带删的不当读 ✓（前面已处理 ✓）
-  return { index: 0 };                                            // ★ 只有"最后一条" ✓ 同上 ✗
+  const m = t.match(new RegExp('第\\s*(' + NUM_RE + ')\\s*(条|个)'));
+  if (m) {
+    const n = cnNum(m[1]);
+    if (n === null || n < 1) return null;
+    return { index: n - 1 };
+  }
+  return { index: 0 };                                            // ★ 没说序号 ⇒ 最新那条 ✓
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -908,17 +937,26 @@ function extraCmdHandle(heard) {
   // ── ① 先判**删闹钟**（"取消九点的闹钟"必须在这里被吃掉 ✗ 晚一步就被当成新增 ✓）──
   const da = parseDelAlarmCmd(heard);
   if (da) {
+    // ★★ "第几个/最后那个闹钟" ⇒ **反问** ✗（设备端口径：闹钟只有槽位、没有新旧 ✓
+    //   ⇒ 「最后那个」在设备侧**没有稳定含义** ✓ ⇒ ★ 绝不猜 ✓ 但也**不当没听见** ✗
+    //   ★ 为什么必须回一句 ✗：静默丢弃会让用户**以为已经删掉了** ✓（比"做不到"更糟 ✓）
+    if (da.needClarify) {
+      const reply = '闹钟是按钟点记的，你说的那一个是几点的？';
+      log(`语音命令: 「${heard}」⇒ del_alarm **口径不足 ⇒ 反问** ✗｜reply="${reply}"`
+        + `（★ 闹钟表只有槽位没有新旧 ⇒ "第几个/最后那个"无稳定含义 ✓ 不猜 ✗）`);
+      return { reply, action: null, params: null };
+    }
     // ★ 用共用的 clockCn ✓ —— 第一版直接 `cnStr(hh)+'点'` ⇒ 15 点被念成「十五点」✗（应为"下午三点"✓）
-    const reply = (da.hh !== undefined)
-      ? ('好，取消' + clockCn(da.hh, da.mm) + '的闹钟')
-      : '好，取消最后那个闹钟';
+    const reply = '好，取消' + clockCn(da.hh, da.mm) + '的闹钟';
     log(`语音命令: 「${heard}」⇒ del_alarm ${JSON.stringify(da)}｜reply="${reply}"`);
     return { reply, action: 'del_alarm', params: da };
   }
   // ── ② 删备忘 ──
   const dm = parseDelMemoCmd(heard);
   if (dm) {
-    const reply = '好，删掉最后一条备忘';
+    // ★ 口径 = 从新往旧数 ✓（`index:0` = 最新 ✓）；有"第 N 条"时也要念清是哪条 ✗
+    const reply = dm.index === 0 ? '好，删掉最后一条备忘'
+                                 : ('好，删掉最新往前的第' + cnStr(dm.index + 1) + '条备忘');
     log(`语音命令: 「${heard}」⇒ del_memo ${JSON.stringify(dm)}｜reply="${reply}"`);
     return { reply, action: 'del_memo', params: dm };
   }
