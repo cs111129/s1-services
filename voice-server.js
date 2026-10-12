@@ -1117,6 +1117,140 @@ const SHADOW_TOOL_TO_OLD = {
   set_timer: 'set_timer', stop_timer: 'stop_timer',
   search_kb: '__kb__',
 };
+
+// ══════════════════════════════════════════════════════════════════════
+// ★★★ CR-20261012-03 §6.6 方案 B：**联网搜索**（用户 2026-10-12 拍板「把 B 接上」✓）
+//
+//   ★ 用户原话（逐字 ✓）：「可是我想的，比方说我刚问"明天天气怎么样"，
+//     他是**真的会去搜**…然后给我回答，**这是我想要的呀**」✓
+//
+//   ★★ 实现形状（来自探针结论 ✓ 别改成别的 ✗）：
+//     · `enable_search` 是**模型级开关**、**不是"工具"** ✗
+//       ⇒ 正确姿势：**路由器**先判"要不要外部信息" ✓
+//         ⇒ 要 ⇒ **生成那一轮带上 `enable_search:true`** ✓（★ 同一次调用 ✓ 不多一次往返 ✓）
+//         ⇒ 不要 ⇒ 不带 ✓（零额外成本/延迟 ✓）
+//     · ★ 必须走**原生端点** ✗✗：`/api/v1/services/aigc/text-generation/generation`
+//       —— 实测**兼容模式会静默忽略 `enable_search`** ✗（模型答"我不连接互联网"✓
+//          这正是我第一轮误判成"这条路是陷阱"的原因 ✗）
+//     · ★ 打开 `search_options.enable_source=true` ⇒ 才拿得到 `search_info.search_results[]`
+//       （带 `site_name`/`title`/`url` ✓ ⇒ ★ 我方把来源**写日志** ✓ 答案可核对 ✓）
+//     · ★★ 实测数字：简单问题 2.5s ✓ ／ 天气 5.3~5.9s ✓ ／ 要求列链接 9.5s ✗（别要求列链接 ✓）
+//       每次 input ≈3000+ tokens ✓（搜索结果进了 prompt ✓）
+//
+//   ★★★ 三条纪律（★ 缺一不可 ✗）：
+//     ① **只在路由器判定需要时才开** ✗（否则每句都搜 ⇒ 成本延迟全上去 ✓）
+//     ② **超时严格**（WEB_TIMEOUT_MS ✓ 默认 9s ✓）—— 超时 ⇒ **退回原路** ✓ 不干等 ✓
+//     ③ **日均额度**（WEB_DAILY_MAX ✓）—— 超了就**退回原路** ✓（不是报错 ✓）
+//
+//   ★ 失败一律**退回原路** ✗✗：路由失败 / 搜索失败 / 超时 / 超额度 ⇒ 都走原来的
+//     知识库＋deepseek 那条 ✓ ⇒ ★ **最坏情况 = 今天的行为** ✓（不会比现在差 ✓）
+// ══════════════════════════════════════════════════════════════════════
+const WEB_SEARCH_ON = process.env.WEB_SEARCH !== '0';
+const WEB_MODEL = process.env.WEB_MODEL || 'qwen-plus';
+const WEB_TIMEOUT_MS = parseInt(process.env.WEB_TIMEOUT_MS || '9000', 10);
+const WEB_DAILY_MAX = Math.max(1, parseInt(process.env.WEB_DAILY_MAX || '200', 10));
+const DASHSCOPE_URL = 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation';
+let _webDayKey = '', _webUsed = 0, _webFail = 0;
+function webQuotaOk() {
+  const d = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);   // ★ 北京时间日 ✓
+  if (d !== _webDayKey) { _webDayKey = d; _webUsed = 0; log(`WEB 额度重置（${d}）上限 ${WEB_DAILY_MAX}/天`); }
+  return _webUsed < WEB_DAILY_MAX;
+}
+/** ★★ 把模型给的 markdown 洗成"能念"的纯文本 ✗✗
+ *  ★ 为什么必须有：探针实测 qwen 带搜索的答案长这样 ✗
+ *    「**天气现象**：多云转晴 - **最高气温**：22℃…」
+ *  ⇒ ★ 设备是 **TTS 逐字念** ✗ ⇒ 会把"星号""井号""短横线"念出来 ✓
+ *  ★ 判据：**"给屏幕看"的格式和"给喇叭念"的格式不是一回事** ✗（本项目 §121 老规矩 ✓）*/
+function speakable(s) {
+  let t = String(s || '');
+  t = t.replace(/```[\s\S]*?```/g, ' ');          // 代码块
+  t = t.replace(/\*\*|__|`|\*|#+\s*/g, '');        // ★ 粗体/斜体/行内码/标题符
+  t = t.replace(/^\s*[-•·]\s*/gm, '');             // 行首项目符号
+  t = t.replace(/^\s*\d+[.、)]\s*/gm, '');         // 行首数字编号
+  t = t.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');   // [文字](链接) ⇒ 文字
+  t = t.replace(/^\s*答[：:]\s*/,'');              // 我方那套前缀（若模型也用了 ✓）
+  t = t.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+  return t;
+}
+/** ★ 路由器：这一轮要不要【外部/实时】信息？（★ 与 KB 检索**并行发** ✓ 见 §6.1 ✓）
+ *  ★ 判据：认不准就 false ✗（= 不搜 ✓ 退回原路 ✓ 安全 ✓）*/
+async function routeNeedsWeb(text) {
+  if (!WEB_SEARCH_ON || !DEEPSEEK_KEY) return false;
+  const ac = new AbortController();
+  const tid = setTimeout(() => ac.abort(), 6000);
+  try {
+    const r = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Authorization': `Bearer ${DEEPSEEK_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-chat', temperature: 0, max_tokens: 60,
+        messages: [
+          { role: 'system', content: [
+            '判断用户这句话需不需要【外部/实时信息】。需要就调用工具，不需要就别调用。',
+            '★ 需要：天气、新闻、今天几号、股价/汇率、赛事、航班、任何"眼下的事实"。',
+            '★ 不需要：店里的SOP/标准/流程/规定（我们有内部知识库）· 操作设备（录制/闹钟/备忘/倒计时）',
+            '  · 打招呼/闲聊/自我介绍/问你是谁 · 靠常识就能答的通用做法。',
+          ].join('\n') },
+          { role: 'user', content: String(text || '') },
+        ],
+        tools: [{ type: 'function', function: { name: 'web_search', description: '需要外部实时信息时调用',
+          parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } } }],
+        tool_choice: 'auto',
+      }),
+    });
+    const j = await r.json();
+    const tc = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.tool_calls;
+    return !!(tc && tc.length);
+  } catch (e) {
+    _webFail++;
+    log(`WEB ⚠️ 路由判定失败（第 ${_webFail} 次，按"不搜"处理 ✓）: ${e.message}`);
+    return false;
+  } finally { clearTimeout(tid); }
+}
+/** ★ 联网回答（qwen-plus ＋ enable_search ＋ enable_source ✓）
+ *  ⇒ 返回 { reply, sources } ／ null（失败 ✓ 调用方退回原路 ✓）*/
+async function webAnswer(heard, lenHint) {
+  if (!DASHSCOPE_API_KEY) { log('WEB ⚠️ 没有 DASHSCOPE_API_KEY ⇒ 退回原路'); return null; }
+  const ac = new AbortController();
+  const tid = setTimeout(() => ac.abort(), WEB_TIMEOUT_MS);
+  const t0 = Date.now();
+  try {
+    const sys = [
+      '你是「赋能02」门店带教助手"小星"，正在给一线员工答话（会被语音念出来）。',
+      '★ 性格幽默接地气，像店里业务最强又爱开玩笑的前辈 ✓ 但**别贫嘴**、一两句就收 ✓。',
+      '★ 用**口语**回答，**不要 markdown、不要星号、不要分点符号、不要 emoji** —— 会被逐字念出来。',
+      '★ 搜到就用搜到的 ✓ 说清"这是查到的"✓；**搜不到或不确定就直说，别编** ✗。',
+      `★ 长度控制在 ${lenHint || '180 字以内'}。`,
+    ].join('\n');
+    const r = await fetch(DASHSCOPE_URL, {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Authorization': `Bearer ${DASHSCOPE_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: WEB_MODEL,
+        input: { messages: [{ role: 'system', content: sys }, { role: 'user', content: String(heard || '') }] },
+        parameters: { enable_search: true, search_options: { enable_source: true }, result_format: 'message' },
+      }),
+    });
+    const j = await r.json();
+    const o = j.output || {};
+    const msg = (o.choices && o.choices[0] && o.choices[0].message) || {};
+    const raw = String(msg.content || '');
+    const sr = (o.search_info && o.search_info.search_results) || [];
+    // ★★ 判据不靠"它说它搜了"✗ —— 看 usage.plugins.search（真搜过的铁证 ✓）
+    const searched = !!((j.usage || {}).plugins || {}).search;
+    const reply = speakable(raw);
+    if (!reply) { log(`WEB ⚠️ 空答案 ⇒ 退回原路（${Date.now() - t0}ms）`); return null; }
+    _webUsed++;
+    log(`WEB ✓ ${Date.now() - t0}ms 搜过=${searched ? 'Y' : 'N'} 来源${sr.length}条 额度${_webUsed}/${WEB_DAILY_MAX}`
+      + (sr.length ? ` ｜ ${sr.slice(0, 3).map(x => String(x.site_name || '') + ':' + String(x.title || '').slice(0, 20)).join(' / ')}` : ''));
+    if (sr.length) log(`WEB 来源URL: ${sr.slice(0, 3).map(x => x.url).join(' ')}`);   // ★ 可核对 ✓
+    return { reply, sources: sr, searched };
+  } catch (e) {
+    _webFail++;
+    log(`WEB ✗ 失败（第 ${_webFail} 次，退回原路 ✓）: ${e.message}（${Date.now() - t0}ms）`);
+    return null;
+  } finally { clearTimeout(tid); }
+}
 // ★★ 取客户端 IP：**必须优先 X-Real-IP，不能用 X-Forwarded-For 的第一个** ✗
 //   原因：nginx 那边两个头来源不同 ——
 //     · `X-Real-IP $remote_addr`        = nginx 拿到的真实对端地址，**客户端伪造不了** ✓
@@ -2407,26 +2541,37 @@ function validateSetConfig(o) {
   //   ★ 只在"不换就要截断"时才换（不无谓改变既有行为），且留日志 + 在 JSON/响应头里回报实际格式
   //   ★ 关掉的办法：环境变量 VOICE_AUTO_ULAW8=0
   const AUTO_ULAW8 = process.env.VOICE_AUTO_ULAW8 !== '0';
-  // ★★ 固定问答（人设类）—— 在【检索之前】短路，理由：
-  //   实测教训：问「你是谁」⇒ 知识库 0 命中 ⇒ reliable=false ⇒ 代码直接回"查不到" ✗，
-  //   而人设明明写在 system prompt 第一句 —— 它排在闸门后面，**根本没机会说话**。
-  //   ⇒ 这类问题不该走知识库，也不该让模型自由发挥：一张写死的表，
-  //     确定性 ✓ 零成本 ✓ 零延迟 ✓ 不可能答错 ✓
-  //   ★ 但**不要**顺手放开闲聊：只认这几类"关于你自己/怎么用你"的问题，其余仍走知识库闸门
-  const SELF_QA = [
-    { re: /(你是谁|你叫什么|你的名字|你是哪个|你是什么|你是人吗|介绍一下你)/,
-      a: '我是店里的培训教练，你问我工作上的事，我按店里的标准给你讲怎么做。' },
-    { re: /(你能做什么|你会做什么|你会什么|你有什么用|能帮我做|你能帮我|你能干)/,
-      a: '店里的规定、SOP、考核标准、客诉怎么处理，还有日常工作怎么做，你都可以问我。' },
-    { re: /(怎么用你|怎么使用|你怎么用|怎么用这个|怎么操作你|怎么跟你说话)/,
-      a: '按住按钮说话，松手等我说完就行。' },
-    { re: /(谁做的你|谁开发|你从哪来|你是哪个公司)/,
-      a: '我是店里赋能系统的一部分，专门帮大家查工作上的事。' },
-  ];
-  function selfAnswer(text) {
-    for (const it of SELF_QA) if (it.re.test(text)) return it.a;
-    return null;
-  }           // reply 硬上限（设备端要求 ≤60 汉字；屏上只放得下 24 字）
+  // ★★★ 2026-10-12 晚 **拆掉**「固定问答（人设类）」这段短路 ✗（用户明确要求 ✓）
+  //
+  //   ★ 用户原话（逐字 ✓ 设计真源）：
+  //     「他的人设包括我问他"你是谁"、让他做下自我介绍等，**一定要让他灵活**。
+  //       他的说话风格要**幽默**一点，幽默很重要，你知道吗？他的人设**一定要幽默**」
+  //
+  //   ★ 原来为什么有它（当时的理由 ✓ 不是没道理）：
+  //     问「你是谁」⇒ 知识库 0 命中 ⇒ reliable=false ⇒ 代码直接回"查不到" ✗，
+  //     而人设明明写在 system prompt 第一句 —— 它排在闸门后面，**根本没机会说话** ✓
+  //     ⇒ 那时用"一张写死的表"兜：确定性 ✓ 零成本 ✓ 零延迟 ✓ 不可能答错 ✓
+  //
+  //   ★★ 现在为什么必须拆 ✗✗：
+  //     **写死的表 = 每次一字不差** ⇒ 用户听到的永远是同一句 ✓ ⇒ ★ **那正是"不灵活"** ✗
+  //     而且**幽默根本放不进去** ✗（表里的话是固定的，笑点会重复到腻 ✓）
+  //   ★ 而且当初那条"闸门"现在也松了 ✓：检索不可信时**已经会交给模型凭通用经验回答** ✓
+  //     （见下面那句"检索不可信 ⇒ 按用户要求交给模型凭通用经验回答"✓）
+  //     ⇒ ★ 所以这条路已经通了 ✓ 不需要再用表兜 ✓
+  //
+  //   ★ 判据（值得记 ✗）：**"写死"能换来确定性，但换不来"灵活"** ✗ ——
+  //     当需求是"灵活/有个性"时，写死的表**本身就是缺陷** ✓ 不是保险 ✓
+  //   ★ 风险与对冲：模型可能吹牛（"我能帮你订机票"✗）
+  //     ⇒ 已在 system prompt 里单开一节【你实际会做什么 · ★ 不许吹牛 ✗】✓
+  //   ★ 代价：人设类问题从此走一次 LLM（多 ~1~2 秒 ✓ 多一次调用费 ✓）
+  //     —— ★ 这是**用户明确要的取舍** ✓（"一定要让他灵活"✓），如实标在这里 ✗
+  const SELF_QA_DISABLED = true;   // ★ 保留一个显式标记 ✗：别把这段删得无影无踪 ✓
+  function selfAnswer(_text) { return null; }   // ★ 永远不短路 ✓ ⇒ 一律交给模型（人设见 system prompt ✓）
+  // 历史留痕（已停用 ✗）：原来那四张写死的表 ——
+  //   「你是谁」⇒ '我是店里的培训教练，你问我工作上的事…'
+  //   「你能做什么」⇒ '店里的规定、SOP、考核标准…'
+  //   「怎么用你」⇒ '按住按钮说话，松手等我说完就行。'
+  //   「谁做的你」⇒ '我是店里赋能系统的一部分…'
   // ★★★ 上下文表在上面**模块级**声明（`_chatSessions`）——
   //   它原来就写在这一行 ✗ 而这里属于"每个请求执行一次"的 handler ⇒ **每次请求都是空表** ✗✗
   //   ⇒ 写回的上下文下个请求看不到 ⇒ **多轮对话完全失效**（见文件顶部那段注释 ✓）
@@ -2443,8 +2588,21 @@ function validateSetConfig(o) {
   //   ⇒ 失败模式从"编一个答案"变成"说查不到"，这是我们要的方向
   //     （给学员用，编错流程比查不到坏得多）。
   const VOICE_CHAT_SYSTEM = [
-    '你是一位资深酒店培训教练，在「赋能02」设备上给门店一线员工做带教。',
-    '你的风格：像带教师傅一样说人话，给能马上照做的做法，不摆架子、不打官腔。',
+    '你是「赋能02」设备上的带教教练，名字叫小星，给门店一线员工帮忙。',
+    '',
+    '【性格 · ★ 很重要，用户特别强调过 ✗】',
+    '· ★★ 你**幽默**、接地气、嘴皮子利索 —— 像店里那个业务最强、又最爱开玩笑的前辈。',
+    '· 幽默要有**分寸**：一两句就够 ✓ 别贫、别尬、别堆网络梗、别拿客人和同事开涮 ✗。',
+    '· ★★ 但**讲标准/流程/规定**的时候 —— 先把准确的答案说全 ✓（可以收尾抖一句 ✓），',
+    '  **绝不许拿标准本身开玩笑** ✗（员工会照着做，玩笑会出事故 ✓）。',
+    '· ★★ 自我介绍、打招呼、闲聊时**要自然、每次说法可以不一样** ✓ —— **别背课文** ✗。',
+    '  （用户原话：「我问他"你是谁"、让他做下自我介绍，一定要让他灵活…人设一定要幽默」✓）',
+    '',
+    '【你实际会做什么 · ★ 不许吹牛 ✗】',
+    '· 查**店里的标准**（SOP / 流程 / 规定 / 考核标准）✓',
+    '· 查**外部实时信息**（天气 / 新闻这类，有联网）✓',
+    '· **操作设备**：开始/结束录制 · 定闹钟 · 记备忘 · 倒计时 ✓',
+    '· ★ 除此之外的事（订机票、买东西、改工资…）**老实说你做不了** ✗，别揽 ✗',
     '',
     '【回答怎么来 · 严格按这个顺序】',
     '1. 先看下面的【知识库参考内容】—— 里面【有相关内容】时，优先依据它回答（那是我们店的标准）。',
@@ -2452,8 +2610,9 @@ function validateSetConfig(o) {
     '   凭你的酒店服务与培训经验，给一个【通用、稳妥、可操作】的建议。',
     '   但要讲清楚这是通用做法（例如：咱们店的具体规定我这边没查到，不过一般这么做…），',
     '   绝不要把通用做法说成【我们店就是这么规定的】。',
-    '3. 只有当你【确实给不出任何有用建议】时（例如问天气、问与酒店工作无关的闲事），',
-    '   只输出四个字：',
+    '3. ★ 与工作无关、但你【答得上来的】（打招呼 ✓ 闲聊 ✓ 自我介绍 ✓）——',
+    '   **幽默地接一句** ✓ 再自然地把话头引回工作 ✓（不用拒绝 ✗）。',
+    '4. 只有当你【确实给不出任何有用内容】时，才只输出四个字：',
     '   无法回答',
     '',
     '【输出格式 · 必须严格照做】',
@@ -2467,14 +2626,15 @@ function validateSetConfig(o) {
     '【回答怎么写】',
     '· ★ 把关键步骤/要点【说全】，不要为了短而漏步骤；问怎么处理就把每一步都说出来。',
     '· 总长度控制在 __LEN__；不要客套话、不要复述问题、不要重复。',
-    '· 口语化，像老员工教新人；直接说做法，不要寒暄。',
+    '· 口语化，像老员工教新人；★ 讲做法时直接说，**别在这时候贫嘴** ✗（幽默留给闲聊 ✓）。',
     '· 不要 markdown、不要分点、不要星号/括号/井号、不要 emoji —— 会被逐字念出来。',
     '',
     '【绝对不许 · 红线】',
     '· 不许编造【具体数字、时限、罚款、金额】（如 3 分钟内必须… / 罚 50 元 / 赔 200 元）',
     '· 不许编造【本店特有的制度条款、岗位规定、流程细节】',
     '· 依据知识库时可以引用它的具体规定；凭经验时只说通用做法，不说本店规定',
-    '· 员工会照着做，编错了会出事 —— 拿不准就用【一般】【通常】这种留余地的说法'
+    '· 员工会照着做，编错了会出事 —— 拿不准就用【一般】【通常】这种留余地的说法',
+    '· ★ 不许为了逗乐而**夸大或编造店里的事** ✗（幽默是语气，不是内容 ✗）'
   ].join('\n');
 
   // 取该设备的上下文（★ 统一入口 —— 这是 2026-10-09 修的一个真 bug）
@@ -2700,11 +2860,16 @@ function validateSetConfig(o) {
         }
 
         // ② 知识库检索（★ 这一步是"先检索再回答"的核心）
-        // ② ★ 固定问答（人设类）先行短路：这类问题不走知识库
+        // ② ★ 固定问答（人设类）**已拆掉** ✗（用户 2026-10-12：「人设一定要幽默、一定要灵活」✓）
+        //    ⇒ `selfAnswer()` 现在恒返回 null ✓ 一律交给模型 ✓（人设写在 system prompt 里 ✓）
         const selfA = selfAnswer(heard);
-        // ③ 知识库检索（先检索再回答的核心；自问自答时跳过，省一次调用）
-        const kb = selfA ? { ok: true, results: [], reliable: false } : await kbSearchForVoice(heard);
-        // ★ 期0 影子：非命令回合的判定（人设短路 / 知识库问答 ✓ 都不 await ✓）
+        // ③ ★★ 知识库检索 与 【联网路由判定】**并行发** ✗（CR-20261012-03 §6.1 ✓）
+        //    ★ 为什么并行：检索只要 0.12~0.27s ✓ 而路由要 0.7~1.1s ✓
+        //      ⇒ 串行的话白等一次 ✓；并行则"等路由"的时间把检索藏掉了 ✓
+        const needWebP = routeNeedsWeb(heard);
+        const kb = await kbSearchForVoice(heard);
+        const needWeb = await needWebP;
+        // ★ 期0 影子：非命令回合的判定（都不 await ✓）
         shadowJudge(heard, selfA ? { kind: 'self_qa' } : { kind: 'kb', reliable: !!kb.reliable, maxScore: kb.maxScore || 0 }, device);
 
         // ③ 决定回答：检索服务挂了 / 检索结果不可信 / 没这条知识 ⇒ 直接用兜底话术，**不叫模型**
@@ -2713,31 +2878,52 @@ function validateSetConfig(o) {
         //       "录像设备开机后按录制键就开始" ✗ 那是它自己编的。
         //       ⇒ 把判据挪到【代码】里：检索不可信 ⇒ 根本不给它编的机会。
         let reply, usage = null;
-        if (selfA) {
-          reply = selfA;
-        } else if (!kb.ok) {
-          reply = KB_DOWN_REPLY;
-        } else {
-          if (!kb.reliable) log('检索不可信 ⇒ 按用户要求交给模型凭通用经验回答（不再生硬说不知道）');
-          // ★ 历史由 chatMsgsFor 给（"新话题/过期"已在上面统一处理过 ⇒ 这里传 '0' 不再清 ✓）
-          const history = chatMsgsFor(device, '0');
-          try {
-            const ans = await voiceChatAnswer(heard, kb.results, history, detail);
-            reply = ans.reply;
-            usage = ans.usage;
-            if (ans.refused) {
-              log(`voice-chat: 模型判定参考内容里没有答案（raw="${ans.raw}"）⇒ 答"查不到"`);
-              reply = NO_KB_REPLY;
+        // ★★★ CR-20261012-03 §6.6 方案 B：**联网分支**（用户拍板「把 B 接上」✓）
+        //   ★ 只在【路由器说需要】且【额度够】时才走 ✓
+        //   ★★ 失败/超时/超额度 ⇒ reply 仍是 null ⇒ **自动落到下面原有的知识库＋deepseek 那条** ✓
+        //      ⇒ 最坏情况 = 今天的行为 ✓（不会比现在差 ✓）
+        //   ⚠️ 注意顺序：联网分支**必须在最前** ✗ —— 因为"店里没有的知识"正是要走它的 ✓
+        if (needWeb && webQuotaOk()) {
+          // ★ 长度提示直接取 `DETAIL_STYLES` ✗ —— 不能写 `style.len`：
+          //   `style` 定义在 `voiceChatAnswer()` **函数内部**（另一个作用域 ✓）
+          //   ⇒ 在这里引用会 **ReferenceError** ✗（本地语法检查查不出来 ✓ 只有跑起来才炸 ✓）
+          //   ★ 判据：**跨函数抄表达式时，先确认变量在【当前】作用域里** ✗
+          const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len);
+          if (wa && wa.reply) { reply = wa.reply; log(`WEB 分支命中 ✓ 来源${(wa.sources || []).length}条`); }
+        }
+        // ★★ 整段用 `reply == null` 包起来 ✗✗ —— 为什么必须：
+        //   第一版我写成 `if (reply == null && selfA) {…} else if (!kb.ok) {…} else {…}` ✗
+        //   ⇒ 联网分支**已经给了 reply** 时，第一个条件为假 ⇒ 落到 `else if (!kb.ok)` ✗
+        //     ⇒ ★ **知识库一挂，就会把我刚搜到的答案覆盖成"知识库不可用"** ✗✗
+        //   ★ 判据：**给一条分支链加"前置分支"时，要检查后面条件的【互斥性】** ✗ ——
+        //     原来那两组条件是互斥的（selfA / kb.ok ✓），我插进来之后就**不互斥**了 ✓
+        if (reply == null) {
+          if (selfA) {
+            reply = selfA;
+          } else if (!kb.ok) {
+            reply = KB_DOWN_REPLY;
+          } else {
+            if (!kb.reliable) log('检索不可信 ⇒ 按用户要求交给模型凭通用经验回答（不再生硬说不知道）');
+            // ★ 历史由 chatMsgsFor 给（"新话题/过期"已在上面统一处理过 ⇒ 这里传 '0' 不再清 ✓）
+            const history = chatMsgsFor(device, '0');
+            try {
+              const ans = await voiceChatAnswer(heard, kb.results, history, detail);
+              reply = ans.reply;
+              usage = ans.usage;
+              if (ans.refused) {
+                log(`voice-chat: 模型判定参考内容里没有答案（raw="${ans.raw}"）⇒ 答"查不到"`);
+                reply = NO_KB_REPLY;
+              }
+            } catch (e) {
+              log(`⚠️ voice-chat LLM 失败: ${e.message}`);
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'llm_failed' }));
+              return;
             }
-          } catch (e) {
-            log(`⚠️ voice-chat LLM 失败: ${e.message}`);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: 'llm_failed' }));
-            return;
+            // ★ 模型有时候还是会绕开"不知道"去编 ⇒ 再过一道：回复里出现明确兜底词就采用，
+            //   否则要求它至少在参考内容里找得到依据（这里只做长度与空值兜底，不做语义判断）
+            if (!reply) reply = NO_KB_REPLY;
           }
-          // ★ 模型有时候还是会绕开"不知道"去编 ⇒ 再过一道：回复里出现明确兜底词就采用，
-          //   否则要求它至少在参考内容里找得到依据（这里只做长度与空值兜底，不做语义判断）
-          if (!reply) reply = NO_KB_REPLY;
         }
         // ★★ 记账放在**分支之外**（2026-10-09 修）——
         //   原来它在 else 里 ⇒ `selfA`（人设自答）与 `!kb.ok`（知识库不可用）这两类轮次
@@ -2954,21 +3140,34 @@ function validateSetConfig(o) {
         const vcS = await voiceCmdHandle(device, heard);
 
         // 人设固定问答 / 知识库检索 / 三档长度 —— 与 /api/voice-chat 同一套逻辑
+        //   ★ 人设短路已拆 ✗（`selfAnswer` 恒 null ✓ 交给模型 ✓ 人设见 system prompt ✓）
         const selfA = vcS ? null : selfAnswer(heard);
+        // ★★ 知识库检索 与 【联网路由判定】**并行发** ✗（CR-20261012-03 §6.1 ✓ 同非流式端点 ✓）
+        const needWebP = vcS ? Promise.resolve(false) : routeNeedsWeb(heard);
         const kb = vcS ? { ok: true, results: [], reliable: true, maxScore: 0 }
-                       : (selfA ? { ok: true, results: [], reliable: false } : await kbSearchForVoice(heard));
+                       : await kbSearchForVoice(heard);
+        const needWeb = await needWebP;
         // ★ 期0 影子（流式端点 = 设备主路径 ✓）：只记录，不 await、不改任何返回值 ✓
         if (vcS) shadowJudge(heard, { kind: 'command', action: vcS.action || null }, device);
         else shadowJudge(heard, selfA ? { kind: 'self_qa' } : { kind: 'kb', reliable: !!kb.reliable, maxScore: kb.maxScore || 0 }, device);
         let reply, usage = null;
-        if (vcS) {
+        // ★★★ CR-20261012-03 §6.6 方案 B：联网分支（★ 结构与非流式端点**完全一致** ✓ 别写两套 ✗）
+        //   ⚠️ 流式端点这里有个已知取舍 ✗：`webAnswer` 是**整段**返回的（不带流式 ✓）
+        //     ⇒ 联网回合会**多等一段**（头发出之前就开始等 ✓ 实测 2.5~5.9s ✓）
+        //     ★ 这是"能用真搜索"换来的代价 ✓ 已如实记录（规格书 §6.6.2 ✓）
+        if (!vcS && needWeb && webQuotaOk()) {
+          // ★ 同非流式端点：长度提示取 `DETAIL_STYLES` ✓（★ 不是 `style.len` ✗ 那个在别的函数里 ✓）
+          const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len);
+          if (wa && wa.reply) { reply = wa.reply; log(`WEB 分支命中（流式）✓ 来源${(wa.sources || []).length}条`); }
+        }
+        if (reply == null && vcS) {
           reply = vcS.reply;                                  // ★ 命令回合不叫 LLM ✓
           log(`voice-chat-stream ✓ device=${device || '-'} ★命令回合(不叫LLM) action=${vcS.action || '-'} heard="${heard.slice(0, 20)}"`);
-        } else if (selfA) {
+        } else if (reply == null && selfA) {
           reply = selfA;
-        } else if (!kb.ok) {
+        } else if (reply == null && !kb.ok) {
           reply = KB_DOWN_REPLY;
-        } else {
+        } else if (reply == null) {
           if (!kb.reliable) log('检索不可信 ⇒ 按用户要求交给模型凭通用经验回答（不再生硬说不知道）');
           // ★ 历史由 chatMsgsFor 给（"新话题/过期"上面已统一处理 ⇒ 传 '0' 不再清 ✓）
           const history = chatMsgsFor(device, '0');
