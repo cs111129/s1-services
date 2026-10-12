@@ -69,8 +69,9 @@ DB_PATH = os.path.join(SCRIPT_DIR, "cam-analysis.db")
 S2_DBAPI = os.environ.get("S2_DBAPI", "http://8.136.146.89:18903")
 INGEST_PATH = "/api/cam-records/ingest"
 BINDING_PATH = "/api/cam-devices/current-binding"
-# ★★ 2026-10-12：ingest token 改为**从文件读**（/root/.cam-ingest-token，0600、不进 git）
-#   优先级：环境变量 > 文件 > 旧默认值（旧值只作过渡期兜底，收尾时删掉）
+# ★★ 2026-10-12：ingest token 从**文件**读（/root/.cam-ingest-token，0600、不进 git）
+#   优先级：环境变量 > 文件；★ 都没有则返回空串 —— 本文件已有的逻辑会
+#   "跳过推 S2、只落本地库"（见下面 CAM_INGEST_TOKEN 为空时的分支），不会静默用默认值 ✓
 #   ★ 为什么要动：这个默认值一直躺在**源码（git）**里 ⇒ 密钥不该在版本库里
 def _load_ingest_token():
     v = (os.environ.get("CAM_INGEST_TOKEN") or "").strip()
@@ -83,7 +84,9 @@ def _load_ingest_token():
                 return v
     except Exception:
         pass
-    return "cam-ingest-token-2026"
+    print("[cam_analyze] ✗ 取不到 CAM_INGEST_TOKEN（环境变量与 /root/.cam-ingest-token 都没有）"
+          " ⇒ 本次只落本地库、不推 S2", flush=True)
+    return ""
 
 CAM_INGEST_TOKEN = _load_ingest_token()
 # CAM_DRYRUN=1：只分析、只写本地库，**不往 S2 推任何数据**。
