@@ -1119,6 +1119,56 @@ const SHADOW_TOOL_TO_OLD = {
 };
 
 // ══════════════════════════════════════════════════════════════════════
+// ★★ CR-20261012-02：语音回复的**语气字段** `reply_mood`（设备端出的 ✓ 让眼睛贴合说话内容）
+//
+//   ★ 设备端已做两层（不需要我方配合 ✓）：① 跟着 PCM 音量的韵律 ✓ ② 从文本标点/关键词推 ✓
+//     本 CR 补**第三层：真语义情绪** ✓ —— ★ 这一层**只有我方知道** ✗
+//
+//   ★★ 三条硬规矩（照设备端规格书 §2.3 ✓ 一条都不能违 ✗）：
+//     ① **缺字段 / 值不认识 ⇒ 设备自动降级** ✓ ⇒ ★ 我方**永远发安全的**：不在 6 个值里就**不发** ✗
+//     ② **只描述语气** ✗ —— 不许发动作/时长/时间轴 ✓（动作归设备 ✓ 时间轴靠网络必抖 ✓）
+//     ③ ★★ **必须与 `reply` 同源** ✗✗ —— "嘴上说好、脸上像道歉"是**最糟的** ✓
+//        ⇒ 做法：**语气由产出这句话的同一次调用一起给出来** ✓（不是事后猜 ✓）
+//
+//   ★★ 什么时候**故意不发** ✗（让设备用自己那两层 ✓ 它们做得比"我瞎猜"好 ✓）：
+//     · 值是 `neutral`（平常）✓ —— 设备自己的标点/关键词层正好覆盖这种情况 ✓
+//     · 命令回合里 reply 为空的（如开始录制 ✓ 它根本不播报 ✓）
+//     · 模型**没给**语气 ✓ —— ★ 宁可不说，也不猜 ✗（猜错 = 表情和内容打架 ✓）
+//
+//   ★★★ 定义位置本身就是一条判据 ✗（我第一版放错了 ✓ 当场踩坑）：
+//     这三个函数被**处理函数内部**的 `voiceChatAnswer()` 用 ✓，
+//     也被**模块级**的 `webAnswer()` 用 ✓
+//     ⇒ ★ 必须放**模块级**（最深的那一层够不到 ✓ 反之才行 ✓）
+//     ★ 判据：**新函数放哪一层，要看【所有】调用点在哪一层** ✗
+//       —— 不是看"写的时候离谁近" ✓（离得近但作用域够不着 = 运行时才炸 ✓ `node --check` 查不出 ✗）
+// ══════════════════════════════════════════════════════════════════════
+const MOODS = ['neutral', 'happy', 'curious', 'sorry', 'excited', 'serious'];   // ★ 就这 6 个 ✗ 别自创 ✓
+/** ★ 收口：只发【在 6 个值里且不是 neutral】的 ✓ 其余一律不发 ✗ */
+function normMood(m) {
+  const v = String(m || '').trim().toLowerCase();
+  if (!MOODS.includes(v)) return null;     // ★ 不认识 ⇒ 不发 ✓（设备会降级 ✓）
+  if (v === 'neutral') return null;        // ★ 平常 ⇒ 交给设备自己推断 ✓
+  return v;
+}
+/** ★★ 命令回合的语气：由 **`action`** 决定 ✓（同源 ✓ 因为 reply 就是同一处按 action 生成的 ✓）
+ *  ★ 只有"确实做了件好事 / 确实做不到"这两类才给 ✗；其余一律不给 ✓
+ *  ⚠️ 那两条"做不到"的回复（倒计时越界 / 备忘太长）**文本是写死的** ✓
+ *    ⇒ 这里用**包含关键短语**来判 ✓（★ 比让模型猜可靠 ✓ 而且那两句就在本文件里 ✓）*/
+function moodForCmd(vc) {
+  if (!vc || !String(vc.reply || '').trim()) return null;        // ★ 不播报的回合 ⇒ 不给 ✓
+  const r = String(vc.reply);
+  if (r.includes('没法定')) return 'sorry';                      // 倒计时越界 ✓
+  if (r.includes('只记住了前半句')) return 'sorry';               // 备忘超长 ✓
+  switch (vc.action) {
+    case 'add_alarm': case 'add_memo':
+    case 'set_timer':  return 'happy';                           // ★ 帮上忙了 ✓
+    case 'del_alarm': case 'del_memo': case 'stop_timer':
+      return null;                                               // ★ 删/停 ⇒ 平常 ✓
+    default: return null;                                        // read_memo（就一个"好"✓）/ 其它 ✓
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ★★★ CR-20261012-03 §6.6 方案 B：**联网搜索**（用户 2026-10-12 拍板「把 B 接上」✓）
 //
 //   ★ 用户原话（逐字 ✓）：「可是我想的，比方说我刚问"明天天气怎么样"，
@@ -1221,6 +1271,10 @@ async function webAnswer(heard, lenHint) {
       '★ 用**口语**回答，**不要 markdown、不要星号、不要分点符号、不要 emoji** —— 会被逐字念出来。',
       '★ 搜到就用搜到的 ✓ 说清"这是查到的"✓；**搜不到或不确定就直说，别编** ✗。',
       `★ 长度控制在 ${lenHint || '180 字以内'}。`,
+      // ★ CR-20261012-02：同一句话里一起给出【语气】⇒ ★ 天然与 reply 同源 ✓
+      '★★ 最后**另起一行**写一行语气（给设备显示表情用 ✓），只能是这 6 个词之一：',
+      '  语气：happy ／ curious ／ sorry ／ excited ／ serious ／ neutral',
+      '  （★ 不许自造词 ✗；语气必须与你上面说的话一致 ✗ ——「嘴上说好、脸上道歉」最糟 ✗）',
     ].join('\n');
     const r = await fetch(DASHSCOPE_URL, {
       method: 'POST', signal: ac.signal,
@@ -1238,7 +1292,11 @@ async function webAnswer(heard, lenHint) {
     const sr = (o.search_info && o.search_info.search_results) || [];
     // ★★ 判据不靠"它说它搜了"✗ —— 看 usage.plugins.search（真搜过的铁证 ✓）
     const searched = !!((j.usage || {}).plugins || {}).search;
-    const reply = speakable(raw);
+    // ★ CR-20261012-02：语气行 —— ★ 必须**先抽掉**再清洗 ✗（否则 speakable 之后
+    //   文字里还留着"语气：happy"✓ 会被 TTS 念出来 ✗✗）
+    const moodM = String(raw).match(/语气\s*[:：]\s*([A-Za-z]+)/);
+    const mood = normMood(moodM && moodM[1]);
+    const reply = speakable(String(raw).replace(/^\s*语气\s*[:：]\s*[A-Za-z]+\s*$/gmi, ''));
     if (!reply) { log(`WEB ⚠️ 空答案 ⇒ 退回原路（${Date.now() - t0}ms）`); return null; }
     _webUsed++;
     log(`WEB ✓ ${Date.now() - t0}ms 搜过=${searched ? 'Y' : 'N'} 来源${sr.length}条 额度${_webUsed}/${WEB_DAILY_MAX}`
@@ -2616,11 +2674,18 @@ function validateSetConfig(o) {
     '   无法回答',
     '',
     '【输出格式 · 必须严格照做】',
-    '· 只要回答，就只输出一行：',
+    '· 只要回答，就先输出一行：',
     '  答：<你的回答>',
     '  （清单、表格条目、流程步骤都算有信息；不用逐字照抄，把要点讲全讲顺就行；',
     '    知识库里给的是通用流程时，也可以直接用来回答某个具体情形）',
-    '· 不给建议时，就只输出那四个字：无法回答',
+    '· ★★ 紧接着**再输出一行**语气（★ 给设备显示表情用 ✓）：',
+    '  语气：<下面 6 个词里的**一个**>',
+    '  · neutral = 平常（也可以不写这一行 ✓）· happy = 肯定/报喜/轻松',
+    '  · curious = 疑问/不确定/需要对方补充 · sorry = 抱歉/做不到/出错',
+    '  · excited = 特别好的消息 · serious = 严肃提醒/重要规定',
+    '  ★★ 只能从这 6 个词里选，**不许自己造词** ✗（造了设备不认 ✓ 等于白写 ✓）',
+    '  ★★ 语气必须与你【上面那句话】一致 ✗ ——「嘴上说好、脸上像道歉」是最糟的 ✗',
+    '· 不给建议时，就只输出那四个字：无法回答（**不要**再写语气行 ✓）',
     '· 不要输出解释、不要输出别的任何内容、不要提参考内容或知识库这类词。',
     '',
     '【回答怎么写】',
@@ -2740,6 +2805,13 @@ function validateSetConfig(o) {
       .trim();
   }
 
+  // ★★ `reply_mood` 的收口函数（`MOODS` / `normMood` / `moodForCmd`）已移到**模块级** ✗
+  //   —— 为什么必须：`webAnswer()` 在**模块级** ✓ 它也要用 `normMood` ✓
+  //   ★ 我第一版把这三个写在**这个处理函数内部** ✗ ⇒ `webAnswer` 里调用会 ReferenceError ✗
+  //   ★ 判据（今天第二次踩 ✓）：**新函数放在哪一层，要看【所有】调用点在哪一层** ✗ ——
+  //     不是看"我写的时候离谁近" ✓（离得近但作用域够不着 = 运行时才炸 ✓ 语法检查查不出 ✗）
+  //   ⇒ 定义见文件上方 `MOODS` / `normMood` / `moodForCmd` ✓
+
   async function voiceChatAnswer(text, kbResults, history, detail) {
     const style = DETAIL_STYLES[detail] || DETAIL_STYLES[2];
     let kbBlock = '';
@@ -2769,9 +2841,15 @@ function validateSetConfig(o) {
       //    以及任何没按格式来的胡说）一律当成"没有可依据的答案"。
       //    这一步是防编造的最后一道闸门 —— 不依赖模型"自觉"。
       const raw = String(content || '').trim();
-      const m = /^答\s*[:：]\s*([\s\S]+)$/.exec(raw);
+      // ★ CR-20261012-02：先把**语气行**抽出来（★ 必须在校验 `答：` 之前 ✗
+      //   否则 `[\s\S]+` 会把语气行一起当成正文 ✓ 回复里就会念出"语气：happy" ✗✗）
+      const moodM = raw.match(/语气\s*[:：]\s*([A-Za-z]+)/);
+      const mood = normMood(moodM && moodM[1]);
+      const body = raw.replace(/^\s*语气\s*[:：]\s*[A-Za-z]+\s*$/gmi, '').trim();
+      const m = /^答\s*[:：]\s*([\s\S]+)$/.exec(body);
       const okAnswer = !!(m && m[1].trim());
-      return { reply: okAnswer ? cleanReply(m[1]) : '', refused: !okAnswer, raw: raw.slice(0, 60), usage: j.usage || null };
+      return { reply: okAnswer ? cleanReply(m[1]) : '', refused: !okAnswer,
+               mood: okAnswer ? mood : null, raw: raw.slice(0, 60), usage: j.usage || null };
     } finally { clearTimeout(tid); }
   }
 
@@ -2855,7 +2933,10 @@ function validateSetConfig(o) {
             success: true, text: oneLine(heard), reply: vcOld.reply,
             session: device ? (device + '#' + chatDepthOf(device)) : ''
           }, silUrl ? { audio: silUrl, audio_is_silence: true } : {},
-             vcOld.action ? { action: vcOld.action } : {}, vcOld.params ? { params: vcOld.params } : {})));
+             vcOld.action ? { action: vcOld.action } : {}, vcOld.params ? { params: vcOld.params } : {},
+             // ★ CR-20261012-02：命令回合的语气（★ 由 action 决定 ⇒ 与 reply 同源 ✓）
+             //   ★ 不给时**不带这个字段** ✗（不是给空值 ✓ —— 设备端规格书 §2.3 第 1 条 ✓）
+             moodForCmd(vcOld) ? { reply_mood: moodForCmd(vcOld) } : {})));
           return;
         }
 
@@ -2878,6 +2959,7 @@ function validateSetConfig(o) {
         //       "录像设备开机后按录制键就开始" ✗ 那是它自己编的。
         //       ⇒ 把判据挪到【代码】里：检索不可信 ⇒ 根本不给它编的机会。
         let reply, usage = null;
+        let replyMood = null;   // ★ CR-20261012-02：语气（★ 不给就保持 null ⇒ 响应里不带该字段 ✗）
         // ★★★ CR-20261012-03 §6.6 方案 B：**联网分支**（用户拍板「把 B 接上」✓）
         //   ★ 只在【路由器说需要】且【额度够】时才走 ✓
         //   ★★ 失败/超时/超额度 ⇒ reply 仍是 null ⇒ **自动落到下面原有的知识库＋deepseek 那条** ✓
@@ -2889,7 +2971,10 @@ function validateSetConfig(o) {
           //   ⇒ 在这里引用会 **ReferenceError** ✗（本地语法检查查不出来 ✓ 只有跑起来才炸 ✓）
           //   ★ 判据：**跨函数抄表达式时，先确认变量在【当前】作用域里** ✗
           const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len);
-          if (wa && wa.reply) { reply = wa.reply; log(`WEB 分支命中 ✓ 来源${(wa.sources || []).length}条`); }
+          if (wa && wa.reply) {
+            reply = wa.reply; replyMood = normMood(wa.mood);   // ★ 语气与这句同源 ✓（同一次调用出的 ✓）
+            log(`WEB 分支命中 ✓ 来源${(wa.sources || []).length}条 mood=${replyMood || '(不发)'}`);
+          }
         }
         // ★★ 整段用 `reply == null` 包起来 ✗✗ —— 为什么必须：
         //   第一版我写成 `if (reply == null && selfA) {…} else if (!kb.ok) {…} else {…}` ✗
@@ -2910,9 +2995,11 @@ function validateSetConfig(o) {
               const ans = await voiceChatAnswer(heard, kb.results, history, detail);
               reply = ans.reply;
               usage = ans.usage;
+              replyMood = normMood(ans.mood);   // ★ 语气与这句同源 ✓（模型在同一次输出里给的 ✓）
               if (ans.refused) {
                 log(`voice-chat: 模型判定参考内容里没有答案（raw="${ans.raw}"）⇒ 答"查不到"`);
                 reply = NO_KB_REPLY;
+                replyMood = null;   // ★ 换成兜底话术了 ⇒ 语气必须跟着清 ✗（否则"查不到"配个 happy 就荒唐了 ✓）
               }
             } catch (e) {
               log(`⚠️ voice-chat LLM 失败: ${e.message}`);
@@ -2996,7 +3083,11 @@ function validateSetConfig(o) {
           bits: afmt === 'ulaw8' ? 8 : 16,
           sample_rate: 16000,
           channels: 1,
-          session: device ? (device + '#' + chatDepthOf(device)) : ''
+          session: device ? (device + '#' + chatDepthOf(device)) : '',
+          // ★ CR-20261012-02：语气（★ 没有就**不带这个字段** ✗ —— 设备端会用自己的两层降级 ✓
+          //   ★ 不用 `reply_mood: null` ✗：设备端规格书 §2.3 第 1 条说的是"缺字段/不认识就降级"✓
+          //     给 null 等于给一个"不认识的值"✓ 虽然也能降级 ✓ 但**不带**更明确 ✓）
+          ...(replyMood ? { reply_mood: replyMood } : {})
         }, null, 0));
       } catch (e) {
         log(`⚠️ voice-chat 异常: ${e.message}`);
@@ -3151,6 +3242,7 @@ function validateSetConfig(o) {
         if (vcS) shadowJudge(heard, { kind: 'command', action: vcS.action || null }, device);
         else shadowJudge(heard, selfA ? { kind: 'self_qa' } : { kind: 'kb', reliable: !!kb.reliable, maxScore: kb.maxScore || 0 }, device);
         let reply, usage = null;
+        let replyMood = null;   // ★ CR-20261012-02：语气（★ 不给就保持 null ⇒ 头里不带该字段 ✗）
         // ★★★ CR-20261012-03 §6.6 方案 B：联网分支（★ 结构与非流式端点**完全一致** ✓ 别写两套 ✗）
         //   ⚠️ 流式端点这里有个已知取舍 ✗：`webAnswer` 是**整段**返回的（不带流式 ✓）
         //     ⇒ 联网回合会**多等一段**（头发出之前就开始等 ✓ 实测 2.5~5.9s ✓）
@@ -3158,11 +3250,15 @@ function validateSetConfig(o) {
         if (!vcS && needWeb && webQuotaOk()) {
           // ★ 同非流式端点：长度提示取 `DETAIL_STYLES` ✓（★ 不是 `style.len` ✗ 那个在别的函数里 ✓）
           const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len);
-          if (wa && wa.reply) { reply = wa.reply; log(`WEB 分支命中（流式）✓ 来源${(wa.sources || []).length}条`); }
+          if (wa && wa.reply) {
+            reply = wa.reply; replyMood = normMood(wa.mood);
+            log(`WEB 分支命中（流式）✓ 来源${(wa.sources || []).length}条 mood=${replyMood || '(不发)'}`);
+          }
         }
         if (reply == null && vcS) {
           reply = vcS.reply;                                  // ★ 命令回合不叫 LLM ✓
-          log(`voice-chat-stream ✓ device=${device || '-'} ★命令回合(不叫LLM) action=${vcS.action || '-'} heard="${heard.slice(0, 20)}"`);
+          replyMood = moodForCmd(vcS);                        // ★ 语气由 action 决定 ⇒ 与 reply 同源 ✓
+          log(`voice-chat-stream ✓ device=${device || '-'} ★命令回合(不叫LLM) action=${vcS.action || '-'} mood=${replyMood || '(不发)'} heard="${heard.slice(0, 20)}"`);
         } else if (reply == null && selfA) {
           reply = selfA;
         } else if (reply == null && !kb.ok) {
@@ -3174,12 +3270,13 @@ function validateSetConfig(o) {
           try {
             const ans = await voiceChatAnswer(heard, kb.results, history, detail);
             reply = ans.reply; usage = ans.usage;
-            if (ans.refused) { log('voice-chat-stream: 模型判定参考内容里没有答案 ⇒ 答"查不到"'); reply = NO_KB_REPLY; }
+            replyMood = normMood(ans.mood);                    // ★ 同一次输出里给的 ⇒ 同源 ✓
+            if (ans.refused) { log('voice-chat-stream: 模型判定参考内容里没有答案 ⇒ 答"查不到"'); reply = NO_KB_REPLY; replyMood = null; }
           } catch (e) {
             log(`⚠️ voice-chat-stream LLM 失败: ${e.message}`);
             fail('llm_failed'); return;
           }
-          if (!reply) reply = NO_KB_REPLY;
+          if (!reply) { reply = NO_KB_REPLY; replyMood = null; }
         }
         // ★★ 记账放在分支之外（与 /api/voice-chat 同一处修正 ✓）——
         //   原来在 else 里 ⇒ selfA / 知识库不可用 那两类轮次不进上下文 ✗
@@ -3210,7 +3307,10 @@ function validateSetConfig(o) {
           bits: afmt === 'ulaw8' ? 8 : 16, format: afmt === 'ulaw8' ? 'ulaw8' : 'pcm_s16le',
           // ★ CR-20261010-01：命令回合才带这两个字段 ✓（不是命令 ⇒ 一个都不加 ⇒ 老固件 behavior 完全不变 ✓）
           ...(vcS && vcS.action ? { action: vcS.action } : {}),
-          ...(vcS && vcS.params ? { params: vcS.params } : {})
+          ...(vcS && vcS.params ? { params: vcS.params } : {}),
+          // ★ CR-20261012-02：语气（★ 与 reply 同级 ✓ 头字段 ✓；★ 没有就**不带** ✗ ⇒ 设备降级 ✓）
+          //   ★★ 同源保证：命令回合取 `action` ✓／联网与知识库回合取**同一次模型输出**里的那行 ✓
+          ...(replyMood ? { reply_mood: replyMood } : {})
         });
         await new Promise(r => setImmediate(r));   // ★ 让 libuv 把上面这一行真正写到 socket 再继续
         const tHead = Date.now();
