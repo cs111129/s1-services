@@ -3076,6 +3076,14 @@ function validateSetConfig(o) {
         if (vcOld) shadowJudge(heard, { kind: 'command', action: vcOld.action || null }, device);
         if (vcOld) {
           if (vcOld.action) chatRecord(device, heard, vcOld.reply);   // 命令也算一轮对话 ✓
+      // ★★ 语音会话记录：命令回合**在这里**记 ✗ —— 本分支 L309x 会 `return` ✓
+      //   所以不能只挂在函数末尾 ✓（★ 那是"改一处漏一处"的典型 ✓）
+      //   ★ 命令回合 reply 可能为空（如"开始录制"✓）⇒ ★ 也记 ✓（`action` 就是内容 ✓）
+      logVoiceTurn({
+        device: device, question: heard, reply: vcOld.reply,
+        action: vcOld.action || '', params: vcOld.params || null,
+        mood: moodForCmd(vcOld), latency_ms: Date.now() - t0, branch: 'command',
+      });
           log(`voice-chat ✓ device=${device || '-'} ★命令回合(不叫LLM) action=${vcOld.action || '-'} heard="${heard.slice(0, 20)}"`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           // ★ 2026-10-12：命令回合（reply 空）**也要给一个音频** ✗ ——
