@@ -1080,6 +1080,80 @@ let _shadowDone = 0, _shadowDropped = 0, _shadowErr = 0;
  *  @param heard     ASR 文本
  *  @param oldV     现有路径的判定（由调用方在**已知之后**传进来 ✓ 不重复跑旧逻辑 ✗ 免得重复打日志 ✓）
  *  @param device    设备码（只进日志 ✓） */
+// ══════════════════════════════════════════════════════════════════════
+// ★★ 语音会话记录（2026-10-14 用户点单：「我要的是乙，用户用设备端和小星的聊天记录」）
+//
+//   ★★★ 三条红线（★ 这个功能最怕的就是"记录把对话搞坏了" ✗）：
+//     ① **绝不阻塞、绝不影响对话** ⇒ **fire-and-forget** ✓（与 `shadowJudge` 同一套做法 ✓）
+//        · 不 await ✓ · 3 秒超时 ✓ · 任何失败**只打日志** ✓ · **绝不改返回值** ✓
+//     ② **S2 挂了 ⇒ 语音照常可用** ✓（与"设备本地上报与指令下发不受影响"同一条纪律 ✓）
+//     ③ **失败必须留证据** ✗ ⇒ 不写 `catch(e){}` 静默 ✓（本项目踩过这个 ✓）
+//
+//   ★ 一轮的定义（与服务端 §2.2 对齐 ✗）：
+//     · 有 reply ⇒ 记 ✓
+//     · **命令回合 reply 为空** ⇒ 也记 ✓（`action` 就是内容 ✓ —— "他让小星干了什么"有价值 ✓）
+//     · 空 turn（无 reply 也无 action）⇒ **不记** ✗（省一次请求 ✓）
+//     · 失败回合 ⇒ 记 ✓ 且带 `err` ✓
+//   ★ 归属：查 S2 的 `current-binding` ✓（**在 fire-and-forget 里查** ⇒ 不占对话时间 ✓）
+//     ★ 查询失败 ⇒ `student_name` 留空 ✓ **但记录照发** ✗（宁可真名缺失，也别整条丢 ✓）
+//     ★ 按**当时**绑定归属 ✓ —— 换绑后历史**不搬家** ✗（那是服务端定死的口径 ✓）
+// ══════════════════════════════════════════════════════════════════════
+function logVoiceTurn(o) {
+  try {
+    const reply = String((o && o.reply) || '');
+    const action = String((o && o.action) || '');
+    const device = String((o && o.device) || '');
+    if (!device) return;                                   // ★ 没设备号就没法归属 ⇒ 不记 ✗
+    // ★★ 空 turn 不记 ✗ —— 但**失败回合要记** ✓（有 err 就算一轮 ✓）
+    //   ⚠️ 反例：`asr_empty`（没听清）**不记** ✗ —— 那不是一轮对话 ✓（用户压根没说话 ✓）
+    if (!reply.trim() && !action && !String((o && o.err) || '').trim()) return;
+    const payload = {
+      device_id: device, student_name: '',
+      question: String((o && o.question) || ''),
+      reply: reply, action: action,
+      params: (o && o.params) || null,
+      mood: String((o && o.mood) || ''),
+      branch: String((o && o.branch) || ''),
+      latency_ms: Number((o && o.latency_ms) || 0) || 0,
+      err: String((o && o.err) || ''),
+      created_at: new Date().toISOString(),
+    };
+    (async () => {
+      const t = Date.now();
+      try {
+        // ① 先查绑定（★ 权威来源在 S2 ✓ 查不到不影响记录 ✓）
+        try {
+          const rb = await fetch(`${CAM_S2_DBAPI}/api/cam-devices/current-binding?device_id=${encodeURIComponent(device)}`,
+            { headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` }, signal: AbortSignal.timeout(3000) });
+          if (rb && rb.ok) {
+            const b = await rb.json();
+            if (b && b.name) payload.student_name = String(b.name);   // ★ 按当时绑定归属 ✓
+          }
+        } catch (e) {
+          log(`  ↳ 会话记录：查绑定失败（★ 不影响记录，按未绑定记 ✓）: ${e.message}`);
+        }
+        // ② 推送（★ 只写不读 ✓ 端点在 S2 db-api 18903 ✓ 与 cam 同一套 token ✓）
+        const r = await fetch(`${CAM_S2_DBAPI}/api/voice-chat-log/ingest`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(3000),
+        });
+        if (!r || !r.ok) {
+          log(`⚠️ 会话记录落库失败 HTTP ${r ? r.status : '-'}（★ 只记日志，不影响对话 ✗）`);
+        } else {
+          log(`  ↳ 会话记录已落库 ✓ ${device} ${payload.student_name || '(未绑定)'} `
+            + `branch=${payload.branch || '-'} ${Date.now() - t}ms（★ 后台任务，不在对话链路里 ✓）`);
+        }
+      } catch (e) {
+        log(`⚠️ 会话记录落库异常: ${e.message}（★ 只记日志，绝不影响对话 ✗）`);
+      }
+    })();
+  } catch (e) {
+    log(`⚠️ logVoiceTurn 组装失败: ${e.message}（★ 同样绝不影响对话 ✗）`);
+  }
+}
+
 function shadowJudge(heard, oldV, device) {
   if (!SHADOW_MODE) return;
   try {
@@ -3038,6 +3112,7 @@ function validateSetConfig(o) {
         //       ⇒ 把判据挪到【代码】里：检索不可信 ⇒ 根本不给它编的机会。
         let reply, usage = null;
         let replyMood = null;   // ★ CR-20261012-02：语气（★ 不给就保持 null ⇒ 响应里不带该字段 ✗）
+        let webHit = false;     // ★ 语音会话记录用：这一轮是不是走了联网分支 ✓（决定 branch 字段）
         // ★★★ CR-20261012-03 §6.6 方案 B：**联网分支**（用户拍板「把 B 接上」✓）
         //   ★ 只在【路由器说需要】且【额度够】时才走 ✓
         //   ★★ 失败/超时/超额度 ⇒ reply 仍是 null ⇒ **自动落到下面原有的知识库＋deepseek 那条** ✓
@@ -3050,7 +3125,7 @@ function validateSetConfig(o) {
           //   ★ 判据：**跨函数抄表达式时，先确认变量在【当前】作用域里** ✗
           const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len);
           if (wa && wa.reply) {
-            reply = wa.reply; replyMood = normMood(wa.mood);   // ★ 语气与这句同源 ✓（同一次调用出的 ✓）
+            reply = wa.reply; replyMood = normMood(wa.mood); webHit = true;   // ★ 语气与这句同源 ✓（同一次调用出的 ✓）
             log(`WEB 分支命中 ✓ 来源${(wa.sources || []).length}条 mood=${replyMood || '(不发)'}`);
           }
         }
@@ -3161,6 +3236,13 @@ function validateSetConfig(o) {
         res.writeHead(200, {
           'Content-Type': 'application/json; charset=utf-8',
           'X-Dyz-Format': afmt
+        });
+        // ★★ 语音会话记录：**fire-and-forget** ✓（非流式端点 = 设备回退路径 ✓ 同样要记 ✓）
+        logVoiceTurn({
+          device: device, question: heard, reply: reply,
+          action: vcOld ? vcOld.action : '', params: vcOld ? vcOld.params : null,
+          mood: replyMood, latency_ms: Date.now() - t0,
+          branch: vcOld ? 'command' : (webHit ? 'web' : (kb.ok ? 'kb' : 'kb_down')),
         });
         res.end(JSON.stringify({
           success: true,
@@ -3332,6 +3414,7 @@ function validateSetConfig(o) {
         else shadowJudge(heard, selfA ? { kind: 'self_qa' } : { kind: 'kb', reliable: !!kb.reliable, maxScore: kb.maxScore || 0 }, device);
         let reply, usage = null;
         let replyMood = null;   // ★ CR-20261012-02：语气（★ 不给就保持 null ⇒ 头里不带该字段 ✗）
+        let webHit = false;     // ★ 语音会话记录用：这一轮是不是走了联网分支 ✓（决定 branch 字段）
         // ★★★ CR-20261012-03 §6.6 方案 B：联网分支（★ 结构与非流式端点**完全一致** ✓ 别写两套 ✗）
         //   ⚠️ 流式端点这里有个已知取舍 ✗：`webAnswer` 是**整段**返回的（不带流式 ✓）
         //     ⇒ 联网回合会**多等一段**（头发出之前就开始等 ✓ 实测 2.5~5.9s ✓）
@@ -3340,7 +3423,7 @@ function validateSetConfig(o) {
           // ★ 同非流式端点：长度提示取 `DETAIL_STYLES` ✓（★ 不是 `style.len` ✗ 那个在别的函数里 ✓）
           const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len);
           if (wa && wa.reply) {
-            reply = wa.reply; replyMood = normMood(wa.mood);
+            reply = wa.reply; replyMood = normMood(wa.mood); webHit = true;
             log(`WEB 分支命中（流式）✓ 来源${(wa.sources || []).length}条 mood=${replyMood || '(不发)'}`);
           }
         }
@@ -3363,6 +3446,9 @@ function validateSetConfig(o) {
             if (ans.refused) { log('voice-chat-stream: 模型判定参考内容里没有答案 ⇒ 答"查不到"'); reply = NO_KB_REPLY; replyMood = null; }
           } catch (e) {
             log(`⚠️ voice-chat-stream LLM 失败: ${e.message}`);
+            // ★ 失败也要留痕 ✓（★ 与"降级必须留证据"同族 ✗ —— 只记成功等于看不见故障率 ✓）
+            logVoiceTurn({ device: device, question: heard, err: 'llm_failed',
+              latency_ms: Date.now() - t0, branch: 'err' });
             fail('llm_failed'); return;
           }
           if (!reply) { reply = NO_KB_REPLY; replyMood = null; }
@@ -3465,6 +3551,14 @@ function validateSetConfig(o) {
         log(`voice-chat-stream ✓ ${pieceN} 块（共 ${reply.length} 字）→ 推 PCM ${pushed} 字节 ` +
             `tokens=${usage ? (usage.prompt_tokens + '/' + usage.completion_tokens) : '-'} ` +
             `总耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
+        // ★★ 语音会话记录：**fire-and-forget** ✓ —— 放在最后 ✓ **不 await** ✓ 绝不改返回值 ✓
+        //   ★ branch 口径：命令 / 联网 / 知识库 / 知识库不可用 —— 便于事后按来源统计 ✓
+        logVoiceTurn({
+          device: device, question: heard, reply: reply,
+          action: vcS ? vcS.action : '', params: vcS ? vcS.params : null,
+          mood: replyMood, latency_ms: Date.now() - t0,
+          branch: vcS ? 'command' : (webHit ? 'web' : (kb.ok ? 'kb' : 'kb_down')),
+        });
         res.end();
       } catch (e) {
         log(`⚠️ voice-chat-stream 异常: ${e.message}`);
