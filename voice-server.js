@@ -231,7 +231,13 @@ function pickSecret(req, q, o) {
   return String(req.headers['x-device-secret'] || (q && q.secret) || (o && o.secret) || '').trim();
 }
 function pickDeviceId(req, q, o) {
-  const explicit = String(req.headers['x-device-id'] || (q && q.device_id) || (o && o.device_id) || '').trim();
+  // ★★ 2026-10-19：**同时认 `dev_id`** ✗ —— CR-20261019-01 的契约写的是 `dev_id`
+  //   （手表按规格书传 `dev_id` ✓ 而这里原来只认 `device_id` ⇒ **取不到设备号** ✓
+  //     后果：`pull` 报 400 或按密钥兜底 ✓ 报错信息还是"缺少 dev_id" ✓ 很难查 ✓）
+  //   ★ 判据：**契约名以规格书为准** ✗ —— 实现去适配契约，别让设备端改 ✓
+  const explicit = String(req.headers['x-device-id']
+    || (q && (q.device_id || q.dev_id))
+    || (o && (o.device_id || o.dev_id)) || '').trim();
   if (explicit) return explicit;
   // ★ CR-20261009-01：没给设备号 ⇒ **用密钥反查**（一机一密后每台密钥唯一 ⇒ 能认出来 ✓）
   //   认不出来就返回 ''（= 保持老行为：按公共兜底校验、SOP 不过滤）⇒ 零回归 ✓
@@ -1851,6 +1857,87 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
       }
+    });
+    return;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // ★★ 赋能03 手表「岗位职责追踪」转发（CR-20261019-01 ✓）
+  //
+  //   ★ 为什么在 S1 转发 ✗：★ 手表**没有学员 token** ✓ 而数据在 S2 ✓
+  //     ⇒ ★ 复用 `/api/cam/*` 那条既有路：**S1 验设备密钥 ⇒ 带内部 token 打 S2** ✓
+  //     （★ 不另造鉴权 ✓ 与 cam 完全同一套 `checkDeviceSecret` ✓）
+  //
+  //   ★★ 安全要点 ✗✗：**`dev_id` 一律用"验过密钥的那个"** ✗ ——
+  //      ★ 绝不用客户端自己报的（★ 否则任何设备都能替别人点「收到」✓）
+  //      report 的 body 里如果带了 dev_id ⇒ **被这里覆盖** ✓
+  //
+  //   ★ "推送"= 设备**拉** ✓（手表在 NAT 后 ✓ 推不进去 ✓）
+  //     ⇒ ★ 服务器在 `pull` 里按当前时间算好"现在该弹什么" ✓（`should_alert` ✓）
+  // ══════════════════════════════════════════════════════════════════════
+  if (req.method === 'GET' && req.url.startsWith('/api/duty/pull')) {
+    const q = getQuery(req.url);
+    const dev = pickDeviceId(req, q, null);
+    if (!checkDeviceSecret(pickSecret(req, q, null), dev)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '设备密钥错误' }));
+      return;
+    }
+    if (!dev) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '缺少 dev_id' }));
+      return;
+    }
+    // ★ 转发到 S2（★ 用**公网域名**走 nginx ✓ —— 18901 不直接对外开放 ✓）
+    fetch(`https://ai.hiiin.com/api/duty/pull?dev_id=${encodeURIComponent(dev)}`, {
+      headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` },
+      signal: AbortSignal.timeout(15000),
+    }).then(async r => {
+      const txt = await r.text();
+      res.writeHead(r.ok ? 200 : 502, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(txt);
+    }).catch(e => {
+      log(`⚠️ duty/pull 转发失败 ${dev}: ${e.message}`);
+      // ★ 失败**必须留证据** ✗ 且**不能装成"没有任务"** ✗（那会让用户以为今天没事 ✓）
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'upstream_unavailable', detail: e.message }));
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/duty/report') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      let o = {};
+      try { o = JSON.parse(body || '{}'); } catch (e) { o = {}; }
+      const dev = pickDeviceId(req, null, o);
+      if (!checkDeviceSecret(pickSecret(req, null, o), dev)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '设备密钥错误' }));
+        return;
+      }
+      if (!dev) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '缺少 dev_id' }));
+        return;
+      }
+      // ★★ 用**验过密钥的 dev** 覆盖 body 里的 dev_id ✗（★ 这是本端点的安全核心 ✓）
+      o.dev_id = dev;
+      fetch('https://ai.hiiin.com/api/duty/report', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(o),
+        signal: AbortSignal.timeout(15000),
+      }).then(async r => {
+        const txt = await r.text();
+        res.writeHead(r.ok ? 200 : 502, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(txt);
+      }).catch(e => {
+        log(`⚠️ duty/report 转发失败 ${dev}: ${e.message}`);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'upstream_unavailable', detail: e.message }));
+      });
     });
     return;
   }
