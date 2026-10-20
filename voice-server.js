@@ -1381,6 +1381,101 @@ function speakable(s) {
 }
 /** ★ 路由器：这一轮要不要【外部/实时】信息？（★ 与 KB 检索**并行发** ✓ 见 §6.1 ✓）
  *  ★ 判据：认不准就 false ✗（= 不搜 ✓ 退回原路 ✓ 安全 ✓）*/
+/**
+ * ★★ 意图路由（2026-10-20 扩：一次调用判两件事 ✗）
+ *   ① 要不要**联网**（外部实时信息）
+ *   ② 要不要**查学习数据**（积分/考试/练习/课程/计划/职责）
+ * ★★ 为什么合并成一次 ✗：拆两次 ⇒ 多 0.7~1.1s ✓
+ *   （★ 语音回合最贵的就是"说完到第一声"✓ 实测已 6.5s 上下 ✓ 不能再加）
+ * ★ 返回 `{ web, learning }` —— ★ `learning` 是 `kind` 枚举或 `null` ✓
+ *   ★ 枚举**写进工具参数** ✓ ⇒ ★ 模型选不了枚举外的值 ✓（S2 侧还会 400 ✓ 双保险）
+ */
+const LEARN_KINDS = ['overview', 'points', 'exams', 'practices', 'courses', 'plan', 'duty'];
+async function routeIntent(text) {
+  const NONE = { web: false, learning: null };
+  if (!DEEPSEEK_KEY) return NONE;              // ★ 学习数据也要模型判定 ⇒ 没 key 两个都不做 ✓
+  const ac = new AbortController();
+  const tid = setTimeout(() => ac.abort(), 6000);
+  try {
+    const r = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Authorization': `Bearer ${DEEPSEEK_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-chat', temperature: 0, max_tokens: 60,
+        messages: [
+          { role: 'system', content: [
+            '你有两个工具，按用户这句话判断要调用哪个（**也可以都不调**）。',
+            '',
+            '① web_search —— 需要【外部/实时信息】时调用',
+            '   ★ 要：天气、新闻、今天几号、股价汇率、赛事、航班、任何"眼下的事实"',
+            '   ★ 不要：店里的SOP/标准/流程/规定 · 操作设备 · 打招呼/闲聊/问你是谁',
+            '',
+            '② get_learning_summary —— 需要【这位员工自己的学习数据】时调用（kind 选最贴近的一个）',
+            '   overview  = 本周练习/考试/平均分 ＋ 当前积分（"我最近学得怎么样/这周"）',
+            '   points    = 积分余额 ＋ 最近变动（"我多少分/积分怎么来的"）',
+            '   exams     = 考试成绩（"我考得怎么样/上次考多少"）',
+            '   practices = 场景练习记录（"我练过什么/练习成绩"）',
+            '   courses   = 课程进度（"我看了哪些课/还有多少没看"）',
+            '   plan      = 学习计划 / 储备人才计划进度',
+            '   duty      = 今天的岗位职责任务（"我今天要做什么/还有什么没做"）',
+            '   ★★ 只能查【本人】✗ —— 问别人的一律**不调**（工具查不到 ✓ 你也别编 ✓）',
+          ].join('\n') },
+          { role: 'user', content: String(text || '') },
+        ],
+        tools: [
+          { type: 'function', function: { name: 'web_search', description: '需要外部实时信息时调用',
+            parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } } },
+          { type: 'function', function: { name: 'get_learning_summary', description: '查这位员工自己的学习数据时调用',
+            parameters: { type: 'object', properties: {
+              kind: { type: 'string', enum: LEARN_KINDS },
+            }, required: ['kind'] } } },
+        ],
+        tool_choice: 'auto',
+      }),
+    });
+    const j = await r.json();
+    const tcs = (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.tool_calls) || [];
+    let web = false, learning = null;
+    for (const tc of tcs) {
+      const fn = tc && tc.function && tc.function.name;
+      if (fn === 'web_search' && WEB_SEARCH_ON) web = true;
+      if (fn === 'get_learning_summary') {
+        let k = null;
+        try { k = JSON.parse(tc.function.arguments || '{}').kind; } catch (e) { k = null; }
+        // ★ 模型给错/没给 ⇒ **兜底 overview** ✗ —— ★ 不猜别的 ✓ 也不因为参数错就整个不查 ✓
+        learning = (LEARN_KINDS.indexOf(k) >= 0) ? k : 'overview';
+      }
+    }
+    return { web, learning };
+  } catch (e) {
+    _webFail++;
+    log(`ROUTE ⚠️ 意图判定失败（第 ${_webFail} 次，按"都不做"处理 ✓）: ${e.message}`);
+    return NONE;
+  } finally { clearTimeout(tid); }
+}
+
+/**
+ * ★★ 取学习数据摘要（2026-10-20）—— **数字由 S2 的 SQL 算** ✓ 这里只搬运 ✓
+ *   ★★ 走**公网域名** ✗ —— 18901 不直接对外开放 ✓（S1 只能经 nginx ✓）
+ *   ★ 失败返回 null ✓ ⇒ 调用方**按"没查到"处理** ✗（★ 绝不编数据 ✓）
+ */
+async function learningSummary(device, kind) {
+  if (!device || !kind) return null;
+  const t0 = Date.now();
+  try {
+    const r = await fetch(`https://ai.hiiin.com/api/voice/learning-summary?dev_id=${encodeURIComponent(device)}&kind=${encodeURIComponent(kind)}`,
+      { headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` }, signal: AbortSignal.timeout(4000) });
+    if (!r || !r.ok) { log(`LEARN ⚠️ 取学习数据失败 HTTP ${r ? r.status : '-'}（★ 按"没查到"处理 ✓ 不编 ✗）`); return null; }
+    const j = await r.json();
+    if (!j || !j.ok || !j.found) { log(`LEARN ⚠️ 学习数据 not found (${j && (j.reason || j.error)})`); return null; }
+    log(`LEARN ✓ 取到 ${kind}（${Date.now() - t0}ms ✓）`);
+    return j;
+  } catch (e) {
+    log(`LEARN ⚠️ 取学习数据异常: ${e.message}（★ 按"没查到"处理 ✓）`);
+    return null;
+  }
+}
+
 async function routeNeedsWeb(text) {
   if (!WEB_SEARCH_ON || !DEEPSEEK_KEY) return false;
   const ac = new AbortController();
@@ -3051,7 +3146,9 @@ function validateSetConfig(o) {
   //     不是看"我写的时候离谁近" ✓（离得近但作用域够不着 = 运行时才炸 ✓ 语法检查查不出 ✗）
   //   ⇒ 定义见文件上方 `MOODS` / `normMood` / `moodForCmd` ✓
 
-  async function voiceChatAnswer(text, kbResults, history, detail) {
+  // ★ 2026-10-20：加了 `toolData` ✗ —— 工具查到的真实数据（★ 可选 ✓ 不传就与原来完全一致 ✓）
+  //   `toolData = { kind, data }` ／ null ✓
+  async function voiceChatAnswer(text, kbResults, history, detail, toolData) {
     const style = DETAIL_STYLES[detail] || DETAIL_STYLES[2];
     let kbBlock = '';
     if (kbResults.length) {
@@ -3060,7 +3157,19 @@ function validateSetConfig(o) {
     } else {
       kbBlock = '【知识库参考内容】\n（没有检索到任何相关内容）';
     }
-    const msgs = [{ role: 'system', content: VOICE_CHAT_SYSTEM.replace('__LEN__', style.len) + '\n\n' + kbBlock }];
+    // ★★ 工具数据块（2026-10-20）：**只放数字，不放解释** ✗
+    //   ★ 模型只负责把它说成人话 ✓ —— 数字来自 S2 的 SQL ✓（★ 它编不了 ✓）
+    //   ★★ 没数据/没查到 ⇒ **明确告诉模型"没查到"** ✗
+    //      （★ 空着不说 ⇒ 它就会凭印象编 ✓ 那是本项目最怕的 ✓）
+    let toolBlock = '';
+    if (toolData && toolData.kind) {
+      toolBlock = '【工具查到的真实数据】\n'
+        + '（★ 这是系统数据库查出来的，**必须据此回答** ✗ 不许自己改数字、不许自己补充不存在的数据 ✓）\n'
+        + 'kind=' + toolData.kind + '\n'
+        + JSON.stringify(toolData.data) + '\n'
+        + '（★ 只说用户问的那一项 ✓ 别把整段数据全念出来 ✗）';
+    }
+    const msgs = [{ role: 'system', content: VOICE_CHAT_SYSTEM.replace('__LEN__', style.len) + '\n\n' + kbBlock + (toolBlock ? '\n\n' + toolBlock : '') }];
     if (history) for (const h of history) msgs.push(h);
     msgs.push({ role: 'user', content: text });
 
@@ -3194,9 +3303,13 @@ function validateSetConfig(o) {
         // ③ ★★ 知识库检索 与 【联网路由判定】**并行发** ✗（CR-20261012-03 §6.1 ✓）
         //    ★ 为什么并行：检索只要 0.12~0.27s ✓ 而路由要 0.7~1.1s ✓
         //      ⇒ 串行的话白等一次 ✓；并行则"等路由"的时间把检索藏掉了 ✓
-        const needWebP = routeNeedsWeb(heard);
+        // ★ 2026-10-20：`routeNeedsWeb` → `routeIntent`（★ 一次判定"联网／查学习数据"两件事 ✓）
+        const intentP = routeIntent(heard);
         const kb = await kbSearchForVoice(heard);
-        const needWeb = await needWebP;
+        const intent = await intentP;
+        const needWeb = intent.web;
+        // ★★ 学习数据（★ 数字由 S2 算 ✓ 这里只搬运 ✓）；与知识库**并行**取 ✓ 不占路由时间 ✓
+        const toolData = intent.learning ? await learningSummary(device, intent.learning) : null;
         // ★ 期0 影子：非命令回合的判定（都不 await ✓）
         shadowJudge(heard, selfA ? { kind: 'self_qa' } : { kind: 'kb', reliable: !!kb.reliable, maxScore: kb.maxScore || 0 }, device);
 
@@ -3240,7 +3353,7 @@ function validateSetConfig(o) {
             // ★ 历史由 chatMsgsFor 给（"新话题/过期"已在上面统一处理过 ⇒ 这里传 '0' 不再清 ✓）
             const history = chatMsgsFor(device, '0');
             try {
-              const ans = await voiceChatAnswer(heard, kb.results, history, detail);
+              const ans = await voiceChatAnswer(heard, kb.results, history, detail, toolData);
               reply = ans.reply;
               usage = ans.usage;
               replyMood = normMood(ans.mood);   // ★ 语气与这句同源 ✓（模型在同一次输出里给的 ✓）
@@ -3500,10 +3613,16 @@ function validateSetConfig(o) {
         //   ★ 人设短路已拆 ✗（`selfAnswer` 恒 null ✓ 交给模型 ✓ 人设见 system prompt ✓）
         const selfA = vcS ? null : selfAnswer(heard);
         // ★★ 知识库检索 与 【联网路由判定】**并行发** ✗（CR-20261012-03 §6.1 ✓ 同非流式端点 ✓）
-        const needWebP = vcS ? Promise.resolve(false) : routeNeedsWeb(heard);
+        // ★★ 知识库检索 与 【意图路由】**并行发** ✗（CR-20261012-03 §6.1 ✓）
+        //   ★ 2026-10-20：`routeNeedsWeb` → `routeIntent`（★ 一次判"联网／查学习数据"✓）
+        //     ★ 命令回合不叫模型 ⇒ 直接给空意图 ✓（★ 省一次往返 ✓）
+        const intentP = vcS ? Promise.resolve({ web: false, learning: null }) : routeIntent(heard);
         const kb = vcS ? { ok: true, results: [], reliable: true, maxScore: 0 }
                        : await kbSearchForVoice(heard);
-        const needWeb = await needWebP;
+        const intent = await intentP;
+        const needWeb = intent.web;
+        // ★ 学习数据（★ 数字由 S2 算 ✓ 失败按"没查到"✓ 绝不编 ✗）
+        const toolData = intent.learning ? await learningSummary(device, intent.learning) : null;
         // ★ 期0 影子（流式端点 = 设备主路径 ✓）：只记录，不 await、不改任何返回值 ✓
         if (vcS) shadowJudge(heard, { kind: 'command', action: vcS.action || null }, device);
         else shadowJudge(heard, selfA ? { kind: 'self_qa' } : { kind: 'kb', reliable: !!kb.reliable, maxScore: kb.maxScore || 0 }, device);
@@ -3535,7 +3654,7 @@ function validateSetConfig(o) {
           // ★ 历史由 chatMsgsFor 给（"新话题/过期"上面已统一处理 ⇒ 传 '0' 不再清 ✓）
           const history = chatMsgsFor(device, '0');
           try {
-            const ans = await voiceChatAnswer(heard, kb.results, history, detail);
+            const ans = await voiceChatAnswer(heard, kb.results, history, detail, toolData);
             reply = ans.reply; usage = ans.usage;
             replyMood = normMood(ans.mood);                    // ★ 同一次输出里给的 ⇒ 同源 ✓
             if (ans.refused) { log('voice-chat-stream: 模型判定参考内容里没有答案 ⇒ 答"查不到"'); reply = NO_KB_REPLY; replyMood = null; }
