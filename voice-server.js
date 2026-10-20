@@ -3157,21 +3157,29 @@ function validateSetConfig(o) {
     } else {
       kbBlock = '【知识库参考内容】\n（没有检索到任何相关内容）';
     }
-    // ★★ 工具数据块（2026-10-20）：**只放数字，不放解释** ✗
-    //   ★ 模型只负责把它说成人话 ✓ —— 数字来自 S2 的 SQL ✓（★ 它编不了 ✓）
-    //   ★★ 没数据/没查到 ⇒ **明确告诉模型"没查到"** ✗
-    //      （★ 空着不说 ⇒ 它就会凭印象编 ✓ 那是本项目最怕的 ✓）
+    // ★★ 工具数据块（2026-10-20）：**两处都放** ✗
+    //   ★★ 实测教训（第一版只放 system ✓）：模型照样说「查不到/积分是空的」✗
+    //      因为 `VOICE_CHAT_SYSTEM` 里有「知识库没内容 ⇒ 说查不到」的规则 ✓
+    //      ⇒ ★ **工具数据必须比"知识库没内容"优先级更高** ✗
+    //   ① system 里加一条**最高优先级规则** ✓（明确"与上面所有规则冲突时以它为准"✓）
+    //   ② 把它**塞进 user 消息** ✓（★ 那是模型正在回答的那一轮 ⇒ 注意力最高 ✓）
     let toolBlock = '';
     if (toolData && toolData.kind) {
-      toolBlock = '【工具查到的真实数据】\n'
-        + '（★ 这是系统数据库查出来的，**必须据此回答** ✗ 不许自己改数字、不许自己补充不存在的数据 ✓）\n'
+      toolBlock = '【系统查询到的真实数据】\n'
         + 'kind=' + toolData.kind + '\n'
-        + JSON.stringify(toolData.data) + '\n'
-        + '（★ 只说用户问的那一项 ✓ 别把整段数据全念出来 ✗）';
+        + JSON.stringify(toolData.data);
     }
-    const msgs = [{ role: 'system', content: VOICE_CHAT_SYSTEM.replace('__LEN__', style.len) + '\n\n' + kbBlock + (toolBlock ? '\n\n' + toolBlock : '') }];
+    const toolRule = toolBlock
+      ? '\n\n★★【最高优先级 · 与上面任何规则冲突时以这条为准】★★\n'
+        + '本轮有【系统查询到的真实数据】—— ★ 那是**确实查到的** ✓（来自系统数据库 ✓）\n'
+        + '⇒ ★ 必须**据此回答** ✗：即使知识库里没有内容、即使你说不出道理 ✓\n'
+        + '⇒ ★★ **严禁**说「查不到 / 数据是空的 / 没查到你的记录」✗✗（数据就在下面 ✓ 说了就是撒谎 ✓）\n'
+        + '⇒ ★ 只说用户问的那一项 ✓ 别把整段数据全念出来 ✗；看不懂的字段就跳过 ✓'
+      : '';
+    const msgs = [{ role: 'system', content: VOICE_CHAT_SYSTEM.replace('__LEN__', style.len) + '\n\n' + kbBlock + toolRule }];
     if (history) for (const h of history) msgs.push(h);
-    msgs.push({ role: 'user', content: text });
+    // ★★ 工具数据**也塞进 user 消息** ✗ —— 双保险（★ 模型对"当前这一轮"的注意力最高 ✓）
+    msgs.push({ role: 'user', content: toolBlock ? (String(text) + '\n\n' + toolBlock) : String(text) });
 
     const ac = new AbortController();
     const tid = setTimeout(() => ac.abort(), LLM_TIMEOUT_MS);
