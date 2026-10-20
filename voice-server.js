@@ -3168,9 +3168,16 @@ function validateSetConfig(o) {
     //   ② 把它**塞进 user 消息** ✓（★ 那是模型正在回答的那一轮 ⇒ 注意力最高 ✓）
     let toolBlock = '';
     if (toolData && toolData.kind) {
+      // ★★ 2026-10-20 修（★ 这个 bug 害模型说了两轮"数据是空的"✗）：
+      //   `learningSummary()` 返回的是**整个 S2 响应对象**（★ 没有 `.data` 这一层 ✗）
+      //   而我写的是 `toolData.data` ⇒ **undefined** ⇒ ★ 提示词里就是 `{kind:points, undefined}` ✓
+      //   ⇒ ★ 模型看到 undefined ✓ **很诚实地**回答"数值是空的" ✓✓
+      //   ★ 判据：**"模型说数据是空的"要先怀疑"我传进去的是不是空的"** ✗
+      //     —— ★ 它有时在说谎 ✓ 但更多时候是**我真的给了它一个空的** ✓
+      const payload = (toolData.data != null) ? toolData.data : toolData;
       toolBlock = '【系统查询到的真实数据】\n'
         + 'kind=' + toolData.kind + '\n'
-        + JSON.stringify(toolData.data);
+        + JSON.stringify(payload);
     }
     const toolRule = toolBlock
       ? '\n\n★★【最高优先级 · 与上面任何规则冲突时以这条为准】★★\n'
