@@ -1742,6 +1742,16 @@ async function rpHandleTurn(device, heard) {
   //     因为记日志的钩子挂在**正常问答分支** ✓ 而★ 对练分支是提前 return 的 ⇒ **跳过了** ✗
   //   ★ 判据：**凡是有独立 return 的分支，都要自己记日志** ✗ 别指望主路径兜住 ✓
   if (r && r.handled && r.reply) {
+    // ★★ 2026-10-21 依设备端回执 §3 加断言 ✗
+    //   ★ 用户报过一次「它把我说的话重复了一遍」✓ 设备端查出真因是
+    //     `/api/voice-chat` 失败后走"ASR 回声"回退 ⇒ ★ **把 heard 当回复念** ✗✓
+    //   ★ 他们说"只要服务器偶尔回 reply == heard，症状就会重现"✓ 完全正确 ✓
+    //   ⇒ ★ 这里硬断言 ✗：对练里 reply 只要等于 heard ⇒ **换掉** ✓ 并告警 ✓
+    //   （★ 换掉而不是只告警 ✓ —— ★ 因为念出来的就是错的 ✓ 日志留证据就够了 ✓）
+    if (String(r.reply).trim() === String(heard).trim()) {
+      log(`ROLEPLAY ⚠️ reply===heard（★ 复读风险 ✗）heard=「${heard}」⇒ 已替换为兜底句 ✓`);
+      r.reply = '嗯……你怎么看？';
+    }
     try {
       logVoiceTurn({
         device: device, question: heard, reply: r.reply,
@@ -2514,6 +2524,108 @@ const server = http.createServer(async (req, res) => {
    *   ★★ 对练的**回合**仍然走 /api/voice-chat（音频 ✓）—— ★ 这里不加音频端点 ✗
    * ══════════════════════════════════════════════════════════════════ */
 
+  /* ══════════════════════════════════════════════════════════════════
+   * ★★ 期2：纯文本入口 ＋ 流式（CR-20261021-02 §4 ✓ 设备端回执 §2.2 ✗）
+   *
+   *   ★ 设备端固件**已经写好并烧进去了**（ac12859 ✓ 按行解析 `data: {"delta":"…"}` ✓
+   *     遇 `"done"` 收工 ✓ 端点不在就自动退回音频老路 ✓）
+   *   ⇒ ★ 他们等的就是这个端点 ✓
+   *
+   *   ★★ 为什么它快 ✗：★ 音频入口是"服务器还要 ASR 一遍" ✓
+   *     而期1 之后设备**已经有文本** ✓ ⇒ ★ 别再识别第二次 ✗
+   *     且 ★ 这里**流式**返 ⇒ 设备**收到第一段就能开始 TTS** ✓（"首句先播"✓）
+   *
+   *   ★★ 对练模式下**暂时不流式** ✗ —— ★ `rpHandleTurn` 是整体返回的 ✓
+   *     ⇒ ★ 对练时一次性给全文 ✓（★ 等 §3 期2 的"句子队列"再优化 ✓）
+   *
+   *   响应格式（★ 设备按行切 ✓ 不需要 SSE 的 event/id ✗）：
+   *     data: {"delta":"是啊，"}
+   *     data: {"delta":"我都说了…"}
+   *     data: {"done":true,"reply":"全文","audio":"/api/voice-audio/x.wav"}
+   * ══════════════════════════════════════════════════════════════════ */
+  if (req.method === 'POST' && req.url === '/api/voice-chat-text') {
+    let tb = '';
+    req.on('data', c => { tb += c; });
+    req.on('end', async () => {
+      let o = {};
+      try { o = JSON.parse(tb || '{}'); } catch (e) { o = {}; }
+      const device = String(o.device || o.dev_id || '').trim();
+      const text = String(o.text || '').trim();
+      const reset = String(o.reset || '') === '1';
+      const send = (obj) => { try { res.write('data: ' + JSON.stringify(obj) + '\n\n'); } catch (e) {} };
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
+      if (!text) { send({ done: true, error: 'empty_text' }); res.end(); return; }
+      log(`voice-chat-text: device=${device || '-'} text=「${text.slice(0, 40)}」`);
+
+      // ★★ 对练会话中 ⇒ 走对练（★ 暂不流式 ✓ 一次性给全文 ✓）
+      try {
+        if (RP_ON && device && _rpSessions.has(device) && !reset) {
+          const rp = await rpHandleTurn(device, text);
+          if (rp && rp.handled) {
+            const au = await ttsWavUrl(rp.reply);
+            send({ done: true, reply: rp.reply, audio: au, roleplay: true });
+            res.end();
+            return;
+          }
+        }
+      } catch (e) { log(`voice-chat-text ⚠️ 对练分支异常: ${e.message}（★ 继续走普通 ✓）`); }
+
+      // ★ 普通模式：★ 流式 delta ✓（★ 复用与小星同一套提示词 ✓ 不含对练 ✗）
+      try {
+        const kb = await kbSearchForVoice(text);
+        const kbBlock = (kb && kb.results && kb.results.length)
+          ? '【知识库参考内容】\n' + kb.results.map((r, i) => `[${i + 1}] ${r.file}\n${r.snippet}`).join('\n\n')
+          : '【知识库参考内容】\n（没有检索到任何相关内容）';
+        const sys = VOICE_CHAT_SYSTEM.replace('__LEN__', '短') + '\n\n' + kbBlock;
+        const ac = new AbortController();
+        const tid = setTimeout(() => ac.abort(), 25000);
+        let full = '';
+        try {
+          const r = await fetch('https://api.deepseek.com/chat/completions', {
+            method: 'POST', signal: ac.signal,
+            headers: { 'Authorization': `Bearer ${DEEPSEEK_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: 'deepseek-chat', temperature: 0.4, max_tokens: 220, stream: true,
+              messages: [{ role: 'system', content: sys }, { role: 'user', content: text }],
+            }),
+          });
+          if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
+          const reader = r.body.getReader();
+          const dec = new TextDecoder('utf-8');
+          let buf = '';
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const lines = buf.split('\n');
+            buf = lines.pop() || '';
+            for (const ln of lines) {
+              const s2 = ln.trim();
+              if (!s2.startsWith('data:')) continue;
+              const payload = s2.slice(5).trim();
+              if (payload === '[DONE]') continue;
+              try {
+                const jj = JSON.parse(payload);
+                const d = jj.choices && jj.choices[0] && jj.choices[0].delta && jj.choices[0].delta.content;
+                if (d) { full += d; send({ delta: d }); }
+              } catch (e) {}
+            }
+          }
+        } finally { clearTimeout(tid); }
+        // ★ 只取 `答：` 之后的内容（★ 与小星同一套契约 ✓）
+        let reply = String(full || '').trim();
+        const mm = reply.match(/答[：:]\s*([\s\S]+)/);
+        if (mm) reply = mm[1].trim();
+        const au2 = await ttsWavUrl(reply);
+        send({ done: true, reply: reply, audio: au2 });
+        res.end();
+      } catch (e) {
+        log(`voice-chat-text ⚠️ 失败: ${e.message}（★ 设备会自动退回音频老路 ✓）`);
+        try { send({ done: true, error: String(e.message || e) }); res.end(); } catch (e2) {}
+      }
+    });
+    return;
+  }
   // GET /api/voice-roleplay/scenes —— 场景列表（★ 设备屏直接渲染 ✓）
   if (req.method === 'GET' && req.url.startsWith('/api/voice-roleplay/scenes')) {
     const q = getQuery(req.url);
