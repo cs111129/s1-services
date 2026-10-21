@@ -1,4 +1,4 @@
-﻿const http = require('http');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');   // ★ CR-20261009-01：设备密钥定长比较（timingSafeEqual）
@@ -2569,7 +2569,7 @@ const server = http.createServer(async (req, res) => {
         if (RP_ON && device && _rpSessions.has(device) && !reset) {
           const rp = await rpHandleTurn(device, text);
           if (rp && rp.handled) {
-            const au = await ttsWavUrl(rp.reply);
+            const au = '';   // ★ 2026-10-21 止损：不在同步路径上合成 ✓
             send({ done: true, reply: rp.reply, audio: au, roleplay: true });
             res.end();
             return;
@@ -2633,7 +2633,7 @@ const server = http.createServer(async (req, res) => {
         let reply = String(full || '').trim();
         const mm = reply.match(/答[：:]\s*([\s\S]+)/);
         if (mm) reply = mm[1].trim();
-        const au2 = await ttsWavUrl(reply);
+        const au2 = '';  // ★ 同上 ✓
         send({ done: true, reply: reply, audio: au2 });
         res.end();
       } catch (e) {
@@ -4163,8 +4163,12 @@ function validateSetConfig(o) {
           return;
         }
 
+        // ★★ 2026-10-21 依设备端递件加分段打点 ✗（★ t0~t5 ✓ 他们只要这一行证据 ✓）
+        //   ★ 判据：**t5 − t1 ≤ 3.0 s** ✓（★ 他们实测 5.4~7.0 ✗）
+        const _t0 = Date.now();
         // ① ASR
         const asr = await handleASR(audioPart.data);
+        const _t2 = Date.now();
         const heard = (asr.text || '').trim();
         if (!heard) {
           log(`voice-chat: 没听清（device=${device || '-'}）`);
@@ -4221,8 +4225,17 @@ function validateSetConfig(o) {
           try {
             const rpA = await rpHandleTurn(device, heard);
             if (rpA && rpA.handled) {
+              // ★ 分段打点（★ 设备端 §3 要的证据 ✗ 判据 t5−t1 ≤ 3.0s ✓）
+              try { log(`[T] ${device} t0→ASR=${_t2 - _t0}ms  ASR→回=${Date.now() - _t2}ms  合计=${Date.now() - _t0}ms`); } catch (e) {}
               // ★ 2026-10-21：★ 顺手合成 WAV 一起回 ✗ ⇒ 设备不用再走一次 TTS 往返 ✓
-              const rpAudio = await ttsWavUrl(rpA.reply);
+              // ★★★ 2026-10-21 **止损** ✗✗
+              //   ★ 原因：★ 设备端实测 t1→t5 = **5.4~7.0 s** ✗ 而其中大头是**我在这里同步做 TTS** ✓
+              //   ★ 我的 `ttsWavUrl()` = `ttsToPcmFile()`（python3 合成）＋ **ffmpeg 转码** ✗ = 2 次子进程 ✗
+              //   ★★ 为了省他们 1 秒（自己调 /api/tts）✓ 我加了 **4 秒** ✗✗ ⇒ **净变慢** ✗
+              //   ★ 而我的 `latency_ms` 只量 `rpHandleTurn`（LLM 719ms ✓）⇒ ★ 我一直以为自己很快 ✗
+              //   ⇒ ★ 立刻回到"只回文本" ✓ 我们自己不合成 ✓ 设备调 `/api/tts` 更快 ✓
+              //   ★ audio 字段**保留**（★ 值为空串 ✓ 设备按"没有 audio"处理 ✓ 不破坏契约 ✓）
+              const rpAudio = '';
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ success: true, reply: rpA.reply, audio: rpAudio, heard: heard, roleplay: true, modules: rpA.modules || undefined, scenes: rpA.scenes || undefined }));
               return;
@@ -4237,7 +4250,7 @@ function validateSetConfig(o) {
           try {
             const rpB = await rpHandleTurn(device, heard);
             if (rpB && rpB.handled) {
-              const rpAudio2 = await ttsWavUrl(rpB.reply);
+              const rpAudio2 = '';   // ★ 同上：不在同步路径上合成 ✓（★ 2026-10-21 止损 ✗）
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ success: true, reply: rpB.reply, audio: rpAudio2, heard: heard, roleplay: true, modules: rpB.modules || undefined, scenes: rpB.scenes || undefined }));
               return;
@@ -4559,8 +4572,17 @@ function validateSetConfig(o) {
           try {
             const rpA = await rpHandleTurn(device, heard);
             if (rpA && rpA.handled) {
+              // ★ 分段打点（★ 设备端 §3 要的证据 ✗ 判据 t5−t1 ≤ 3.0s ✓）
+              try { log(`[T] ${device} t0→ASR=${_t2 - _t0}ms  ASR→回=${Date.now() - _t2}ms  合计=${Date.now() - _t0}ms`); } catch (e) {}
               // ★ 2026-10-21：★ 顺手合成 WAV 一起回 ✗ ⇒ 设备不用再走一次 TTS 往返 ✓
-              const rpAudio = await ttsWavUrl(rpA.reply);
+              // ★★★ 2026-10-21 **止损** ✗✗
+              //   ★ 原因：★ 设备端实测 t1→t5 = **5.4~7.0 s** ✗ 而其中大头是**我在这里同步做 TTS** ✓
+              //   ★ 我的 `ttsWavUrl()` = `ttsToPcmFile()`（python3 合成）＋ **ffmpeg 转码** ✗ = 2 次子进程 ✗
+              //   ★★ 为了省他们 1 秒（自己调 /api/tts）✓ 我加了 **4 秒** ✗✗ ⇒ **净变慢** ✗
+              //   ★ 而我的 `latency_ms` 只量 `rpHandleTurn`（LLM 719ms ✓）⇒ ★ 我一直以为自己很快 ✗
+              //   ⇒ ★ 立刻回到"只回文本" ✓ 我们自己不合成 ✓ 设备调 `/api/tts` 更快 ✓
+              //   ★ audio 字段**保留**（★ 值为空串 ✓ 设备按"没有 audio"处理 ✓ 不破坏契约 ✓）
+              const rpAudio = '';
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ success: true, reply: rpA.reply, audio: rpAudio, heard: heard, roleplay: true, modules: rpA.modules || undefined, scenes: rpA.scenes || undefined }));
               return;
@@ -4576,7 +4598,7 @@ function validateSetConfig(o) {
           try {
             const rpB = await rpHandleTurn(device, heard);
             if (rpB && rpB.handled) {
-              const rpAudio2 = await ttsWavUrl(rpB.reply);
+              const rpAudio2 = '';   // ★ 同上：不在同步路径上合成 ✓（★ 2026-10-21 止损 ✗）
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ success: true, reply: rpB.reply, audio: rpAudio2, heard: heard, roleplay: true, modules: rpB.modules || undefined, scenes: rpB.scenes || undefined }));
               return;
