@@ -2572,11 +2572,21 @@ const server = http.createServer(async (req, res) => {
 
       // ★ 普通模式：★ 流式 delta ✓（★ 复用与小星同一套提示词 ✓ 不含对练 ✗）
       try {
-        const kb = await kbSearchForVoice(text);
-        const kbBlock = (kb && kb.results && kb.results.length)
-          ? '【知识库参考内容】\n' + kb.results.map((r, i) => `[${i + 1}] ${r.file}\n${r.snippet}`).join('\n\n')
-          : '【知识库参考内容】\n（没有检索到任何相关内容）';
-        const sys = VOICE_CHAT_SYSTEM.replace('__LEN__', '短') + '\n\n' + kbBlock;
+        // ★★ 2026-10-21：★ 这里**不能**用 `kbSearchForVoice` / `VOICE_CHAT_SYSTEM` ✗
+        //   它们都是**后面才声明的 const** ✓ 我这段在它们前面 ⇒ **TDZ**
+        //   （实测报错：Cannot access 'VOICE_CHAT_SYSTEM' before initialization ✗）
+        //   ★ 判据：★ **缩进一样只说明"同一个作用域"，不说明"能用"** ✗
+        //     还要看**声明顺序** ✗ —— 这是今天第 5 个同类坑 ✓
+        //   ⇒ ★ 这个端点**自带提示词** ✗ 不依赖任何外层声明 ✓ 最稳 ✓
+        const sys = [
+          '你是「赋能02」设备上的带教教练，名字叫小星，给门店一线员工帮忙。',
+          '★★ 幽默、接地气 ✓ 一两句就够 ✗ 别贫 ✓',
+          '★ 直接从"答："之后开始说 ✓ 不要加任何前缀/解释 ✗',
+          '★ 不知道就说不知道 ✗ 绝不编造店里制度 ✗',
+          '★ 每次都要落到企业文化的一条上（真诚：讲真话做实事爱客户守承诺 · ',
+          '   高效：成果导向沟通简单标准明确推进有力 · 专业：精流程定标准练技能严考核 · ',
+          '   担当：会放权勇挑战敢行动定决策担责任）✓ 一句话带过 ✗ 别背条文 ✓',
+        ].join('\n');
         const ac = new AbortController();
         const tid = setTimeout(() => ac.abort(), 25000);
         let full = '';
