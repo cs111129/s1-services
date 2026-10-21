@@ -2356,6 +2356,109 @@ const server = http.createServer(async (req, res) => {
   //     ⇒ ★ 服务器在 `pull` 里按当前时间算好"现在该弹什么" ✓（`should_alert` ✓）
   // ══════════════════════════════════════════════════════════════════════
   /* ══════════════════════════════════════════════════════════════════
+   * ★★★ 期1：边录边识别（CR-20261021-02 ✓ 方案：协同/specs/CR-20261021-02 ✓）
+   *
+   *   ★★ 为什么做这个 ✗：★ 实测首字延迟 ~2.7s ✓ 其中 **ASR 占 1.5~1.8s** ✗
+   *      ★ 只改 TTS/LLM 流式 ⇒ 下限被 ASR 锁死 ✓ 只省 0.35s ✗
+   *      ⇒ ★ **要 1 秒级，必须让 ASR 与用户说话并行** ✗✓（★ 边录边识别 ✓）
+   *
+   *   ★★ 设计要点（★ 最简单的正确做法 ✗）：
+   *     ① 设备边录边传分片 ✓ 服务器**累积**
+   *     ② 每次对**累积的全部音频**做一次全量识别 ✓ ⇒ ★ 返回"到目前为止的全文"✗
+   *        （★ 不是增量 ✗ —— ★ 增量会反复 ✓ 全量天然稳定 ✓✓）
+   *     ③ ★ **并发保护**：同一设备同时只跑一次识别 ✓ 正在跑就**直接返回上次结果** ✗
+   *        （★ 20 片 × 全量识别 = O(n²) ✗ ⇒ 必须丢弃中间态 ✓）
+   *     ④ ★ **静音处切 / 片间重叠** 是**设备侧**的事 ✓（★ 方案 §3 期1 三坑之一 ✓）
+   *
+   *   ★ 端点（★ 只增不改 ✓ 老固件完全不受影响 ✓）：
+   *     POST /api/voice/asr-chunk?device=xxx&seq=1   body = 音频字节
+   *       → { ok:true, seq, text:"到目前为止的全文", bytes }
+   *     POST /api/voice/asr-commit?device=xxx        body = 最后一片（可空）
+   *       → { ok:true, text:"最终全文" }
+   * ══════════════════════════════════════════════════════════════════ */
+  const _asrSess = new Map();       // device -> { parts: Map<seq,Buffer>, text, at, busy }
+  const ASR_SESS_TTL = 120 * 1000;  // ★ 2 分钟没动静 ⇒ 丢 ✓（★ 防止内存漏 ✗）
+
+  function _asrSessGet(device) {
+    let s = _asrSess.get(device);
+    if (s && Date.now() - s.at > ASR_SESS_TTL) { _asrSess.delete(device); s = null; }
+    if (!s) { s = { parts: new Map(), text: '', at: Date.now(), busy: false }; _asrSess.set(device, s); }
+    s.at = Date.now();
+    return s;
+  }
+  // ★ 按 seq 顺序拼（★ 并发到达也不会乱 ✓ 缺号就跳过 ✓ 不抛错）
+  function _asrConcat(s) {
+    const keys = Array.from(s.parts.keys()).sort(function (a, b) { return a - b; });
+    return Buffer.concat(keys.map(function (k) { return s.parts.get(k); }));
+  }
+
+  if (req.method === 'POST' && req.url.startsWith('/api/voice/asr-chunk')) {
+    const q = getQuery(req.url);
+    const dev = String(q.device || q.dev_id || q.device_id || '').trim();
+    const seq = parseInt(q.seq, 10) || 0;
+    if (!dev) { jsonOut(400, { ok: false, error: '缺少 device' }); return; }
+    const bufs = [];
+    req.on('data', c => bufs.push(c));
+    req.on('end', async () => {
+      const data = Buffer.concat(bufs);
+      if (!data.length) { jsonOut(400, { ok: false, error: '空分片' }); return; }
+      const s = _asrSessGet(dev);
+      s.parts.set(seq, data);
+      // ★★ 并发保护 ✗ —— 正在识别就**直接回上次结果** ✓（★ 丢弃中间态 ✓ O(n²) 也扛得住 ✓）
+      if (s.busy) { jsonOut(200, { ok: true, seq: seq, text: s.text, bytes: _asrConcat(s).length, busy: true }); return; }
+      s.busy = true;
+      try {
+        const all = _asrConcat(s);
+        let text = '';
+        try {
+          const asr = await handleASR(all);      // ★ 与 /api/voice-chat 用**同一个**识别 ✓
+          text = String((asr && asr.text) || '').trim();
+          s.text = text;                          // ★ 只记"最近一次成功"的全文 ✓
+        } catch (e) {
+          log(`ASR-CHUNK ⚠️ 识别失败（${dev} seq=${seq}）: ${e.message}（★ 返回上次全文 ✓）`);
+        }
+        jsonOut(200, { ok: true, seq: seq, text: s.text, bytes: all.length });
+      } finally { s.busy = false; }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url.startsWith('/api/voice/asr-commit')) {
+    const q = getQuery(req.url);
+    const dev = String(q.device || q.dev_id || q.device_id || '').trim();
+    if (!dev) { jsonOut(400, { ok: false, error: '缺少 device' }); return; }
+    const bufs = [];
+    req.on('data', c => bufs.push(c));
+    req.on('end', async () => {
+      const tail = Buffer.concat(bufs);
+      const s = _asrSess.get(dev);
+      if (!s) {
+        // ★ 没有分片 ⇒ 只有最后一片 ✓ 直接识别它 ✓（★ 兼容"设备没分片直接 commit"✓）
+        if (!tail.length) { jsonOut(400, { ok: false, error: '没有音频' }); return; }
+        try {
+          const asr = await handleASR(tail);
+          jsonOut(200, { ok: true, text: String((asr && asr.text) || '').trim(), chunks: 0 });
+        } catch (e) { jsonOut(500, { ok: false, error: e.message }); }
+        return;
+      }
+      if (tail.length) s.parts.set(99999, tail);       // ★ 最后一片放最后 ✓
+      s.at = Date.now();
+      try {
+        const all = _asrConcat(s);
+        const asr = await handleASR(all);
+        const text = String((asr && asr.text) || '').trim();
+        const n = s.parts.size;
+        _asrSess.delete(dev);                          // ★★ 交卷即**清会话** ✗（★ 下一次对练从头开始 ✓）
+        log(`ASR-COMMIT ✓ ${dev} ${n} 片 / ${all.length} 字节 ⇒ ${text.length} 字`);
+        jsonOut(200, { ok: true, text: text, chunks: n, bytes: all.length });
+      } catch (e) {
+        log(`ASR-COMMIT ⚠️ 失败（${dev}）: ${e.message}`);
+        jsonOut(500, { ok: false, error: e.message });
+      }
+    });
+    return;
+  }
+  /* ══════════════════════════════════════════════════════════════════
    * ★★ 设备端「模拟对练」屏上入口（CR-20261021-01 ✓ 规格：协同/specs/CR-20261021-01 ✓）
    *
    *   ★ 用户 2026-10-21：「这个对练的激活方式不光是语音激活，用户也可以在设备端
