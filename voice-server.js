@@ -88,6 +88,19 @@ function loadIngestToken() {
   return '';
 }
 const CAM_INGEST_TOKEN = loadIngestToken();
+
+// ★★★ 2026-10-21 P0 兜底 ✗✗
+//   ★ 今天真实事故：★ 我在模块级引用了 handler 内的 `jsonOut` ✗ ⇒ ReferenceError
+//     ⇒ **进程直接退出** ⇒ ★ 整个语音服务（对练／小星／TTS）全挂 2~3 分钟 ✗✗
+//   ★ 判据：**一个端点的缺陷，不该等于全站语音不可用** ✗
+//   ★★ 这里只**记日志、不退出** ✓ —— 注意这只兜"没人接的异常" ✓
+//      真正的修法是每个 handler 自己 try/catch ✓（那个还得逐个补 ✓）
+process.on('uncaughtException', (e) => {
+  try { log(`💥 uncaughtException（★ 已兜住，进程继续 ✓）: ${e && e.stack ? String(e.stack).split('\n').slice(0, 4).join(' | ') : e}`); } catch (_) {}
+});
+process.on('unhandledRejection', (e) => {
+  try { log(`💥 unhandledRejection（★ 已兜住 ✓）: ${e && e.message ? e.message : e}`); } catch (_) {}
+});
 // 设备离线判定间隔：超过此毫秒无状态上报视为离线（前端判在线/离线）
 const CAM_OFFLINE_MS = 15000;
 // 待下发指令缓存：device_id -> { cmd, ts }
@@ -1859,6 +1872,37 @@ async function _rpHandleTurnInner(device, heard) {
     };
   }
   return null;
+}
+
+/**
+ * ★★ 服务器侧把一句回复合成成 **WAV** 并返回 URL（2026-10-21 ✓ 依设备端回执 CR-20261021-02 §2 ✗）
+ *
+ *   ★ 起因：★ 现在的链路里**有一次 TTS 往返是设备自己补的** ✗
+ *     设备 → /api/voice-chat → 只拿到 {reply}（没 audio ✗）→ 设备再 POST /api/tts
+ *     → 等整段 WAV → 下载 → 播放 ⇒ ★ 实测多花 **0.9~1.4 s** ✗
+ *   ⇒ ★ 服务器**顺手合成好** ✓ 响应里直接给 audio ✓ 设备拿到就播 ✓
+ *   ★★ 首字预期：★ 2.7 s → **1.6~1.8 s** ✓（★ 不改设备任何音频路径 ✓ 风险≈0 ✓）
+ *
+ *   ★★ 必须给 **RIFF WAV** ✗ —— ★ 设备只解析 PCM16 / μ-law ✓ **没有 mp3 解码器** ✗
+ *     （★ 所以不能直接用 `handleTTS()` 的 mp3 ✓）
+ *   ★ 复用：`ttsToPcmFile()`（合成 → pcm）＋ `pcmToWav()`（pcm → wav 头）✓ 都现成 ✓
+ */
+async function ttsWavUrl(text) {
+  const s = String(text || '').trim();
+  if (!s) return '';
+  let pcmPath = '';
+  try {
+    pcmPath = await ttsToPcmFile(s);
+    const pcm = fs.readFileSync(pcmPath);
+    const name = 'rtts-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7) + '.wav';
+    fs.writeFileSync(path.join(AUDIO_DIR, name), pcmToWav(pcm));
+    return '/api/voice-audio/' + name;
+  } catch (e) {
+    log(`TTS-AUDIO ⚠️ 合成失败（★ 只回文本 ✓ 设备会自己补 ✓）: ${e.message}`);
+    return '';
+  } finally {
+    if (pcmPath) { try { fs.unlinkSync(pcmPath); } catch (e) {} }
+  }
 }
 
 async function routeNeedsWeb(text) {
@@ -4035,8 +4079,10 @@ function validateSetConfig(o) {
           try {
             const rpA = await rpHandleTurn(device, heard);
             if (rpA && rpA.handled) {
+              // ★ 2026-10-21：★ 顺手合成 WAV 一起回 ✗ ⇒ 设备不用再走一次 TTS 往返 ✓
+              const rpAudio = await ttsWavUrl(rpA.reply);
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true, reply: rpA.reply, heard: heard, roleplay: true, modules: rpA.modules || undefined, scenes: rpA.scenes || undefined }));
+              res.end(JSON.stringify({ success: true, reply: rpA.reply, audio: rpAudio, heard: heard, roleplay: true, modules: rpA.modules || undefined, scenes: rpA.scenes || undefined }));
               return;
             }
           } catch (e) { log('ROLEPLAY ⚠️ 回合异常（★ 退回小星 ✓）: ' + e.message); }
@@ -4049,8 +4095,9 @@ function validateSetConfig(o) {
           try {
             const rpB = await rpHandleTurn(device, heard);
             if (rpB && rpB.handled) {
+              const rpAudio2 = await ttsWavUrl(rpB.reply);
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true, reply: rpB.reply, heard: heard, roleplay: true, modules: rpB.modules || undefined, scenes: rpB.scenes || undefined }));
+              res.end(JSON.stringify({ success: true, reply: rpB.reply, audio: rpAudio2, heard: heard, roleplay: true, modules: rpB.modules || undefined, scenes: rpB.scenes || undefined }));
               return;
             }
           } catch (e) { _rpStartPending.delete(device); log('ROLEPLAY ⚠️ 启动异常（★ 退回小星 ✓）: ' + e.message); }
@@ -4370,8 +4417,10 @@ function validateSetConfig(o) {
           try {
             const rpA = await rpHandleTurn(device, heard);
             if (rpA && rpA.handled) {
+              // ★ 2026-10-21：★ 顺手合成 WAV 一起回 ✗ ⇒ 设备不用再走一次 TTS 往返 ✓
+              const rpAudio = await ttsWavUrl(rpA.reply);
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true, reply: rpA.reply, heard: heard, roleplay: true, modules: rpA.modules || undefined, scenes: rpA.scenes || undefined }));
+              res.end(JSON.stringify({ success: true, reply: rpA.reply, audio: rpAudio, heard: heard, roleplay: true, modules: rpA.modules || undefined, scenes: rpA.scenes || undefined }));
               return;
             }
           } catch (e) { log('ROLEPLAY ⚠️ 回合异常（★ 退回小星 ✓）: ' + e.message); }
@@ -4385,8 +4434,9 @@ function validateSetConfig(o) {
           try {
             const rpB = await rpHandleTurn(device, heard);
             if (rpB && rpB.handled) {
+              const rpAudio2 = await ttsWavUrl(rpB.reply);
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true, reply: rpB.reply, heard: heard, roleplay: true, modules: rpB.modules || undefined, scenes: rpB.scenes || undefined }));
+              res.end(JSON.stringify({ success: true, reply: rpB.reply, audio: rpAudio2, heard: heard, roleplay: true, modules: rpB.modules || undefined, scenes: rpB.scenes || undefined }));
               return;
             }
           } catch (e) { _rpStartPending.delete(device); log('ROLEPLAY ⚠️ 启动异常（★ 退回小星 ✓）: ' + e.message); }
