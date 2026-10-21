@@ -2332,6 +2332,186 @@ const server = http.createServer(async (req, res) => {
   //   ★ "推送"= 设备**拉** ✓（手表在 NAT 后 ✓ 推不进去 ✓）
   //     ⇒ ★ 服务器在 `pull` 里按当前时间算好"现在该弹什么" ✓（`should_alert` ✓）
   // ══════════════════════════════════════════════════════════════════════
+  /* ══════════════════════════════════════════════════════════════════
+   * ★★ 设备端「模拟对练」屏上入口（CR-20261021-01 ✓ 规格：协同/specs/CR-20261021-01 ✓）
+   *
+   *   ★ 用户 2026-10-21：「这个对练的激活方式不光是语音激活，用户也可以在设备端
+   *     进入『模拟对练』，在里面选择类型、选择场景，然后开始练习。」
+   *   ★★ 这套端点是给**设备屏**用的 ✗ —— 与语音入口**共用同一个会话池** ✓
+   *      （`_rpSessions` ✓）⇒ ★ 语音说"开始对练"和屏上点"开始练习"**是同一个会话** ✓
+   *
+   *   ★ 鉴权：与 /api/cam/* 同一套 `X-Device-Secret` ✓（★ 一机一密 ✓）
+   *   ★★ 对练的**回合**仍然走 /api/voice-chat（音频 ✓）—— ★ 这里不加音频端点 ✗
+   * ══════════════════════════════════════════════════════════════════ */
+
+  // GET /api/voice-roleplay/scenes —— 场景列表（★ 设备屏直接渲染 ✓）
+  if (req.method === 'GET' && req.url.startsWith('/api/voice-roleplay/scenes')) {
+    const q = getQuery(req.url);
+    const dev = pickDeviceId(req, q, null);
+    if (!checkDeviceSecret(pickSecret(req, q, null), dev)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '设备密钥错误' }));
+      return;
+    }
+    const wantMod = String(q.module || '').trim();
+    rpLoadScenes().then(function (sj) {
+      if (!sj || !sj.scenes) {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'scenes_unavailable' }));
+        return;
+      }
+      const scenes = wantMod ? sj.scenes.filter(function (x) { return x.module === wantMod; }) : sj.scenes;
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, total: sj.total, modules: sj.modules || [], scenes: scenes }));
+    }).catch(function (e) {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    });
+    return;
+  }
+
+  // GET /api/voice-roleplay/state —— 当前状态（★ 屏幕轮询用 ✓ 建议 10~15 秒一次 ✓）
+  if (req.method === 'GET' && req.url.startsWith('/api/voice-roleplay/state')) {
+    const q = getQuery(req.url);
+    const dev = pickDeviceId(req, q, null);
+    if (!checkDeviceSecret(pickSecret(req, q, null), dev)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '设备密钥错误' }));
+      return;
+    }
+    const s = dev ? _rpSessions.get(dev) : null;
+    const idle = s ? (Date.now() - s.at > RP_IDLE_MS) : false;
+    if (!s || idle) {
+      if (s && idle) _rpSessions.delete(dev);      // ★ 顺手清理 ✓
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, active: false }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      ok: true, active: true, mode: s.mode,
+      scene: s.scene ? { id: s.scene.id, name: s.scene.name, module: s.scene.module } : null,
+      turns: s.turns || 0, max_turns: RP_MAX_TURNS
+    }));
+    return;
+  }
+
+  // POST /api/voice-roleplay/start —— 屏上点「开始练习」（★ 直接指定 scene_id ✓ 不问模型 ✗）
+  if (req.method === 'POST' && req.url === '/api/voice-roleplay/start') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      let o = {};
+      try { o = JSON.parse(body || '{}'); } catch (e) { o = {}; }
+      const dev = pickDeviceId(req, null, o);
+      if (!checkDeviceSecret(pickSecret(req, null, o), dev)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '设备密钥错误' }));
+        return;
+      }
+      if (!dev) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '缺少 dev_id' }));
+        return;
+      }
+      const sid = String(o.scene_id || '').trim();
+      if (!sid) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '缺少 scene_id' }));
+        return;
+      }
+      try {
+        const sj = await rpLoadScenes();
+        if (!sj || !sj.scenes) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: 'scenes_unavailable' }));
+          return;
+        }
+        const hit = sj.scenes.find(function (x) { return x.id === sid; });
+        if (!hit) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: 'scene_not_found' }));
+          return;
+        }
+        // ★★ 一旦 start ⇒ **重置**该设备的对练会话 ✓（★ 语音入口与屏上入口共用同一个 ✓）
+        _rpStartPending.delete(dev);
+        const s = {
+          mode: 'roleplay', scene: hit, sceneId: hit.id, sceneName: hit.name,
+          module: hit.module, msgs: [], turns: 0, at: Date.now()
+        };
+        _rpSessions.set(dev, s);
+        log(`ROLEPLAY ▶（屏上）开始「${hit.name}」(${hit.id}) device=${dev}`);
+        // ★ 开场：★ 角色第一句 ✓ 文本 ＋ 音频都给 ✓
+        let open = '';
+        try {
+          open = await rpCallLLM(rpSystemPrompt(hit, 1), [{
+            role: 'user', content: '（对练开始。请以角色身份说第一句话，把上面的情境自然带出来，1~3 句，不要旁白。）'
+          }], 180);
+        } catch (e) {
+          open = '你好，我这边有个事想跟你说一下。';
+          log(`ROLEPLAY ⚠️ 屏上开场生成失败: ${e.message}（★ 用兜底开场 ✓）`);
+        }
+        s.msgs.push({ role: 'assistant', content: open });
+        s.turns = 1;
+        // ★★ 开场**只给文本** ✗ —— ★ 设备本来就会调 `/api/tts`（★ 它天天在用 ✓）
+        //   ★ 2026-10-21：我原来写了个 `ttsSynthesize()` ✗ —— ★ 那个函数**根本不存在** ✓
+        //     （★ `node --check` 查不出来 ✓ 与 `LLM_TIMEOUT_MS` 同一类坑 ✗）
+        //   ★ 判据：**跨模块复用前先 grep 确认函数真的存在** ✗ 别凭印象写名字 ✓
+        const audioUrl = '';
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+          ok: true,
+          session: {
+            mode: 'roleplay',
+            scene: { id: hit.id, name: hit.name, module: hit.module, description: hit.description || '' },
+            turns: 1, max_turns: RP_MAX_TURNS
+          },
+          opening: { text: open, audio_url: audioUrl }
+        }));
+      } catch (e) {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/voice-roleplay/end —— 屏上点「结束练习」（★ 点评＋打分＋落库 ✓ 服务器做 ✓）
+  if (req.method === 'POST' && req.url === '/api/voice-roleplay/end') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      let o = {};
+      try { o = JSON.parse(body || '{}'); } catch (e) { o = {}; }
+      const dev = pickDeviceId(req, null, o);
+      if (!checkDeviceSecret(pickSecret(req, null, o), dev)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '设备密钥错误' }));
+        return;
+      }
+      const s = dev ? _rpSessions.get(dev) : null;
+      // ★ 没在练（或没开场）⇒ ★ **不点评、不算一次练习** ✗（★ 与静默超时同一条口径 ✓）
+      if (!s || s.mode !== 'roleplay' || !s.msgs || !s.msgs.length) {
+        if (dev) _rpSessions.delete(dev);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, skipped: 'not_in_roleplay' }));
+        return;
+      }
+      try {
+        const debriefText = await rpDebrief(dev, s);     // ★ 内部已落库 ✓
+        // ★ 再取一次库里的这条，把结构化分数回给屏 ✓（rpDebrief 已 delete 会话 ✓）
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+          ok: true,
+          result: { debrief_text: debriefText, saved: true }
+        }));
+      } catch (e) {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
   if (req.method === 'GET' && req.url.startsWith('/api/duty/pull')) {
     const q = getQuery(req.url);
     const dev = pickDeviceId(req, q, null);
