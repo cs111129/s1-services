@@ -3514,7 +3514,9 @@ function validateSetConfig(o) {
   }
 
   // POST /api/tts - TTS
-  if (req.method === 'POST' && req.url === '/api/tts') {
+  // ★★★ 2026-10-21：★ 原来是 `req.url === '/api/tts'` ✗ —— ★ 带 query（?format=ulaw8）就匹配不上 ⇒ 404 ✗
+//   ★ 判据：**req.url 含 query string** ✗ ⇒ 精确匹配只对"无参数"的请求成立 ✓
+if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
     // ★ CR-20260924-01 加固：限频 + 限大小（同上）
     if (voiceRateLimited(req)) { voiceRateReply(res); return; }
     if (voiceTooLargeByHeader(req)) { voiceTooLargeReply(res); return; }
