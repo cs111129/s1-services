@@ -1578,6 +1578,9 @@ const _rpStartPending = new Set();      // device：本回合被判定为"开始
 const RP_MAX_TURNS = 6;                 // ★ 满 6 轮自动收尾 ✓（用户拍板 ✓）
 const RP_IDLE_MS = 5 * 60 * 1000;       // ★ 静默 5 分钟 ⇒ 自动退出 ✓（用户拍板 ✓）
 const RP_ON = String(process.env.ROLEPLAY_ON || '1') !== '0';   // ★ 回退开关 ✓ 置 0 立即回到"只当小星" ✓
+// ★★ 对练自己的超时（★ 端点里的 LLM_TIMEOUT_MS 是**函数内**的 ✓ 这里在模块级 ⇒ 用不了 ✗
+//   ★ 这就是 2026-10-21 那次 LLM_TIMEOUT_MS is not defined 的根因 ✓
+const RP_LLM_TIMEOUT_MS = 20000;
 const RP_END_WORDS = /(结束|不练了|不玩了|停下|停止|退出|算了|够了|到此为止|结束练习|结束对练)/;
 
 // ★ 场景缓存（★ 200 个 48KB ✓ 别每次读盘 ✓ 10 分钟 ✓）
@@ -1647,7 +1650,7 @@ function rpDebriefPrompt(scene, msgs) {
 // ★ 调模型（★ 对练专用 ✓ 温度 0.6 ✓ 演戏需要点变化 ✓）
 async function rpCallLLM(system, msgs, maxTokens) {
   const ac = new AbortController();
-  const tid = setTimeout(() => ac.abort(), LLM_TIMEOUT_MS);
+  const tid = setTimeout(() => ac.abort(), RP_LLM_TIMEOUT_MS);
   try {
     const r = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST', signal: ac.signal,
@@ -1699,7 +1702,7 @@ async function rpDebrief(device, s) {
   if (!comment) comment = '练完了。下次记得先把对方的话听完再答，别急着解释。';
   await rpSaveLog(device, scene, scores, total, grade, s.turns, comment);
   _rpSessions.delete(device);      // ★★ **清会话** ✗ 对练历史绝不进小星的上下文 ✓
-  const reply = '练完了——' + comment
+  const reply = (comment.indexOf('练完了') === 0 ? comment : ('练完了——' + comment))
     + ' 三个分：交流深度 ' + scores['交流深度'] + '、专业度 ' + scores['专业度']
     + '、应对合理性 ' + scores['应对合理性'] + '，合计 ' + total + ' 分，' + grade + ' 级。'
     + ' 想再来一遍就说「开始对练」。';
