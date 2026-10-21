@@ -1456,7 +1456,7 @@ function speakable(s) {
  */
 const LEARN_KINDS = ['overview', 'points', 'exams', 'practices', 'courses', 'plan', 'duty'];
 async function routeIntent(text) {
-  const NONE = { web: false, learning: null };
+  const NONE = { web: false, learning: null, roleplay: false };
   if (!DEEPSEEK_KEY) return NONE;              // ★ 学习数据也要模型判定 ⇒ 没 key 两个都不做 ✓
   const ac = new AbortController();
   const tid = setTimeout(() => ac.abort(), 6000);
@@ -1483,6 +1483,10 @@ async function routeIntent(text) {
             '   plan      = 学习计划 / 储备人才计划进度',
             '   duty      = 今天的岗位职责任务（"我今天要做什么/还有什么没做"）',
             '   ★★ 只能查【本人】✗ —— 问别人的一律**不调**（工具查不到 ✓ 你也别编 ✓）',
+            '',
+            '③ start_roleplay —— 用户想**练场景 / 做对练 / 角色扮演**时调用（无参数）',
+            '   ★ 例如：「开始对练」「练个场景」「我想练练」「来一次情景模拟」「陪我练一下投诉」',
+            '   ★ 不是："跟我聊聊天"（那是闲聊）、"我考试考得怎么样"（那是查数据）',
           ].join('\n') },
           { role: 'user', content: String(text || '') },
         ],
@@ -1493,16 +1497,19 @@ async function routeIntent(text) {
             parameters: { type: 'object', properties: {
               kind: { type: 'string', enum: LEARN_KINDS },
             }, required: ['kind'] } } },
+          { type: 'function', function: { name: 'start_roleplay', description: '用户想练场景/做对练/角色扮演时调用',
+            parameters: { type: 'object', properties: {} } } },
         ],
         tool_choice: 'auto',
       }),
     });
     const j = await r.json();
     const tcs = (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.tool_calls) || [];
-    let web = false, learning = null;
+    let web = false, learning = null, roleplay = false;
     for (const tc of tcs) {
       const fn = tc && tc.function && tc.function.name;
       if (fn === 'web_search' && WEB_SEARCH_ON) web = true;
+      if (fn === 'start_roleplay' && RP_ON) roleplay = true;
       if (fn === 'get_learning_summary') {
         let k = null;
         try { k = JSON.parse(tc.function.arguments || '{}').kind; } catch (e) { k = null; }
@@ -1510,7 +1517,7 @@ async function routeIntent(text) {
         learning = (LEARN_KINDS.indexOf(k) >= 0) ? k : 'overview';
       }
     }
-    return { web, learning };
+    return { web, learning, roleplay };
   } catch (e) {
     _webFail++;
     log(`ROUTE ⚠️ 意图判定失败（第 ${_webFail} 次，按"都不做"处理 ✓）: ${e.message}`);
@@ -1538,6 +1545,294 @@ async function learningSummary(device, kind) {
     log(`LEARN ⚠️ 取学习数据异常: ${e.message}（★ 按"没查到"处理 ✓）`);
     return null;
   }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * ★★★ 语音对练 · 独立智能体（2026-10-21 定格「丙」✗）
+ *
+ *   ★★ 用户原话：「能不能『对练功能』走第二个智能体路由？这样就不怕和小星的
+ *      数据搞混了，且练习完成以后的数据是要进 S2 服务器数据库的」
+ *   ★ 用户拍板：① **丙**（同一个 HTTP 入口 ✓ 内部两套完全独立的会话池 ✓）
+ *                ② **认**（对练静默 5 分钟自动收尾 ✓）
+ *                ③ **丙：不能**（对练期间不许用小星别的功能 ✓ 说天气也按角色回 ✓）
+ *
+ *   ★★★ "独立"体现在四样东西**全部私有** ✗（★ 与小星**零共享** ✓）：
+ *     ① `_rpSessions`  ← 会话池（★ 与小星的 `_chatSessions` **不是一张表** ✗）
+ *     ② `rpSystemPrompt()` ← 提示词（★ **不含**小星人设/企业文化/学习数据工具 ✗）
+ *     ③ 历史（★ 对练的 msgs **永远不进**小星的上下文 ✓ 反之亦然 ✓）
+ *     ④ 出口与超时（★ 对练静默 5 分钟 ⇒ 只收对练 ✓ 不影响小星 TTL ✓）
+ *
+ *   ★★ 为什么④必须独立 ✗：★ 小星的 TTL 是"话题过期" ✓ 对练的 5 分钟是"人走了 ✓
+ *     别一直演客人" ✓ —— ★ **语义不同** ✓ 共用一个会互相误伤 ✓
+ *
+ *   ★★ 三种出口（★ 缺一不可 ✗ 规格书 §2 ✓）：
+ *     ① 用户明说：结束 / 不练了 / 停 ✓
+ *     ② 满 6 轮 ✓（★ 防止一直聊 ✓）
+ *     ③ 静默 5 分钟 ✓（★ 进程重启 ⇒ 表清空 ⇒ 自动回 normal ✓ 安全降级 ✓）
+ *
+ *   ★ 数据落 S2：`POST /api/voice/practice-log`（★ 已上线 ✓ 实测写进 practices ✓）
+ *     ★ 归属 `dev_id → device_binding` ✓ 未绑定 ⇒ 不落库也不报错 ✓
+ * ════════════════════════════════════════════════════════════════════════ */
+const _rpSessions = new Map();          // device -> { mode, scene, sceneId, sceneName, module, turns, msgs:[], at }
+const _rpStartPending = new Set();      // device：本回合被判定为"开始对练" ✓ 下一次调用进 picking
+const RP_MAX_TURNS = 6;                 // ★ 满 6 轮自动收尾 ✓（用户拍板 ✓）
+const RP_IDLE_MS = 5 * 60 * 1000;       // ★ 静默 5 分钟 ⇒ 自动退出 ✓（用户拍板 ✓）
+const RP_ON = String(process.env.ROLEPLAY_ON || '1') !== '0';   // ★ 回退开关 ✓ 置 0 立即回到"只当小星" ✓
+const RP_END_WORDS = /(结束|不练了|不玩了|停下|停止|退出|算了|够了|到此为止|结束练习|结束对练)/;
+
+// ★ 场景缓存（★ 200 个 48KB ✓ 别每次读盘 ✓ 10 分钟 ✓）
+let _rpSceneCache = { at: 0, data: null };
+async function rpLoadScenes() {
+  if (_rpSceneCache.data && Date.now() - _rpSceneCache.at < 10 * 60 * 1000) return _rpSceneCache.data;
+  try {
+    const r = await fetch('https://ai.hiiin.com/api/voice/scenes',
+      { headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` }, signal: AbortSignal.timeout(5000) });
+    if (!r || !r.ok) return _rpSceneCache.data;
+    const j = await r.json();
+    if (j && j.ok && Array.isArray(j.scenes)) {
+      _rpSceneCache = { at: Date.now(), data: j };
+      log(`ROLEPLAY 场景库已缓存：${j.total} 个 / ${(j.modules || []).length} 个模块 ✓`);
+    }
+    return _rpSceneCache.data;
+  } catch (e) { log(`ROLEPLAY ⚠️ 场景库拉取失败: ${e.message}`); return _rpSceneCache.data; }
+}
+
+// ★★ 对练提示词（★ **只演** ✗ 不评价 ✓ 不带小星人设/文化/工具 ✗✗）
+function rpSystemPrompt(scene, turn) {
+  return [
+    '★★ 你现在**不是**助手，你是场景里的一个**具体角色**（客人 / 员工 / 同事）✗✗',
+    '',
+    '【场景】' + scene.name + '（' + (scene.module || '') + ' · 难度 ' + (scene.difficulty || '') + '）',
+    '【情境】' + (scene.description || ''),
+    '【对方身份】一线门店员工（学员）· 【你的身份】这个场景里的对手方',
+    '',
+    '【硬规则】',
+    '1. ★ 每轮只说 1~3 句 ✓ 口语 ✓ 像真人在说话 ✓ 别写成小说 ✗',
+    '2. ★ 第一句要把情境**自然带出** ✓ —— ★ **不许**念"场景：xxx"✗（那是播报 ✓ 不是演戏 ✓）',
+    '3. ★★ **绝不点评、绝不指导、绝不提"你应该…"** ✗✗ —— 你现在是客人/员工 ✓ 不是教练 ✓',
+    '4. ★ 用户说什么都**顺着演** ✓ 不纠正 ✓ 不跳出 ✓ 不解释规则 ✓',
+    '5. ★ 有情绪就带情绪 ✓（客人会不耐烦 ✓ 员工会委屈 ✓）—— 这才像真场景 ✓',
+    '6. ★★ 只输出角色的台词 ✗ —— **不要**旁白、不要括号解释、不要任何前缀 ✗',
+    '',
+    '【进度】第 ' + turn + ' / ' + RP_MAX_TURNS + ' 轮'
+  ].join('\n');
+}
+
+// ★★ 收尾点评（★ 此时才切回教练 ✓ 可用小星的语气 ✓）
+function rpDebriefPrompt(scene, msgs) {
+  const dialog = msgs.map(function (m) {
+    return (m.role === 'user' ? '员工' : '对方') + '：' + m.content;
+  }).join('\n');
+  return [
+    '你是门店带教教练，刚陪员工练完一个场景，现在给**收尾点评**。',
+    '',
+    '【场景】' + scene.name + '（' + (scene.module || '') + '）',
+    '【情境】' + (scene.description || ''),
+    '',
+    '【对话记录】',
+    dialog,
+    '',
+    '【评分维度】★ 就用这三个 ✗（与学员端口径一致 ✓ 别自造维度 ✗）',
+    '  · 交流深度（0~34）：有没有问清问题、听懂对方真正在意的',
+    '  · 专业度（0~33）：流程/标准有没有说到位',
+    '  · 应对合理性（0~33）：处理是否得当、有没有踩坑',
+    '★ 三项加起来满分 100 ✓',
+    '',
+    '★★ 只输出**严格 JSON** ✗（不要解释、不要 markdown 代码块）：',
+    '{"交流深度":28,"专业度":30,"应对合理性":26,"点评":"不超过 80 字，先说一个亮点，再说一个改进点"}',
+    '★★ 点评**必须 ≤ 80 字** ✗ —— 设备上要念出来的 ✓ 长了没人听 ✓'
+  ].join('\n');
+}
+
+// ★ 调模型（★ 对练专用 ✓ 温度 0.6 ✓ 演戏需要点变化 ✓）
+async function rpCallLLM(system, msgs, maxTokens) {
+  const ac = new AbortController();
+  const tid = setTimeout(() => ac.abort(), LLM_TIMEOUT_MS);
+  try {
+    const r = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Authorization': `Bearer ${DEEPSEEK_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-chat', temperature: 0.6, max_tokens: maxTokens || 160,
+        messages: [{ role: 'system', content: system }].concat(msgs)
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
+    return String((j.choices && j.choices[0] && j.choices[0].message.content) || '').trim();
+  } finally { clearTimeout(tid); }
+}
+
+// ★ 落库到 S2（★ 失败只记日志 ✓ 不能让"写库失败"毁掉用户的练习体验 ✓）
+async function rpSaveLog(device, scene, scores, total, grade, turns, feedback) {
+  try {
+    const r = await fetch('https://ai.hiiin.com/api/voice/practice-log', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dev_id: device, scene: scene.name, scores, total, grade, turns, feedback }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const j = await r.json();
+    if (j && j.ok) log(`ROLEPLAY ✓ 已落库 id=${j.id || '-'} ${j.student || '(未绑定)'} ${total}分 ${grade}（${turns} 轮）`);
+    else log(`ROLEPLAY ⚠️ 落库失败: ${JSON.stringify(j).slice(0, 120)}`);
+  } catch (e) { log(`ROLEPLAY ⚠️ 落库异常: ${e.message}（★ 不影响用户 ✓）`); }
+}
+
+// ★★ 收尾：点评 ＋ 打分 ＋ 落库 ＋ **清会话** ✗
+async function rpDebrief(device, s) {
+  const scene = s.scene || { name: s.sceneName || '', module: s.module || '', description: '' };
+  let parsed = null;
+  try {
+    const out = await rpCallLLM(rpDebriefPrompt(scene, s.msgs), [{ role: 'user', content: '请给收尾点评（严格 JSON）' }], 320);
+    const m = out.match(/\{[\s\S]*\}/);
+    if (m) parsed = JSON.parse(m[0]);
+  } catch (e) { log(`ROLEPLAY ⚠️ 收尾点评失败: ${e.message}（★ 用兜底分 ✓）`); }
+  const scores = {
+    '交流深度': Math.max(0, Math.min(34, parseInt(parsed && parsed['交流深度'], 10) || 20)),
+    '专业度': Math.max(0, Math.min(33, parseInt(parsed && parsed['专业度'], 10) || 20)),
+    '应对合理性': Math.max(0, Math.min(33, parseInt(parsed && parsed['应对合理性'], 10) || 20))
+  };
+  const total = scores['交流深度'] + scores['专业度'] + scores['应对合理性'];
+  const grade = total >= 90 ? 'S' : (total >= 80 ? 'A' : (total >= 70 ? 'B' : (total >= 60 ? 'C' : 'D')));
+  let comment = String((parsed && parsed['点评']) || '').trim();
+  if (comment.length > 80) comment = comment.slice(0, 78) + '…';
+  if (!comment) comment = '练完了。下次记得先把对方的话听完再答，别急着解释。';
+  await rpSaveLog(device, scene, scores, total, grade, s.turns, comment);
+  _rpSessions.delete(device);      // ★★ **清会话** ✗ 对练历史绝不进小星的上下文 ✓
+  const reply = '练完了——' + comment
+    + ' 三个分：交流深度 ' + scores['交流深度'] + '、专业度 ' + scores['专业度']
+    + '、应对合理性 ' + scores['应对合理性'] + '，合计 ' + total + ' 分，' + grade + ' 级。'
+    + ' 想再来一遍就说「开始对练」。';
+  log(`ROLEPLAY ✓ 收尾（${scene.name} / ${s.turns} 轮 / ${total}分 ${grade}）`);
+  return reply;
+}
+
+/**
+ * ★★ 对练回合的统一入口（★ 两个端点都调它 ✓ 不重复写 ✓）
+ *   ★ 返回 `null` ⇒ **不是对练回合** ✓ 调用方走原路（★ 小星路径**一字不改** ✓）
+ *   ★ 返回 `{reply, handled:true}` ⇒ ★ 这个回合归对练 ✓ 调用方**直接回** ✗
+ */
+async function rpHandleTurn(device, heard) {
+  if (!RP_ON || !device) return null;
+  const s = _rpSessions.get(device);
+
+  // ── ① 已在对练 / 选场景中 ──
+  if (s) {
+    // ★ 出口③：静默超时 ✓（★ 不点评 ✓ 不算一次练习 ✓）
+    if (Date.now() - s.at > RP_IDLE_MS) {
+      log(`ROLEPLAY 静默 ${Math.round((Date.now() - s.at) / 1000)}s ⇒ 自动退出（★ 不点评 ✓ 不算练习 ✓）`);
+      _rpSessions.delete(device);
+      return { reply: '你走开了吧？那这次不算练完。想练的时候说「开始对练」。', handled: true };
+    }
+    s.at = Date.now();
+
+    // ★ 出口①：用户明说结束 ✓
+    if (RP_END_WORDS.test(heard)) {
+      if (s.mode !== 'roleplay' || !s.msgs || !s.msgs.length) {
+        _rpSessions.delete(device);
+        return { reply: '行，那先不练了。想练了再叫我。', handled: true };
+      }
+      return { reply: await rpDebrief(device, s), handled: true };
+    }
+
+    // ── 选场景中：★ **两层** ✗ —— 先说模块 ✓ 再说场景名 ✓（规格书 §3 ✓）──
+    if (s.mode === 'picking') {
+      // ① 还在选模块 ⇒ 认模块名 ✓ 然后报该模块下的场景（★ 最多 3 个 ＋ "还有 N 个" ✓）
+      if (s.stage !== 'scene') {
+        const mods = s.modules || [];
+        const mHit = mods.find(function (m) {
+          return heard.indexOf(m.module) >= 0 || m.module.indexOf(heard) >= 0;
+        });
+        if (!mHit) {
+          const head = mods.slice(0, 6).map(function (m) { return m.module; });
+          return { reply: '这几个方向里挑一个：' + head.join('、') + '。', handled: true };
+        }
+        const inMod = (s.allScenes || []).filter(function (x) { return x.module === mHit.module; });
+        const top = inMod.slice(0, 3);
+        // ★ 只留这个模块的场景 ✓ 下一句按场景名匹配 ✓
+        s.pending = inMod;
+        s.stage = 'scene';
+        s.at = Date.now();
+        const moreN = inMod.length > 3 ? ('，还有 ' + (inMod.length - 3) + ' 个我没念') : '';
+        return {
+          reply: mHit.module + '有 ' + inMod.length + ' 个。先说这三个：'
+            + top.map(function (x) { return x.name; }).join('、') + moreN + '。说名字就行。',
+          handled: true,
+          scenes: inMod.map(function (x) { return { id: x.id, name: x.name }; })
+        };
+      }
+      // ② 选场景 ⇒ 匹配上就开场 ✓
+      const list = s.pending || [];
+      const hit = list.find(function (x) {
+        return heard.indexOf(x.name) >= 0 || x.name.indexOf(heard) >= 0
+          || (x.name.length > 4 && heard.indexOf(x.name.slice(0, 5)) >= 0);
+      });
+      if (!hit) {
+        return { reply: '没对上号。你就说场景名字，比如「' + ((list[0] && list[0].name) || '客户投诉空调太冷') + '」。', handled: true };
+      }
+      s.mode = 'roleplay'; s.scene = hit; s.sceneId = hit.id; s.sceneName = hit.name; s.module = hit.module;
+      s.msgs = []; s.turns = 0; s.at = Date.now();
+      log(`ROLEPLAY ▶ 开始「${hit.name}」(${hit.id} / ${hit.module}) device=${device}`);
+      let open = '';
+      try {
+        open = await rpCallLLM(rpSystemPrompt(hit, 1), [{
+          role: 'user', content: '（对练开始。请以角色身份说第一句话，把上面的情境自然带出来，1~3 句，不要旁白。）'
+        }], 180);
+      } catch (e) {
+        open = '你好，我这边有个事想跟你说一下。';
+        log(`ROLEPLAY ⚠️ 开场失败: ${e.message}（★ 用兜底开场 ✓）`);
+      }
+      s.msgs.push({ role: 'assistant', content: open });
+      s.turns = 1;
+      return { reply: open, handled: true };
+    }
+
+    // ── 扮演中：★ 只演 ✓ 不评价 ✓ ──
+    s.msgs.push({ role: 'user', content: heard });
+    if (s.msgs.length > RP_MAX_TURNS * 3) s.msgs.shift();
+    let out = '';
+    try {
+      out = await rpCallLLM(rpSystemPrompt(s.scene, Math.min(s.turns + 1, RP_MAX_TURNS)), s.msgs.slice(-8), 180);
+    } catch (e) {
+      log(`ROLEPLAY ⚠️ 演回合失败: ${e.message}`);
+      return { reply: '（对方没接话，好像信号断了。再说一遍？）', handled: true };
+    }
+    s.msgs.push({ role: 'assistant', content: out });
+    s.turns++;
+    s.at = Date.now();
+    // ★ 出口②：满 6 轮 ✓ 自动收尾 ✓
+    if (s.turns >= RP_MAX_TURNS) {
+      const debrief = await rpDebrief(device, s);
+      return { reply: out + ' ' + debrief, handled: true };
+    }
+    return { reply: out, handled: true };
+  }
+
+  // ── ② 不在对练中 ──
+  //   ★★ "开始对练"由 `routeIntent` 判定 ✓（★ 模型决定 ✓ 不硬编码关键词 ✓）
+  if (_rpStartPending.has(device)) {
+    _rpStartPending.delete(device);
+    const sj = await rpLoadScenes();
+    if (!sj || !sj.scenes || !sj.scenes.length) {
+      return { reply: '场景库这会儿没拉到，等下再试试。', handled: true };
+    }
+    // ★ 一层一层报 ✗ —— 先报模块（★ 10 个 ⇒ 只念前 6 ＋ "还有 N 个" ✓ 规格书 §3 ✓）
+    const mods = sj.modules || [];
+    const head = mods.slice(0, 6).map(function (m) { return m.module; });
+    const more = mods.length > 6 ? ('，还有 ' + (mods.length - 6) + ' 个别的') : '';
+    // ★ 记住全量场景 ✓ 选模块后按 module 过滤 ✓（★ stage='module' ⇒ 先认模块 ✓）
+    _rpSessions.set(device, {
+      mode: 'picking', stage: 'module',
+      modules: mods, allScenes: sj.scenes || [],
+      pending: [], turns: 0, msgs: [], at: Date.now()
+    });
+    return {
+      reply: '行，练哪个方向？' + head.join('、') + more + '。说一个就行，屏幕上也看得到全部。',
+      handled: true,
+      modules: mods
+    };
+  }
+  return null;
 }
 
 async function routeNeedsWeb(text) {
@@ -3395,9 +3690,32 @@ function validateSetConfig(o) {
         //    ★ 为什么并行：检索只要 0.12~0.27s ✓ 而路由要 0.7~1.1s ✓
         //      ⇒ 串行的话白等一次 ✓；并行则"等路由"的时间把检索藏掉了 ✓
         // ★ 2026-10-20：`routeNeedsWeb` → `routeIntent`（★ 一次判定"联网／查学习数据"两件事 ✓）
-        const intentP = routeIntent(heard);
+        // ★★ 语音对练（独立智能体 ✗）：已在会话中 ⇒ **直接处理并回** ✓
+        //   ★ 关键：此时**不进 routeIntent** ✗ —— 省一次往返 ✓ 且对练回合归对练 ✓
+        if (RP_ON && device && _rpSessions.has(device)) {
+          try {
+            const rpA = await rpHandleTurn(device, heard);
+            if (rpA && rpA.handled) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: true, reply: rpA.reply, heard: heard, roleplay: true, modules: rpA.modules || undefined, scenes: rpA.scenes || undefined }));
+              return;
+            }
+          } catch (e) { log('ROLEPLAY ⚠️ 回合异常（★ 退回小星 ✓）: ' + e.message); }
+        }        const intentP = routeIntent(heard);
         const kb = await kbSearchForVoice(heard);
         const intent = await intentP;
+        // ★★ 路由判定"用户想开始对练" ⇒ **立刻进对练** ✓（★ 不落到小星的能力里 ✗）
+        if (RP_ON && device && intent.roleplay && !_rpSessions.has(device)) {
+          _rpStartPending.add(device);
+          try {
+            const rpB = await rpHandleTurn(device, heard);
+            if (rpB && rpB.handled) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: true, reply: rpB.reply, heard: heard, roleplay: true, modules: rpB.modules || undefined, scenes: rpB.scenes || undefined }));
+              return;
+            }
+          } catch (e) { _rpStartPending.delete(device); log('ROLEPLAY ⚠️ 启动异常（★ 退回小星 ✓）: ' + e.message); }
+        }
         const needWeb = intent.web;
         // ★★ 学习数据（★ 数字由 S2 算 ✓ 这里只搬运 ✓）；与知识库**并行**取 ✓ 不占路由时间 ✓
         const toolData = intent.learning ? await learningSummary(device, intent.learning) : null;
@@ -3707,10 +4025,33 @@ function validateSetConfig(o) {
         // ★★ 知识库检索 与 【意图路由】**并行发** ✗（CR-20261012-03 §6.1 ✓）
         //   ★ 2026-10-20：`routeNeedsWeb` → `routeIntent`（★ 一次判"联网／查学习数据"✓）
         //     ★ 命令回合不叫模型 ⇒ 直接给空意图 ✓（★ 省一次往返 ✓）
-        const intentP = vcS ? Promise.resolve({ web: false, learning: null }) : routeIntent(heard);
+        // ★★ 语音对练（独立智能体 ✗）：已在会话中 ⇒ **直接处理并回** ✓
+        //   ★ 关键：此时**不进 routeIntent** ✗ —— 省一次往返 ✓ 且对练回合归对练 ✓
+        if (RP_ON && device && _rpSessions.has(device)) {
+          try {
+            const rpA = await rpHandleTurn(device, heard);
+            if (rpA && rpA.handled) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: true, reply: rpA.reply, heard: heard, roleplay: true, modules: rpA.modules || undefined, scenes: rpA.scenes || undefined }));
+              return;
+            }
+          } catch (e) { log('ROLEPLAY ⚠️ 回合异常（★ 退回小星 ✓）: ' + e.message); }
+        }        const intentP = vcS ? Promise.resolve({ web: false, learning: null, roleplay: false }) : routeIntent(heard);
         const kb = vcS ? { ok: true, results: [], reliable: true, maxScore: 0 }
                        : await kbSearchForVoice(heard);
         const intent = await intentP;
+        // ★★ 路由判定"用户想开始对练" ⇒ **立刻进对练** ✓（★ 不落到小星的能力里 ✗）
+        if (RP_ON && device && intent.roleplay && !_rpSessions.has(device)) {
+          _rpStartPending.add(device);
+          try {
+            const rpB = await rpHandleTurn(device, heard);
+            if (rpB && rpB.handled) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: true, reply: rpB.reply, heard: heard, roleplay: true, modules: rpB.modules || undefined, scenes: rpB.scenes || undefined }));
+              return;
+            }
+          } catch (e) { _rpStartPending.delete(device); log('ROLEPLAY ⚠️ 启动异常（★ 退回小星 ✓）: ' + e.message); }
+        }
         const needWeb = intent.web;
         // ★ 学习数据（★ 数字由 S2 算 ✓ 失败按"没查到"✓ 绝不编 ✗）
         const toolData = intent.learning ? await learningSummary(device, intent.learning) : null;
