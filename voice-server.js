@@ -1576,7 +1576,11 @@ async function learningSummary(device, kind) {
 const _rpSessions = new Map();          // device -> { mode, scene, sceneId, sceneName, module, turns, msgs:[], at }
 const _rpStartPending = new Set();      // device：本回合被判定为"开始对练" ✓ 下一次调用进 picking
 const RP_MAX_TURNS = 6;                 // ★ 满 6 轮自动收尾 ✓（用户拍板 ✓）
-const RP_IDLE_MS = 5 * 60 * 1000;       // ★ 静默 5 分钟 ⇒ 自动退出 ✓（用户拍板 ✓）
+// ★ 静默超时（★ 用户拍板 5 分钟 ✓）
+//   ★★ 2026-10-21：允许 env 覆盖 ✗ —— ★ 否则"静默 5 分钟自动退出"这条**永远没法验** ✓
+//     （★ 真等 5 分钟 = 让用户干等 ✗ 违反本项目的输出纪律 ✓）
+//   ★ 生产不设 ⇒ 默认 5 分钟 ✓；验的时候临时设 6 秒 ✓ 验完删掉 ✓
+const RP_IDLE_MS = Math.max(3000, parseInt(process.env.ROLEPLAY_IDLE_MS, 10) || (5 * 60 * 1000));
 const RP_ON = String(process.env.ROLEPLAY_ON || '1') !== '0';   // ★ 回退开关 ✓ 置 0 立即回到"只当小星" ✓
 // ★★ 对练自己的超时（★ 端点里的 LLM_TIMEOUT_MS 是**函数内**的 ✓ 这里在模块级 ⇒ 用不了 ✗
 //   ★ 这就是 2026-10-21 那次 LLM_TIMEOUT_MS is not defined 的根因 ✓
@@ -2372,10 +2376,19 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: true, total: sj.total, modules: sj.modules || [], scenes: [], count: 0 }));
         return;
       }
-      const scenes = sj.scenes.filter(function (x) { return x.module === wantMod; });
+      const allInMod = sj.scenes.filter(function (x) { return x.module === wantMod; });
+      // ★★ 2026-10-21 实测：★ 20 条 = **4006 字节** ✗ 而设备缓冲 **4096** ⇒ **只剩 90 字节** ✗✗
+      //   ★ 场景名一变长 / 加一个字段 ⇒ **立刻回到静默截断** ✓
+      //   ⇒ ★ **默认只回 12 条**（约 2.4 KB ✓ 留一半余量 ✓）＋ 支持 `?limit=`（上限 20 ✓）
+      //   ★ 判据：**贴着缓冲边界跑 = 迟早出事** ✗ 余量必须留一半 ✓
+      let lim = parseInt(q.limit, 10);
+      if (!(lim > 0)) lim = 12;
+      if (lim > 20) lim = 20;
+      const scenes = allInMod.slice(0, lim);
       res.end(JSON.stringify({
         ok: true, total: sj.total, modules: sj.modules || [],
-        module: wantMod, scenes: scenes, count: scenes.length
+        module: wantMod, in_module: allInMod.length, limit: lim,
+        scenes: scenes, count: scenes.length
       }));
     }).catch(function (e) {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
