@@ -95,6 +95,36 @@ const CAM_INGEST_TOKEN = loadIngestToken();
 //   ★ 判据：**一个端点的缺陷，不该等于全站语音不可用** ✗
 //   ★★ 这里只**记日志、不退出** ✓ —— 注意这只兜"没人接的异常" ✓
 //      真正的修法是每个 handler 自己 try/catch ✓（那个还得逐个补 ✓）
+/* ══════════════════════════════════════════════════════════════════════
+ * ★★★ keep-alive 超时（2026-10-21 依设备端回执 ✗✗ 这条很关键）
+ *
+ *   ★★ 设备端的推理（★ 我认为是对的 ✓）：
+ *     ① 他们对练页**整个会话只用一条 TLS 连接**（复用 ✓ 省 2.4 s/轮）
+ *     ② ★ 而复用的前提是**服务端没把它关掉** ✗
+ *     ③ ★ Node 默认 `server.keepAliveTimeout` = **5 秒** ✗
+ *        ⇒ 对练回合间隔常常 > 5 s（用户在说话/在听）⇒ ★ **对面已经关了** ✗
+ *     ④ 于是他们 `fetch_headers` 时**先撞死连接**（TCP 要等发送失败/超时 ✗）
+ *        ＋ **再重连握手** ⇒ ★ 这几秒被他们记进「等到响应头」
+ *        ⇒ ★★ **看起来像"服务器慢"** ✗ 而我这边 `t5` 早就发出了 ✓
+ *     ⑤ ★ 这与我测的 `t0→t5 = 4027 ms` **完全自洽** ✓
+ *        （9377 − 4027 = 5350 ms 全在"死连接上白等"✓）
+ *
+ *   ★ 判据：★ **"我方 t5 已发出" 与 "对方 t1→t5 9.4s" 同时成立** ⇒
+ *     矛盾 ⇒ ★ **一定有东西在"我方发完之后"变慢** ✗
+ *     ★ 第一个该怀疑的就是 **连接被提前关掉** ✓（不是带宽 ✓ 不是处理 ✓）
+ *
+ *   ★ 修：★ keepAliveTimeout **65 s** ✓（> 他们 8 秒一次的 state 轮询 ✓ 也 > 说话时长 ✓）
+ *     ＋ headersTimeout 必须 **> keepAliveTimeout** ✗（Node 会断言 ✓）
+ *   默认值（★ 记住 ✗）：keepAliveTimeout = 5 s · headersTimeout = 60 s · requestTimeout = 300 s
+ * ══════════════════════════════════════════════════════════════════════ */
+function tuneKeepAlive(srv) {
+  try {
+    srv.keepAliveTimeout = 65000;      // ★ 从默认 5s → 65s ✓
+    srv.headersTimeout = 66000;        // ★ 必须比 keepAliveTimeout 大 ✓
+    srv.requestTimeout = 120000;       // ★ 对练回合最长也就 ~10s ✓ 给足 ✓
+    log('HTTP keep-alive: keepAliveTimeout=65s headersTimeout=66s requestTimeout=120s ✓（★ 默认 5s 会让设备复用连接时撞死连接 ✗）');
+  } catch (e) { log('keep-alive 调优失败: ' + e.message); }
+}
 process.on('uncaughtException', (e) => {
   try { log(`💥 uncaughtException（★ 已兜住，进程继续 ✓）: ${e && e.stack ? String(e.stack).split('\n').slice(0, 4).join(' | ') : e}`); } catch (_) {}
 });
@@ -4841,6 +4871,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
   res.end('Not Found');
 });
 
+tuneKeepAlive(server);
 server.listen(PORT, '0.0.0.0', () => {
   log(`语音服务器启动在 0.0.0.0:${PORT}`);
 });
