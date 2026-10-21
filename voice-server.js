@@ -2353,6 +2353,12 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ ok: false, error: '设备密钥错误' }));
       return;
     }
+    // ★★ 2026-10-21 依设备端回执修（★ 真 bug ✗）：
+    //   设备下行缓冲 **4 KB**（`downlink.c` `char buf[4096]` ✓ 读满即止 ✓ **不报错** ✗）
+    //   而 200 条场景 ≈ 十几 KB ⇒ ★ **静默截断** ✓ 设备分不出"被截断" ✗✗
+    //   ⇒ ★★ **不带 `module` 时只回模块清单**（★ 约 1 KB ✓ 安全 ✓）
+    //      ★ 设备先取清单 ⇒ 再按 module 取该模块 20 条（★ 约 2 KB ✓）
+    //   ★ 另给 `count` 与 `total` ✗ —— ★ 设备拿 `count` 和"解析出几条"对账 ✓ 对不上就报错 ✓
     const wantMod = String(q.module || '').trim();
     rpLoadScenes().then(function (sj) {
       if (!sj || !sj.scenes) {
@@ -2360,9 +2366,17 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, error: 'scenes_unavailable' }));
         return;
       }
-      const scenes = wantMod ? sj.scenes.filter(function (x) { return x.module === wantMod; }) : sj.scenes;
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: true, total: sj.total, modules: sj.modules || [], scenes: scenes }));
+      if (!wantMod) {
+        // ★ 只回菜单 ✓ 不回 scenes ✗（★ 免得十几 KB 把 4 KB 缓冲撑爆 ✓）
+        res.end(JSON.stringify({ ok: true, total: sj.total, modules: sj.modules || [], scenes: [], count: 0 }));
+        return;
+      }
+      const scenes = sj.scenes.filter(function (x) { return x.module === wantMod; });
+      res.end(JSON.stringify({
+        ok: true, total: sj.total, modules: sj.modules || [],
+        module: wantMod, scenes: scenes, count: scenes.length
+      }));
     }).catch(function (e) {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -2391,7 +2405,14 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true, active: true, mode: s.mode,
       scene: s.scene ? { id: s.scene.id, name: s.scene.name, module: s.scene.module } : null,
-      turns: s.turns || 0, max_turns: RP_MAX_TURNS
+      turns: s.turns || 0, max_turns: RP_MAX_TURNS,
+      // ★★ 2026-10-21 依设备端回执加 ✗：对方**最新一句**
+      //   ★ 用途：① 日志里能自证"轮次真的在推进" ✓ ② 将来要恢复屏上文字也直接有数据 ✓
+      last_reply: (function () {
+        const mm = s.msgs || [];
+        for (let i = mm.length - 1; i >= 0; i--) if (mm[i].role === 'assistant') return mm[i].content;
+        return '';
+      })()
     }));
     return;
   }
