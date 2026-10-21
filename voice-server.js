@@ -1586,6 +1586,7 @@ async function learningSummary(device, kind) {
  *   ★ 数据落 S2：`POST /api/voice/practice-log`（★ 已上线 ✓ 实测写进 practices ✓）
  *     ★ 归属 `dev_id → device_binding` ✓ 未绑定 ⇒ 不落库也不报错 ✓
  * ════════════════════════════════════════════════════════════════════════ */
+const _lastDebrief = new Map();   // device -> { total, grade, scores, comment }（★ end 响应要用 ✗）
 const _rpSessions = new Map();          // device -> { mode, scene, sceneId, sceneName, module, turns, msgs:[], at }
 const _rpStartPending = new Set();      // device：本回合被判定为"开始对练" ✓ 下一次调用进 picking
 const RP_MAX_TURNS = 6;                 // ★ 满 6 轮自动收尾 ✓（用户拍板 ✓）
@@ -1719,6 +1720,10 @@ async function rpDebrief(device, s) {
   if (comment.length > 80) comment = comment.slice(0, 78) + '…';
   if (!comment) comment = '练完了。下次记得先把对方的话听完再答，别急着解释。';
   await rpSaveLog(device, scene, scores, total, grade, s.turns, comment);
+  // ★★ 2026-10-21 依设备端递件补 ✗：★★ end 原来只回 debrief_text ✗ —— 而规格 §2.4
+  //   明确要 { total, grade, scores, comment, debrief_text } ✓ ⇒ ★ 实现与规格不一致 ✓ 我认 ✗
+  //   这里把结构化结果**存一份** ✓（★ 会话马上要 delete ✓ 存不进会话里 ✗）
+  _lastDebrief.set(device, { total: total, grade: grade, scores: scores, comment: comment });
   _rpSessions.delete(device);      // ★★ **清会话** ✗ 对练历史绝不进小星的上下文 ✓
   const reply = (comment.indexOf('练完了') === 0 ? comment : ('练完了——' + comment))
     + ' 三个分：交流深度 ' + scores['交流深度'] + '、专业度 ' + scores['专业度']
@@ -2820,12 +2825,25 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       try {
-        const debriefText = await rpDebrief(dev, s);     // ★ 内部已落库 ✓
-        // ★ 再取一次库里的这条，把结构化分数回给屏 ✓（rpDebrief 已 delete 会话 ✓）
+        const debriefText = await rpDebrief(dev, s);     // ★ 内部已落库 ✓ ＋ 已存 _lastDebrief ✓
+        // ★★ 2026-10-21 依设备端递件补全 ✗（★ 原来只回 debrief_text ✓ 屏上显示"没拿到分数" ✗）
+        //   ★ 规格 §2.4 的五件套：total / grade / scores / comment / debrief_text ✓
+        //   ★ 三条口径按他们要求 ✓：
+        //     ① `total` = **三个维度之和** ✓（0~100 ✓）
+        //     ② `comment` 与 `debrief_text` **都给** ✓ 允许相同 ✓
+        //     ③ `scores` 键名**保持中文** ✓（★ 他们按 key 直取 ✓ 改英文就取不到 ✗）
+        const lb = _lastDebrief.get(dev) || null;
+        _lastDebrief.delete(dev);                       // ★ 用完即清 ✓ 防串下一局 ✗
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({
           ok: true,
-          result: { debrief_text: debriefText, saved: true }
+          result: {
+            total: lb ? lb.total : 0,
+            grade: lb ? lb.grade : '',
+            scores: lb ? lb.scores : { '交流深度': 0, '专业度': 0, '应对合理性': 0 },
+            comment: lb ? lb.comment : '',
+            debrief_text: debriefText,
+          }
         }));
       } catch (e) {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
