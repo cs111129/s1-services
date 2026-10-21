@@ -1614,7 +1614,8 @@ function rpSystemPrompt(scene, turn) {
     '【对方身份】一线门店员工（学员）· 【你的身份】这个场景里的对手方',
     '',
     '【硬规则】',
-    '1. ★ 每轮只说 1~3 句 ✓ 口语 ✓ 像真人在说话 ✓ 别写成小说 ✗',
+        '1. ★★ 每轮只说 **1~2 句** ✗（★ **总字数 ≤ 40 字** ✗✗）口语 ✓ 像真人在说话 ✓ 别写成小说 ✗',
+    '   ★ 为什么卡这么死：★ 设备上要念出来 ✓ 长了没人听 ✓ 而且**生成字数直接等于等待时间** ✗',
     '2. ★ 第一句要把情境**自然带出** ✓ —— ★ **不许**念"场景：xxx"✗（那是播报 ✓ 不是演戏 ✓）',
     '3. ★★ **绝不点评、绝不指导、绝不提"你应该…"** ✗✗ —— 你现在是客人/员工 ✓ 不是教练 ✓',
     '4. ★ 用户说什么都**顺着演** ✓ 不纠正 ✓ 不跳出 ✓ 不解释规则 ✓',
@@ -1690,7 +1691,7 @@ async function rpDebrief(device, s) {
   const scene = s.scene || { name: s.sceneName || '', module: s.module || '', description: '' };
   let parsed = null;
   try {
-    const out = await rpCallLLM(rpDebriefPrompt(scene, s.msgs), [{ role: 'user', content: '请给收尾点评（严格 JSON）' }], 320);
+    const out = await rpCallLLM(rpDebriefPrompt(scene, s.msgs), [{ role: 'user', content: '请给收尾点评（严格 JSON）' }], 220);
     const m = out.match(/\{[\s\S]*\}/);
     if (m) parsed = JSON.parse(m[0]);
   } catch (e) { log(`ROLEPLAY ⚠️ 收尾点评失败: ${e.message}（★ 用兜底分 ✓）`); }
@@ -1721,6 +1722,24 @@ async function rpDebrief(device, s) {
  */
 async function rpHandleTurn(device, heard) {
   if (!RP_ON || !device) return null;
+  const _rt0 = Date.now();
+  const r = await _rpHandleTurnInner(device, heard);
+  // ★★ 2026-10-21 加：★ 对练回合**也记会话日志** ✗
+  //   ★ 起因：用户问"能看日志吗" ⇒ ★ 我说"分数在、对话没记" ✗
+  //     因为记日志的钩子挂在**正常问答分支** ✓ 而★ 对练分支是提前 return 的 ⇒ **跳过了** ✗
+  //   ★ 判据：**凡是有独立 return 的分支，都要自己记日志** ✗ 别指望主路径兜住 ✓
+  if (r && r.handled && r.reply) {
+    try {
+      logVoiceTurn({
+        device: device, question: heard, reply: r.reply,
+        action: '', params: null, mood: '',
+        latency_ms: Date.now() - _rt0, branch: 'roleplay',
+      });
+    } catch (e) {}
+  }
+  return r;
+}
+async function _rpHandleTurnInner(device, heard) {
   const s = _rpSessions.get(device);
 
   // ── ① 已在对练 / 选场景中 ──
@@ -1784,7 +1803,7 @@ async function rpHandleTurn(device, heard) {
       try {
         open = await rpCallLLM(rpSystemPrompt(hit, 1), [{
           role: 'user', content: '（对练开始。请以角色身份说第一句话，把上面的情境自然带出来，1~3 句，不要旁白。）'
-        }], 180);
+        }], 70);
       } catch (e) {
         open = '你好，我这边有个事想跟你说一下。';
         log(`ROLEPLAY ⚠️ 开场失败: ${e.message}（★ 用兜底开场 ✓）`);
@@ -1799,7 +1818,7 @@ async function rpHandleTurn(device, heard) {
     if (s.msgs.length > RP_MAX_TURNS * 3) s.msgs.shift();
     let out = '';
     try {
-      out = await rpCallLLM(rpSystemPrompt(s.scene, Math.min(s.turns + 1, RP_MAX_TURNS)), s.msgs.slice(-8), 180);
+      out = await rpCallLLM(rpSystemPrompt(s.scene, Math.min(s.turns + 1, RP_MAX_TURNS)), s.msgs.slice(-8), 70);
     } catch (e) {
       log(`ROLEPLAY ⚠️ 演回合失败: ${e.message}`);
       return { reply: '（对方没接话，好像信号断了。再说一遍？）', handled: true };
@@ -2480,7 +2499,7 @@ const server = http.createServer(async (req, res) => {
         try {
           open = await rpCallLLM(rpSystemPrompt(hit, 1), [{
             role: 'user', content: '（对练开始。请以角色身份说第一句话，把上面的情境自然带出来，1~3 句，不要旁白。）'
-          }], 180);
+          }], 70);
         } catch (e) {
           open = '你好，我这边有个事想跟你说一下。';
           log(`ROLEPLAY ⚠️ 屏上开场生成失败: ${e.message}（★ 用兜底开场 ✓）`);
