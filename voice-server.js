@@ -2180,7 +2180,19 @@ async function handleTTS(text, audioFmt) {
       log(`WAV 转码失败(不影响 MP3): ${e.message}`);
     }
 
-    return { success: true, audio: `/api/voice-audio/${ttsMp3}` };
+    // ★★★ 2026-10-21 依设备端回执修 ✗✗
+  //   ★ 原来**永远**返回 `.mp3` ✗ —— 即使 ulaw 分支已经把 WAV 生成好了（L2178 ✓）
+  //   ⇒ ★ 设备只解析 RIFF WAV ✓ **没有 mp3 解码器** ✗ ⇒ 拿到 .mp3 = 播不了 ✗
+  //   ★★ 判据：**"生成了" ≠ "返回了"** ✗ —— 生成在 L2178 ✓ 返回在 L2183 ✓ 两者不通 ✓
+  //   ★ 三种格式 ✗：
+  //     · `format=ulaw8` ⇒ μ-law WAV（★ 设备要的 ✓ 体积约 PCM16 的一半 ✓）
+  //     · `format=wav`   ⇒ PCM16 WAV（★ 兼容其它要 WAV 的消费者 ✓）
+  //     · 不传           ⇒ .mp3（★ **保持原样** ✓ 浏览器/WebChat 一直在用 ✗ 不能改 ✓）
+  if (audioFmt === 'ulaw8' || audioFmt === 'wav') {
+    if (!fs.existsSync(wavTarget)) throw new Error('WAV 转码失败（format=' + audioFmt + '）');
+    return { success: true, audio: `/api/voice-audio/${ttsWav}`, format: audioFmt };
+  }
+  return { success: true, audio: `/api/voice-audio/${ttsMp3}` };
   } catch (error) {
     throw error;
   }
@@ -3538,7 +3550,16 @@ function validateSetConfig(o) {
           return;
         }
 
-        const result = await handleTTS(body.text);
+        // ★★★ 2026-10-21 依设备端回执修 ✗✗
+        //   ★ 我原来写：`handleTTS(body.text)` —— **只传了 1 个参数** ✗
+        //   ⇒ `audioFmt` 恒为 undefined ⇒ `ulaw = (undefined === 'ulaw8')` = false ⇒ **永远 PCM16** ✗
+        //   ⇒ ★ 所以设备端两种写法（query / body）都"失败"✓ —— 其实是被**静默忽略** ✓
+        //   ★★ 而我还跟他们说"`/api/tts` 本来就支持 format=ulaw8" ✗ ⇒ **我说错了** ✓
+        //   ★ 判据：**"代码里有这个能力" ≠ "这个端点暴露了这个能力"** ✗
+        //     必须**看端点到底传了什么** ✓ 而不是看被调函数支持什么 ✓
+        //   ★ 现在两个位置都认（★ query 优先 ✓ body 次之 ✓ 两种都能用 ✓）
+        const fmtArg = String((body && body.format) || (getQuery(req.url) || {}).format || '').trim();
+        const result = await handleTTS(body.text, fmtArg);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (error) {
