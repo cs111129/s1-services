@@ -1,4 +1,4 @@
-const http = require('http');
+﻿const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');   // ★ CR-20261009-01：设备密钥定长比较（timingSafeEqual）
@@ -2435,6 +2435,8 @@ const server = http.createServer(async (req, res) => {
    *     POST /api/voice/asr-commit?device=xxx        body = 最后一片（可空）
    *       → { ok:true, text:"最终全文" }
    * ══════════════════════════════════════════════════════════════════ */
+  // ★ 期1 专用响应（只 4 个字段 ✓ 不回文本 ✗）
+  function jsonOut4(code, obj) { try { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); } catch (e) {} }
   const _asrSess = new Map();       // device -> { parts: Map<seq,Buffer>, text, at, busy }
   const ASR_SESS_TTL = 120 * 1000;  // ★ 2 分钟没动静 ⇒ 丢 ✓（★ 防止内存漏 ✗）
 
@@ -2455,16 +2457,16 @@ const server = http.createServer(async (req, res) => {
     const q = getQuery(req.url);
     const dev = String(q.device || q.dev_id || q.device_id || '').trim();
     const seq = parseInt(q.seq, 10) || 0;
-    if (!dev) { jsonOut(400, { ok: false, error: '缺少 device' }); return; }
+    if (!dev) { jsonOut4(400, { ok: false, error: '缺少 device' }); return; }
     const bufs = [];
     req.on('data', c => bufs.push(c));
     req.on('end', async () => {
       const data = Buffer.concat(bufs);
-      if (!data.length) { jsonOut(400, { ok: false, error: '空分片' }); return; }
+      if (!data.length) { jsonOut4(400, { ok: false, error: '空分片' }); return; }
       const s = _asrSessGet(dev);
       s.parts.set(seq, data);
       // ★★ 并发保护 ✗ —— 正在识别就**直接回上次结果** ✓（★ 丢弃中间态 ✓ O(n²) 也扛得住 ✓）
-      if (s.busy) { jsonOut(200, { ok: true, seq: seq, text: s.text, bytes: _asrConcat(s).length, busy: true }); return; }
+        if (s.busy) { jsonOut4(200, { ok: true, seq: seq, final: false, len: _asrConcat(s).length }); return; }
       s.busy = true;
       try {
         const all = _asrConcat(s);
@@ -2476,7 +2478,7 @@ const server = http.createServer(async (req, res) => {
         } catch (e) {
           log(`ASR-CHUNK ⚠️ 识别失败（${dev} seq=${seq}）: ${e.message}（★ 返回上次全文 ✓）`);
         }
-        jsonOut(200, { ok: true, seq: seq, text: s.text, bytes: all.length });
+        jsonOut4(200, { ok: true, seq: seq, final: false, len: all.length });
       } finally { s.busy = false; }
     });
     return;
@@ -2485,7 +2487,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url.startsWith('/api/voice/asr-commit')) {
     const q = getQuery(req.url);
     const dev = String(q.device || q.dev_id || q.device_id || '').trim();
-    if (!dev) { jsonOut(400, { ok: false, error: '缺少 device' }); return; }
+    if (!dev) { jsonOut4(400, { ok: false, error: '缺少 device' }); return; }
     const bufs = [];
     req.on('data', c => bufs.push(c));
     req.on('end', async () => {
@@ -2493,11 +2495,11 @@ const server = http.createServer(async (req, res) => {
       const s = _asrSess.get(dev);
       if (!s) {
         // ★ 没有分片 ⇒ 只有最后一片 ✓ 直接识别它 ✓（★ 兼容"设备没分片直接 commit"✓）
-        if (!tail.length) { jsonOut(400, { ok: false, error: '没有音频' }); return; }
+        if (!tail.length) { jsonOut4(400, { ok: false, error: '没有音频' }); return; }
         try {
           const asr = await handleASR(tail);
-          jsonOut(200, { ok: true, text: String((asr && asr.text) || '').trim(), chunks: 0 });
-        } catch (e) { jsonOut(500, { ok: false, error: e.message }); }
+          jsonOut4(200, { ok: true, text: String((asr && asr.text) || '').trim(), chunks: 0 });
+        } catch (e) { jsonOut4(500, { ok: false, error: e.message }); }
         return;
       }
       if (tail.length) s.parts.set(99999, tail);       // ★ 最后一片放最后 ✓
@@ -2509,10 +2511,10 @@ const server = http.createServer(async (req, res) => {
         const n = s.parts.size;
         _asrSess.delete(dev);                          // ★★ 交卷即**清会话** ✗（★ 下一次对练从头开始 ✓）
         log(`ASR-COMMIT ✓ ${dev} ${n} 片 / ${all.length} 字节 ⇒ ${text.length} 字`);
-        jsonOut(200, { ok: true, text: text, chunks: n, bytes: all.length });
+        jsonOut4(200, { ok: true, text: text, chunks: n, bytes: all.length });
       } catch (e) {
         log(`ASR-COMMIT ⚠️ 失败（${dev}）: ${e.message}`);
-        jsonOut(500, { ok: false, error: e.message });
+        jsonOut4(500, { ok: false, error: e.message });
       }
     });
     return;
