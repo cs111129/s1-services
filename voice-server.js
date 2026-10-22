@@ -4696,10 +4696,10 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
     const ct = req.headers['content-type'] || '';
     const bm = ct.match(/boundary=(.+)/);
     if (voiceRateLimited(req)) {
-      streamHeaders(res); headLine(res, { success: false, error: 'rate_limited' }); res.end(); return;
+      streamHeaders(res); headLine(res, { success: false, error: 'rate_limited', message: '这台设备问得有点急，等几秒再问一次' }); res.end(); return;
     }
     if (!bm) {
-      streamHeaders(res); headLine(res, { success: false, error: 'no_boundary' }); res.end(); return;
+      streamHeaders(res); headLine(res, { success: false, error: 'no_boundary', message: '这一轮没收到完整的音频，再说一遍试试' }); res.end(); return;
     }
     const chunks = []; let got = 0, tooBig = false;
     req.on('data', c => {
@@ -4709,11 +4709,25 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
       chunks.push(c);
     });
     req.on('end', async () => {
-      if (tooBig) { streamHeaders(res); headLine(res, { success: false, error: 'too_large' }); res.end(); return; }
+      if (tooBig) { streamHeaders(res); headLine(res, { success: false, error: 'too_large', message: '这段录音太长了，分两句话说' }); res.end(); return; }
       const t0 = Date.now();
       let headSent = false;
+      // ★★ 2026-10-22（CR-20261022-02 §5.1）：失败时**给一句人话** ✗
+      //   设备端原来只能拿到 `{"success":false,"error":"no_boundary"}`（40 字节）⇒ 屏上只能说"本轮失败" ✓
+      //   ⇒ 多给一个 `message` 字段（**只增不改** ⇒ 老固件忽略它，行为不变 ✓）
+      //   ★ 判据：**错误码给机器、message 给人** —— 屏上要说"没听清"，不是"error code -3" ✗
+      const STREAM_ERR_HUMAN = {
+        rate_limited: '这台设备问得有点急，等几秒再问一次',
+        no_boundary: '这一轮没收到完整的音频，再说一遍试试',
+        too_large: '这段录音太长了，分两句话说',
+        no_audio: '没收到音频数据，再说一遍试试',
+        asr_empty: '没听清，再说一遍？',
+        llm_failed: '我这会儿没想出来，稍后再问一句',
+        server_error: '服务器这边出了点问题，稍后再试',
+      };
+      const humanOf = (code) => STREAM_ERR_HUMAN[code] || '这一轮没成功，稍后再试';
       const fail = (code) => {
-        try { if (!headSent) { streamHeaders(res); headSent = true; } headLine(res, { success: false, error: code }); } catch (e) {}
+        try { if (!headSent) { streamHeaders(res); headSent = true; } headLine(res, { success: false, error: code, message: humanOf(code) }); } catch (e) {}
         try { res.end(); } catch (e) {}
       };
       try {
@@ -4722,13 +4736,18 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         const devPart = parts.find(p => p.name === 'device');
         const resetPart = parts.find(p => p.name === 'reset');
         const detailPart = parts.find(p => p.name === 'detail');
-        const fmtPart = parts.find(p => p.name === 'audio_fmt');
+        // ★★ 2026-10-22（CR-20261022-02 §3）：多认一个 multipart 字段 **`format`** ✗
+        //   设备端请求侧已经发 `format=ulaw8` ✓（我们原来只认 `audio_fmt` ⇒ 他们发的等于没发 ✗）
+        //   ★ 两个名字都认 ✓（`audio_fmt` 是有老固件在用的，不能删 ✗）
+        //   ★ 只认 body 字段 —— **不走 query** ✗（他们 10-21 被 `?format=` 坑过一次 ✓ CR §3 明说）
+        const fmtPart = parts.find(p => p.name === 'audio_fmt' || p.name === 'format');
         const device = devPart ? String(devPart.data.toString('utf8')).trim() : '';
         const reset = resetPart ? String(resetPart.data.toString('utf8')).trim() : '0';
         const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
-        // ★ audio_fmt：'pcm16'(缺省) / 'ulaw8'（设备端 §16.4 建议的字段名）—— 非法值一律按 pcm16，不报错
-        //   ★ 用 let：下面可能要按"体积预算"自动改成 ulaw8（见 pickStreamFmt）
-        let afmt = (fmtPart && String(fmtPart.data.toString('utf8')).trim() === 'ulaw8') ? 'ulaw8' : 'pcm16';
+        // ★ 取值：'ulaw8'（也认 'ulaw'/'mulaw'，手写客户端容易少个 8 ✓）；其余/缺失一律 pcm16，不报错
+        //   ★ 用 let：下面可能按"体积预算"自动改成 ulaw8（见 pickStreamFmt）
+        const _fv = fmtPart ? String(fmtPart.data.toString('utf8')).trim().toLowerCase() : '';
+        let afmt = (_fv === 'ulaw8' || _fv === 'ulaw' || _fv === 'mulaw') ? 'ulaw8' : 'pcm16';
         if (!audioPart || !audioPart.data || !audioPart.data.length) { fail('no_audio'); return; }
 
         const asr = await handleASR(audioPart.data);
