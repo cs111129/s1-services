@@ -540,14 +540,16 @@ function vcStartParams(sop) {
 //     必须让**第一句话就说"这台设备不做这个"** ✓ 并**引导到对练/录制/问答** ✓
 //   ★ 03 手表（FNW-）**保留**这四样 ✓ 不受影响 ✓
 const OFFLINE_ACTIONS = {
-  add_alarm: '赋能02 没有闹钟功能，我陪你对练或答疑更实在。',
+  add_alarm: '赋能02 没有闹钟功能，我陪你答疑或录一段更实在。',
   del_alarm: '赋能02 没有闹钟功能，所以也没有要取消的。',
-  add_memo: '这台设备不留备忘。要记流程的话，我们直接练一遍那个场景更管用。',
+  add_memo: '这台设备不留备忘。要记流程的话，直接问我或录一段更管用。',
   del_memo: '这台设备不留备忘，所以也没有可删的。',
   read_memo: '这台设备不留备忘，所以我这儿没有能念的。',
-  set_timer: '赋能02 没有倒计时功能。要练的话可以说「开始对练」。',
+  // ★ 2026-10-22 CR-20261022-03：设备上已没有对练 ⇒ 别再把它当"去处"引导 ✗
+  set_timer: '赋能02 没有倒计时功能。要练的话，对练在手机 App 里开始。',
   stop_timer: '赋能02 没有倒计时功能，所以没有在跑的计时。',
 };
+
 async function voiceCmdHandle(device, heard) {
   const r = await _voiceCmdHandleInner(device, heard);
   if (!r || !r.action) return r;
@@ -1432,17 +1434,23 @@ function isTrainerDevice(dev) {
   if (/^FNW-/.test(d)) return false;      // ★ 03 手表 ✓
   return /^FN-/.test(d) || d === '';      // ★ 02 ✓（★ 空设备号按 02 处理 ✓ 保守 ✓）
 }
-/** ★ 02 的能力块：明确"没有那四样" ＋ 不许引导 ✗ */
+/** ★ 02 的能力块：明确"没有那四样" ＋ 「对练不在设备上」 ＋ 不许引导 ✗ */
 const CAPS_TRAINER = [
   '',
   '【★ 这台设备（赋能02）不做什么 · 用户 2026-10-22 定的产品口径 ✗】',
-  '★★ 赋能02 是**纯培训设备** ✓ 只做：录制 · 预览 · 模拟对练 · 语音问答 · 设备状态与设置。',
+  '★★ 赋能02 是**纯培训设备** ✓ 只做：录制 · 预览 · 语音问答 · 查学习数据 · 设备状态与设置。',
   '★★ **它没有闹钟、备忘、日历、倒计时这几样功能** ✗ ——',
-  '  ★ 用户问起时：★ **直接说明这台设备不提供** ✓ 并**引导到对练 / 录制 / 问答**上 ✗',
+  '  ★ 用户问起时：★ **直接说明这台设备不提供** ✓ 并**引导到录制 / 问答 / 学习数据**上 ✗',
   '  ★★ **绝不许说「已帮你定好」「记下了」「倒计时开始」** ✗✗（★ 那是做不到的事 ✓）',
   '  ★★ 也**不要说「这个功能已下线」** ✗ —— ★ 那听起来像机器坏了 ✓ 要说「这台设备不做这个」✓',
   '  ★ 问"今天几号"⇒ ★ **可以答日期** ✓ 但**不要**顺势问"要不要看日历" ✗（★ 没有日历 ✗）',
-  '  ★ 主动引导时用：★ 「可以说『开始对练』，或者问我业务问题」✓ **别举例让他定闹钟** ✗',
+  // ★★ 2026-10-22（CR-20261022-03）：设备端已把这台机器的「对练」**编译期下线** ✗
+  //   设备上已经没有对练磁贴/四个页面 ⇒ 语音里再引导"开始对练"= 指一条走不通的路 ✗✗
+  '★★ **这台设备上不能开始「对练 / 场景练习 / 角色扮演」** ✗ ——',
+  '  ★ 用户想练时：★ **说「对练在手机 App 里开始」** ✓ 然后**把话头接回来**：',
+  '    「这台设备我陪你查标准、录一段、或看看你的学习数据」✓',
+  '  ★★ **绝不许说「好的，开始对练」「我们开始练」** ✗✗（★ 设备根本开不了 ✓ 用户会以为坏了 ✗）',
+  '  ★ 主动引导时用：★ 「问我业务问题、或者开始录制」✓ **别举例让他定闹钟、也别提『开始对练』** ✗',
 ];
 /** ★ 03 手表的能力块：那四样**有** ✓（★ 不加约束，只补回能力 ✓） */
 const CAPS_WATCH = [
@@ -2193,6 +2201,9 @@ function parseMultipart(buffer, boundary) {
 }
 
 // ASR: 音频 → 文字（浏览器 webm 音频）
+// ★ 2026-10-22：ASR 子进程的**硬超时** ✗ —— 原来 `exec` 没给 timeout ⇒ 一次卡住的识别能把整轮拖到 nginx 超时
+//   （用户只看到"思考中"✗）★ 25 s 留足余量：正常 paraformer 回退路径实测约 6 s ✓
+const ASR_TIMEOUT_MS = parseInt(process.env.ASR_TIMEOUT_MS || '25000', 10);
 async function handleASR(audioData) {
   const timestamp = Date.now();
   const webmPath = path.join(AUDIO_DIR, `input-${timestamp}.webm`);
@@ -2202,7 +2213,9 @@ async function handleASR(audioData) {
     fs.writeFileSync(webmPath, audioData);
     await execAsync(`ffmpeg -i "${webmPath}" -acodec pcm_s16le -ar 16000 -ac 1 -f wav "${pcmPath}" -y`);
 
-    const { stdout } = await execAsync(`python3 "${ASR_SCRIPT}" "${pcmPath}"`, { env: execEnv });
+    // ★ 2026-10-22：**给 ASR 子进程一个硬超时** ✗（原来没有 ⇒ 一句听不清就能把整轮拖住 ✗）
+    const { stdout } = await execAsync(`python3 "${ASR_SCRIPT}" "${pcmPath}"`,
+      { env: execEnv, timeout: ASR_TIMEOUT_MS });
     const result = JSON.parse(stdout);
 
     fs.unlinkSync(webmPath);
@@ -2210,6 +2223,14 @@ async function handleASR(audioData) {
 
     return { success: true, text: result.text || '' };
   } catch (error) {
+    // ★★ 2026-10-22：**把 ASR 的 stderr 记下来** ✗✗
+    //   原来只留一句 `Command failed: python3 …` ⇒ 今天 18:3x 那批 `server_error`（约 40%）根本查不出真因 ✗
+    //   ★ 判据：**子进程失败必须把它的 stderr 带回来**（只记"失败了"等于没记 ✗）
+    try {
+      const se = String((error && (error.stderr || error.message)) || '').trim();
+      const tail = se.split('\n').filter(Boolean).slice(-6).join(' | ');
+      log(`⚠️ ASR 子进程失败${error && error.killed ? '（超时被杀）' : ''}: ${tail.slice(0, 400) || '(无 stderr)'}`);
+    } catch (_) {}
     [webmPath, pcmPath].forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
     throw error;
   }
@@ -4426,7 +4447,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         const kb = await kbSearchForVoice(heard);
         const intent = await intentP;
         // ★★ 路由判定"用户想开始对练" ⇒ **立刻进对练** ✓（★ 不落到小星的能力里 ✗）
-        if (RP_ON && device && intent.roleplay && !_rpSessions.has(device)) {
+        if (RP_ON && device && intent.roleplay && !isTrainerDevice(device) && !_rpSessions.has(device)) {   // ★ CR-20261022-03：02 已下线对练 ⇒ 不许再开场 ✓
           _rpStartPending.add(device);
           try {
             const rpB = await rpHandleTurn(device, heard);
@@ -4795,7 +4816,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
                        : await kbSearchForVoice(heard);
         const intent = await intentP;
         // ★★ 路由判定"用户想开始对练" ⇒ **立刻进对练** ✓（★ 不落到小星的能力里 ✗）
-        if (RP_ON && device && intent.roleplay && !_rpSessions.has(device)) {
+        if (RP_ON && device && intent.roleplay && !isTrainerDevice(device) && !_rpSessions.has(device)) {   // ★ CR-20261022-03：02 已下线对练 ⇒ 不许再开场 ✓
           _rpStartPending.add(device);
           try {
             const rpB = await rpHandleTurn(device, heard);

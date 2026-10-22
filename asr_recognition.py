@@ -38,7 +38,12 @@ import shutil
 import requests
 
 # ============ 配置 ============
-ASR_MODEL = os.environ.get("ASR_MODEL", "qwen3-asr-flash-2026-02-10")
+# ★★ 2026-10-22：默认模型名改成**不带日期后缀**的别名 ✗✗
+#   原来 `qwen3-asr-flash-2026-02-10` 在这台账号上 **HTTP 404 Model not exist** ✓
+#   ⇒ 每一轮都先白撞一次 404、再回退 paraformer ⇒ 实测 **6.86 s/轮**（用户听到的就是"反应慢"✗）
+#   ⇒ 改成 `qwen3-asr-flash` ⇒ 实测 **1.44 s/轮**，快 5.4 s ✓ 识别质量也更好
+#   ★ 判据：**带日期的快照名会随账号/地域失效** ⇒ 想稳用别名；要用快照必须有 404 兜底 ✓
+ASR_MODEL = os.environ.get("ASR_MODEL", "qwen3-asr-flash")
 NATIVE_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 # 引擎选择：qwen3（默认）| paraformer（回退/强制老路径）
 ASR_ENGINE = os.environ.get("ASR_ENGINE", "qwen3").strip().lower()
