@@ -2695,7 +2695,25 @@ const server = http.createServer(async (req, res) => {
         }
       } catch (e) { log(`voice-chat-text ⚠️ 对练分支异常: ${e.message}（★ 继续走普通 ✓）`); }
 
-      // ★ 普通模式：★ 流式 delta ✓（★ 复用与小星同一套提示词 ✓ 不含对练 ✗）
+      // ★★★ 2026-10-22 补：★ 这条**也要过命令拦截** ✗✗
+      //   ★ 实测才发现：`voice-chat-text` 原来**只走 LLM** ✓ 不走 `voiceCmdHandle` ✗
+      //     ⇒ 「记一下」⇒ 模型答「我记下了」✗✗ 「倒计时」⇒「倒计时开始」✗✗
+      //   ★★ 而 ★ 设备端固件**已经接了这个入口** ✗（他们 §2.2 ✓）
+      //     ⇒ ★ 一旦切过来，赋能02 的假承诺全回来了 ✗
+      //   ★ 判据：**同一个"能力边界"必须挂在所有入口上** ✗
+      //     —— 只挂一条 ⇒ 另一条就是后门 ✓（今天第 11 条同族 ✗）
+      try {
+        if (RP_ON && device) {
+          const vc = await voiceCmdHandle(device, text);
+          if (vc && vc.reply) {
+            send({ done: true, reply: vc.reply, audio: '', action: vc.action || null, command: true });
+            res.end();
+            return;
+          }
+        }
+      } catch (e) { log(`voice-chat-text ⚠️ 命令拦截异常: ${e.message}（★ 继续走 LLM ✓）`); }
+
+      // ★ 普通模式：★ 流式 delta ✓
       try {
         // ★★ 2026-10-21：★ 这里**不能**用 `kbSearchForVoice` / `VOICE_CHAT_SYSTEM` ✗
         //   它们都是**后面才声明的 const** ✓ 我这段在它们前面 ⇒ **TDZ**
@@ -2711,7 +2729,7 @@ const server = http.createServer(async (req, res) => {
           '★ 每次都要落到企业文化的一条上（真诚：讲真话做实事爱客户守承诺 · ',
           '   高效：成果导向沟通简单标准明确推进有力 · 专业：精流程定标准练技能严考核 · ',
           '   担当：会放权勇挑战敢行动定决策担责任）✓ 一句话带过 ✗ 别背条文 ✓',
-        ].join('\n');
+        ].join('\n') + deviceCapsBlock(device);   // ★ 2026-10-22：★ 设备能力边界**必须在这条也生效** ✗
         const ac = new AbortController();
         const tid = setTimeout(() => ac.abort(), 25000);
         let full = '';
