@@ -4863,13 +4863,24 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         //     ⇒ **客户端先走**（我方还在往里写）✓ 此时"对端掐断"这个判断要反过来 ✓
         let pushed = 0;         // ★ 已写进 socket 的 PCM 字节（给下面的关闭日志用 ✓）
         let tFirstPcm = 0;      // ★ 首块时间（看"关闭"离首块多久 ✓）
+        // ★★ 2026-10-22 §9：**连接没了就别再合成** ✗✗
+        //   16:13:55 那轮实测：socket 在**首块后 1114ms** 被 RST（ECONNRESET），
+        //   而 handler 还在往里塞第 2、3 块，最后还打了「✓ 推 PCM 545,022 字节」——
+        //   ★ **那行是假象**：字节进了死连接 ⇒ 日志说"成功"、设备只收到 32,761 字节 ✗
+        //   ⇒ ① 记 `clientGone` ② 合成循环立刻收工 ③ 结尾日志改成"被中断" ✗
+        let clientGone = false;
         try {
           const _sock = req.socket;
           _sock.on('close', () => {
+            if (pushed === 0 || res.writableFinished) return;   // 正常收尾不发这条 ✓
+            clientGone = true;
             log(`voice-chat-stream socket 关闭：已推 ${pushed} 字节 · headersSent=${res.headersSent} ` +
                 `writableFinished=${res.writableFinished} · 自首块 ${tFirstPcm ? (Date.now() - tFirstPcm) + 'ms' : '(还没推首块)'}`);
           });
-          _sock.on('error', (e) => log(`voice-chat-stream socket error: ${e.code || e.message}（已推 ${pushed} 字节）`));
+          _sock.on('error', (e) => {
+            clientGone = true;
+            log(`voice-chat-stream socket error: ${e.code || e.message}（已推 ${pushed} 字节）`);
+          });
         } catch (e) {}
         streamHeaders(res, afmt); headSent = true;
         try { if (res.socket) res.socket.setNoDelay(true); } catch (e) {}
@@ -4911,6 +4922,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
             + `（★ 不发的话他们那侧会判"0 字节 = 失败"并回退老端点 ✗）`);
         }
         while (si < sents.length || carry) {
+          if (clientGone) break;   // ★ 对端已经走了 ⇒ 别再花 6 秒合成没人听的音频 ✗
           const queuedSec = pushed / bytesPerSec;            // 已推的音频还能播多少秒
           const target = Math.min(STREAM_REST_CAP,
             Math.max(STREAM_FIRST_CAP, Math.floor(queuedSec * 0.7 * STREAM_SYNTH_CPS)));
@@ -4948,9 +4960,16 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
             break;
           }
         }
-        log(`voice-chat-stream ✓ ${pieceN} 块（共 ${reply.length} 字）→ 推 PCM ${pushed} 字节 ` +
-            `tokens=${usage ? (usage.prompt_tokens + '/' + usage.completion_tokens) : '-'} ` +
-            `总耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
+        if (clientGone) {
+          // ★★ 诚实日志 ✗：这轮**没送完**。原来那行「✓ 推 PCM N 字节」会把"写进死连接"也说成成功 ✓
+          log(`⚠️ voice-chat-stream **被对端中断**：只推出 ${pushed} 字节 / ${pieceN} 块（共 ${reply.length} 字）` +
+              ` · 自首块 ${tFirstPcm ? (Date.now() - tFirstPcm) + 'ms' : '-'} 就没了 socket ❌` +
+              `（★ 设备端收到的字节数以它自己日志为准 ✓ 我这行只说明我推了多少 ✗）`);
+        } else {
+          log(`voice-chat-stream ✓ ${pieceN} 块（共 ${reply.length} 字）→ 推 PCM ${pushed} 字节 ` +
+              `tokens=${usage ? (usage.prompt_tokens + '/' + usage.completion_tokens) : '-'} ` +
+              `总耗时=${((Date.now() - t0) / 1000).toFixed(1)}s`);
+        }
         // ★★ 语音会话记录：**fire-and-forget** ✓ —— 放在最后 ✓ **不 await** ✓ 绝不改返回值 ✓
         //   ★ branch 口径：命令 / 联网 / 知识库 / 知识库不可用 —— 便于事后按来源统计 ✓
         logVoiceTurn({
