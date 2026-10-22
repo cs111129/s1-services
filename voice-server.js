@@ -532,7 +532,33 @@ function vcStartParams(sop) {
  * @returns {null}                              ⇒ 不是命令 ⇒ 走原来的流程（LLM ✓ 且响应里**不加** action ✓）
  *          {reply:'', action, params}          ⇒ 是命令 ⇒ **直接回，不叫 LLM、不合成语音** ✓
  */
+// ★★★ 2026-10-22 依设备端递件：★ **赋能02 = 纯培训设备** ✗
+//   ★ 闹钟 / 备忘 / 日历 / 倒计时 四个功能已从 02 设备**下线** ✓（13→9 磁贴 ✓）
+//   ★★ 设备端现在的兜底是"回一句'这个功能已下线'"✗ ⇒ ★ 他们自己说：「这是兜底，不是设计」✓
+//   ⇒ ★ 我方**在源头就别认这些动作** ✗ —— ★ 用户根本拿不到一个"已帮你定好"的假承诺 ✓
+//   ★★ 判据：★ 用户听到"已帮你定好" 然后发现设备没反应 ⇒ **机器坏了** ✗
+//     必须让**第一句话就说"这台设备不做这个"** ✓ 并**引导到对练/录制/问答** ✓
+//   ★ 03 手表（FNW-）**保留**这四样 ✓ 不受影响 ✓
+const OFFLINE_ACTIONS = {
+  add_alarm: '赋能02 没有闹钟功能，我陪你对练或答疑更实在。',
+  del_alarm: '赋能02 没有闹钟功能，所以也没有要取消的。',
+  add_memo: '这台设备不留备忘。要记流程的话，我们直接练一遍那个场景更管用。',
+  del_memo: '这台设备不留备忘，所以也没有可删的。',
+  read_memo: '这台设备不留备忘，所以我这儿没有能念的。',
+  set_timer: '赋能02 没有倒计时功能。要练的话可以说「开始对练」。',
+  stop_timer: '赋能02 没有倒计时功能，所以没有在跑的计时。',
+};
 async function voiceCmdHandle(device, heard) {
+  const r = await _voiceCmdHandleInner(device, heard);
+  if (!r || !r.action) return r;
+  // ★★ **赋能02** 且命中已下线动作 ⇒ ★ **不下发** ✗ ＋ 换成自然拒绝 ✓（★ 不说"已下线"✗）
+  if (isTrainerDevice(device) && OFFLINE_ACTIONS[r.action]) {
+    log(`语音命令: 「${heard}」⇒ ⛔ ${r.action} 在赋能02 **已下线** ⇒ 不下发 ✓ 回「${OFFLINE_ACTIONS[r.action]}」`);
+    return { reply: OFFLINE_ACTIONS[r.action], action: null, params: null, offline: true };
+  }
+  return r;
+}
+async function _voiceCmdHandleInner(device, heard) {
   if (!VOICE_CMD_ENABLED || !device) return null;
   const t = vcNorm(heard);
   if (!t) return null;
@@ -1381,12 +1407,61 @@ function corpCultureBlock() {
   return L.join('\n');
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * ★★★ 按设备型号区分能力（2026-10-22 依设备端递件 ✗）
+ *
+ *   ★ 用户原话：「**赋能02的定位就是赋能相关的功能**」
+ *              「把：计时、闹钟、备忘、日历 这几个功能，从赋能02设备上删除掉」
+ *
+ *   ★★ 两条产品线 ✗：
+ *     · **赋能02**（`FN-000x`）= **纯培训设备** ✓ 录制/预览/对练/语音/设置/绑定/状态/记录/自检
+ *       ★★ **没有** 闹钟 / 备忘 / 日历 / 倒计时 ✗（设备端已把 4 个磁贴下线 ✓ 13→9 ✓）
+ *     · **赋能03 手表**（`FNW-000x`）= 手表全套 ✓ **有**那四样 ✗
+ *
+ *   ★★★ 判据（★ 设备端提得很好，值得记 ✗）：
+ *     **"同一套人设服务两种硬件" ⇒ 必然有一边是错的** ✗
+ *     ⇒ ★ 必须按 `X-Device-Id` 前缀分流 ✓（★ 否则 02 会承诺做不到的事 ✗ / 03 会被误禁 ✓）
+ *
+ *   ★★ 为什么危险 ✗：★ 人设一旦说"我帮你定闹钟" ✓
+ *     设备端只能回「这个功能已下线」✓ ⇒ ★ 用户会觉得**机器坏了** ✗✗
+ *     （★ 设备端原话：「这是我们兜底，不是设计」✓）
+ * ══════════════════════════════════════════════════════════════════════ */
+function isTrainerDevice(dev) {
+  // ★ 02 = FN- 前缀 ✓；★ 03 = FNW- ✓（★ FNW 也以 FN 开头 ⇒ 必须**先排 FNW** ✗）
+  const d = String(dev || '').trim().toUpperCase();
+  if (/^FNW-/.test(d)) return false;      // ★ 03 手表 ✓
+  return /^FN-/.test(d) || d === '';      // ★ 02 ✓（★ 空设备号按 02 处理 ✓ 保守 ✓）
+}
+/** ★ 02 的能力块：明确"没有那四样" ＋ 不许引导 ✗ */
+const CAPS_TRAINER = [
+  '',
+  '【★ 这台设备（赋能02）不做什么 · 用户 2026-10-22 定的产品口径 ✗】',
+  '★★ 赋能02 是**纯培训设备** ✓ 只做：录制 · 预览 · 模拟对练 · 语音问答 · 设备状态与设置。',
+  '★★ **它没有闹钟、备忘、日历、倒计时这几样功能** ✗ ——',
+  '  ★ 用户问起时：★ **直接说明这台设备不提供** ✓ 并**引导到对练 / 录制 / 问答**上 ✗',
+  '  ★★ **绝不许说「已帮你定好」「记下了」「倒计时开始」** ✗✗（★ 那是做不到的事 ✓）',
+  '  ★★ 也**不要说「这个功能已下线」** ✗ —— ★ 那听起来像机器坏了 ✓ 要说「这台设备不做这个」✓',
+  '  ★ 问"今天几号"⇒ ★ **可以答日期** ✓ 但**不要**顺势问"要不要看日历" ✗（★ 没有日历 ✗）',
+  '  ★ 主动引导时用：★ 「可以说『开始对练』，或者问我业务问题」✓ **别举例让他定闹钟** ✗',
+];
+/** ★ 03 手表的能力块：那四样**有** ✓（★ 不加约束，只补回能力 ✓） */
+const CAPS_WATCH = [
+  '',
+  '【★ 这台设备（赋能03 手表）额外会做的 ✗】',
+  '★ 你还能：★ **定闹钟 / 记备忘 / 读备忘 / 倒计时（计时）** ✓ —— ★ 这台是手表 ✓ 这些**有** ✓',
+  '★ 日历/日期也可以主动提供 ✓（★ 但**不要**把这些能力说给 02 的用户听 ✗）',
+];
+function deviceCapsBlock(dev) {
+  return (isTrainerDevice(dev) ? CAPS_TRAINER : CAPS_WATCH).join('\n');
+}
+
 const PERSONA_CAPS = [
   '【你实际会做什么 · ★ 只许说这六件 ✗✗】',
   '★ 你的能力**只有下面这六样，多一样都没有** ✗：',
   '  1. 查**店里的标准**（SOP / 流程 / 规定 / 考核标准）✓',
   '  2. 查**外部实时信息**（天气 / 新闻这类，有联网）✓',
-  '  3. **操作这台设备**：开始/结束录制 · 定闹钟 · 记备忘 · 倒计时 ✓',
+  '  3. **操作这台设备**：开始/结束录制 ✓（★ 闹钟/备忘/倒计时**不在基础能力里** ✗ ——',
+  '     它们由**设备型号块**决定 ✓ 见 deviceCapsBlock ✓ 02 没有 ✗ / 03 手表有 ✓）',
   '  4. **查他自己的学习数据**（积分 · 考试成绩 · 场景练习 · 课程进度 · 学习计划 · 今天的职责任务）✓',
   '     ★★ 只能查**当前这台设备绑定的人** ✗ —— 问别人的一律说查不到 ✓ **不许编** ✗',
   '     ★★ 有【系统查询到的真实数据】时**必须照着说** ✗ —— 别再说"查不到/做不了" ✓',
@@ -1985,7 +2060,7 @@ async function routeNeedsWeb(text) {
 }
 /** ★ 联网回答（qwen-plus ＋ enable_search ＋ enable_source ✓）
  *  ⇒ 返回 { reply, sources } ／ null（失败 ✓ 调用方退回原路 ✓）*/
-async function webAnswer(heard, lenHint) {
+async function webAnswer(heard, lenHint, device) {
   if (!DASHSCOPE_API_KEY) { log('WEB ⚠️ 没有 DASHSCOPE_API_KEY ⇒ 退回原路'); return null; }
   const ac = new AbortController();
   const tid = setTimeout(() => ac.abort(), WEB_TIMEOUT_MS);
@@ -1997,6 +2072,7 @@ async function webAnswer(heard, lenHint) {
       // ★★ 2026-10-12 修 ✗：这条**原来没有**能力边界 ⇒ 联网回合能随便吹 ✓（用户报的问题的一半 ✓）
       //   ⇒ 现在**共用模块级同一份** ✓（别在这里再写一遍 ✗）
       ...PERSONA_CAPS,
+    deviceCapsBlock(device),
       '★ 用**口语**回答，**不要 markdown、不要星号、不要分点符号、不要 emoji** —— 会被逐字念出来。',
       '★ 搜到就用搜到的 ✓ 说清"这是查到的"✓；**搜不到或不确定就直说，别编** ✗。',
       `★ 长度控制在 ${lenHint || '180 字以内'}。`,
@@ -3932,6 +4008,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
     // ★★ 能力清单**从模块级常量展开** ✗（★ 不再在这里写一遍 ✓）
     //   —— 因为**联网那条路也要同一份** ✓（"同一个事实只能一处"✓ 原来漏了联网路 ✗）
     ...PERSONA_CAPS,
+    deviceCapsBlock(device),
     '',
     '【回答怎么来 · 严格按这个顺序】',
     '1. 先看下面的【知识库参考内容】—— 里面【有相关内容】时，优先依据它回答（那是我们店的标准）。',
@@ -4125,7 +4202,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         + '⇒ ★★ **严禁**说「查不到 / 数据是空的 / 没查到你的记录」✗✗（数据就在下面 ✓ 说了就是撒谎 ✓）\n'
         + '⇒ ★ 只说用户问的那一项 ✓ 别把整段数据全念出来 ✗；看不懂的字段就跳过 ✓'
       : '';
-    const msgs = [{ role: 'system', content: VOICE_CHAT_SYSTEM.replace('__LEN__', style.len) + '\n\n' + kbBlock + toolRule }];
+    const msgs = [{ role: 'system', content: VOICE_CHAT_SYSTEM.replace('__LEN__', style.len) + '\n\n' + kbBlock + toolRule + deviceCapsBlock(device) }];
     if (history) for (const h of history) msgs.push(h);
     // ★★ 工具数据**也塞进 user 消息** ✗ —— 双保险（★ 模型对"当前这一轮"的注意力最高 ✓）
     msgs.push({ role: 'user', content: toolBlock ? (String(text) + '\n\n' + toolBlock) : String(text) });
