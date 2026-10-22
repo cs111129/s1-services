@@ -3964,11 +3964,36 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
   //     而 300 的代码线一到就把句子从中间切断 ⇒ 用户听到的正是"没有全部念完" ✗
   //     400 字 ulaw8 ≈ **1.25MB**（≤ 1.4MB 预算）⇒ 装得下，没必要切 ✓
   //     ⚠️ 简约/中等**不跟着放宽**：实测 84/90、159/180 都没超线（没症状就别动）✗
+  //   ★★★ 2026-10-22 20:0x **用户拍板提档：150 / 250 / 350** ✗
+  //     起因：用户问「能说的仔细一点吗」，两轮仍是 `reply=91字` 带 `…` ⇒ 要的更详细被 90 字线砍掉 ✓
+  //     ★ 音量预算（按 5 字/秒、16k 单声道）：
+  //        · 150 字 ≈ 30s ≈ pcm16 0.96MB ✓ / ulaw8 0.48MB ✓
+  //        · 250 字 ≈ 50s ≈ pcm16 1.60MB ✗ 超 1.5MB ⇒ 250/350 两档在"整段 WAV"那条路**自动降 ulaw8** ✓
+  //        · 350 字 ≈ 70s ≈ ulaw8 1.12MB ✓（≤ 1.4MB 预算 ✓）
+  //     ⇒ 代码线取 **165 / 275 / 385**（留 10% 余量，见下一条老坑 ✓）
+  //     ⚠️ 350 字 ≈ **70~80 s 音频** ⇒ 会逼近设备端新加的「语音轮 75 s 看门狗」✗ 已同步提醒设备端 ✓
+  // ★★★ 2026-10-22 20:0x **提档（用户拍板：150 / 250 / 350）** ✗
+  //   背景：19:50/19:51 两轮都是 `reply=91字`、末尾 `…` —— 用户问「能说的仔细一点吗」，
+  //   结果还是 90 字，**因为他要的更详细被"简短档上限"截掉了** ✓（不是音频没推完 ✓ 已核对）
+  //   ⇒ 三档上限提高到 **150 / 250 / 350** ✓
+  //   ★ 但**提示词与代码线要留 10% 余量**（老规矩，见下面那段坑）：模型对"上限"会超额 10~15% ✓
+  //     提示词写 150/250/350 ⇒ 代码线 165/275/385 ⇒ **截断只在模型真的离谱时才发生** ✓
+  //   ★★ 截断改成**按句末/从句回退**（原来 `slice(0,cap)` 会切在词中间，如「…亲和力，目…」✗）
   const DETAIL_STYLES = {
-    1: { max: 90,  tokens: 280, len: '不超过 90 字，2~4 句，只给最核心的一步或结论' },
-    2: { max: 180, tokens: 560, len: '180 字以内，4~6 句，把关键几步说清楚' },
-    3: { max: 400, tokens: 800, len: '300 字以内，把关键的几步都说全，可以说 6~8 句' },
+    1: { max: 165, tokens: 400, len: '不超过 150 字，3~5 句，把最核心的几步说清楚' },
+    2: { max: 275, tokens: 650, len: '250 字以内，5~7 句，把关键几步都说清楚' },
+    3: { max: 385, tokens: 1000, len: '350 字以内，把关键步骤说全，可以说 8~10 句' },
   };
+  // ★ 按标点回退的截断 ✗（比硬切好：最多少几个字，但不会把句子切碎 ✓）
+  //   ★ 只在"退到 cap 的 60% 以内"时才接受回退 ⇒ 否则宁可硬切（防止一句话太长时被砍掉一半 ✗）
+  function cutNice(s, cap) {
+    const str = String(s || '');
+    if (str.length <= cap) return str;
+    const head = str.slice(0, cap);
+    const m = head.match(/^[\s\S]*[。！？!?；;]/) || head.match(/^[\s\S]*[，、：,]/);
+    if (m && m[0].length >= Math.floor(cap * 0.6)) return m[0] + '…';
+    return head + '…';
+  }
   function detailOf(v) {
     const n = parseInt(String(v || '').trim(), 10);
     return DETAIL_STYLES[n] ? n : 2;   // 不传/空/非法 ⇒ 中等
@@ -4549,7 +4574,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         }
         if (reply.length > cap) {
           log(`voice-chat: 回复 ${reply.length} 字 > ${afmt} 上限 ${cap} 字 ⇒ 截断（避免设备端 WAV 缓冲溢出）`);
-          reply = reply.slice(0, cap) + '…';
+          reply = cutNice(reply, cap);   // ★ 2026-10-22：按标点回退，别切在词中间 ✓
         }
         if (!reply) reply = NO_KB_REPLY;
 
@@ -4881,7 +4906,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         //   原来在 else 里 ⇒ selfA / 知识库不可用 那两类轮次不进上下文 ✗
         chatRecord(device, heard, reply);
         const cap = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
-        if (reply.length > cap) reply = reply.slice(0, cap) + '…';
+        if (reply.length > cap) reply = cutNice(reply, cap);   // ★ 2026-10-22：按标点回退，别切在词中间 ✓
         // ★★ 流式也要看**体积预算**（2026-10-07 用户实测"具体档没念完"后定位）
         //   实测日志：`detail=3` 推过 **2,075,594 字节**的 PCM（301 字），
         //   而设备端 `VOICE_WAV_MAX` 只有 **1.5MB** —— 之前只验过 897KB 的长流 ✗
