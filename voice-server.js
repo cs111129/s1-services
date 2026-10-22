@@ -4026,7 +4026,15 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
     // ★★ 能力清单**从模块级常量展开** ✗（★ 不再在这里写一遍 ✓）
     //   —— 因为**联网那条路也要同一份** ✓（"同一个事实只能一处"✓ 原来漏了联网路 ✗）
     ...PERSONA_CAPS,
-    deviceCapsBlock(device),
+    // ★★ 2026-10-22 P0（★ 我自己 12:50 那次改出来的 ✗✗）：
+    //   ★ 这一行原来写的是 `deviceCapsBlock(device)` ✓ 但**这里根本没有 device** ✗
+    //   ★ 更致命的是：`VOICE_CHAT_SYSTEM` 是**请求处理函数内部的 const** ⇒ **每个请求都会执行** ✗
+    //   ⇒ 抛 `ReferenceError: device is not defined` ⇒ handler 的 Promise 直接 reject
+    //     ⇒ ★ **一个字节都不回**（nginx 那边只能等到超时）✗✗
+    //   ⇒ 受害面不是"只有 chat"：audio / voice-input / tts / chat-text **全在这行之后** ⇒ 整组 voice 路由挂死
+    //   （设备端 15:49 的 CR-20261022-01 抓的就是这个：79.6 s / aud 0 / bytes 0）
+    //   ★ 能力块**改到真正知道 device 的地方加** ⇒ `voiceChatAnswer(..., device)`（见下面第 4223 行那段）✗
+    //   ★ 判据：**"边界/人设"必须是"按设备"的 ⇒ 它就不能出现在"还不知道是哪台设备"的位置** ✓
     '',
     '【回答怎么来 · 严格按这个顺序】',
     '1. 先看下面的【知识库参考内容】—— 里面【有相关内容】时，优先依据它回答（那是我们店的标准）。',
@@ -4185,7 +4193,10 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
 
   // ★ 2026-10-20：加了 `toolData` ✗ —— 工具查到的真实数据（★ 可选 ✓ 不传就与原来完全一致 ✓）
   //   `toolData = { kind, data }` ／ null ✓
-  async function voiceChatAnswer(text, kbResults, history, detail, toolData) {
+  // ★★ 2026-10-22 P0：**必须带 device** ✗ ——
+  //   下面 `deviceCapsBlock(device)` 要按"哪台设备"分流（02 培训 / 03 手表 ✓）
+  //   ⇒ 原来这里没有形参 ⇒ 运行时 `device is not defined` ⇒ 整个请求无响应（见上方那段注释 ✗✗）
+  async function voiceChatAnswer(text, kbResults, history, detail, toolData, device) {
     const style = DETAIL_STYLES[detail] || DETAIL_STYLES[2];
     let kbBlock = '';
     if (kbResults.length) {
@@ -4429,7 +4440,9 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
           //   `style` 定义在 `voiceChatAnswer()` **函数内部**（另一个作用域 ✓）
           //   ⇒ 在这里引用会 **ReferenceError** ✗（本地语法检查查不出来 ✓ 只有跑起来才炸 ✓）
           //   ★ 判据：**跨函数抄表达式时，先确认变量在【当前】作用域里** ✗
-          const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len);
+          // ★★ 2026-10-22：**必须把 device 传进去** ✗ —— webAnswer 里要按设备型号加能力块；
+          //   不传 ⇒ device 是 undefined ⇒ isTrainerDevice('') 当 **02** 处理 ⇒ ★ 03 手表会被说成"没有闹钟" ✗
+          const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len, device);
           if (wa && wa.reply) {
             reply = wa.reply; replyMood = normMood(wa.mood); webHit = true;   // ★ 语气与这句同源 ✓（同一次调用出的 ✓）
             log(`WEB 分支命中 ✓ 来源${(wa.sources || []).length}条 mood=${replyMood || '(不发)'}`);
@@ -4451,7 +4464,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
             // ★ 历史由 chatMsgsFor 给（"新话题/过期"已在上面统一处理过 ⇒ 这里传 '0' 不再清 ✓）
             const history = chatMsgsFor(device, '0');
             try {
-              const ans = await voiceChatAnswer(heard, kb.results, history, detail, toolData);
+              const ans = await voiceChatAnswer(heard, kb.results, history, detail, toolData, device);
               reply = ans.reply;
               usage = ans.usage;
               replyMood = normMood(ans.mood);   // ★ 语气与这句同源 ✓（模型在同一次输出里给的 ✓）
@@ -4768,7 +4781,9 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         //     ★ 这是"能用真搜索"换来的代价 ✓ 已如实记录（规格书 §6.6.2 ✓）
         if (!vcS && needWeb && webQuotaOk()) {
           // ★ 同非流式端点：长度提示取 `DETAIL_STYLES` ✓（★ 不是 `style.len` ✗ 那个在别的函数里 ✓）
-          const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len);
+          // ★★ 2026-10-22：**必须把 device 传进去** ✗ —— webAnswer 里要按设备型号加能力块；
+          //   不传 ⇒ device 是 undefined ⇒ isTrainerDevice('') 当 **02** 处理 ⇒ ★ 03 手表会被说成"没有闹钟" ✗
+          const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len, device);
           if (wa && wa.reply) {
             reply = wa.reply; replyMood = normMood(wa.mood); webHit = true;
             log(`WEB 分支命中（流式）✓ 来源${(wa.sources || []).length}条 mood=${replyMood || '(不发)'}`);
@@ -4787,7 +4802,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
           // ★ 历史由 chatMsgsFor 给（"新话题/过期"上面已统一处理 ⇒ 传 '0' 不再清 ✓）
           const history = chatMsgsFor(device, '0');
           try {
-            const ans = await voiceChatAnswer(heard, kb.results, history, detail, toolData);
+            const ans = await voiceChatAnswer(heard, kb.results, history, detail, toolData, device);
             reply = ans.reply; usage = ans.usage;
             replyMood = normMood(ans.mood);                    // ★ 同一次输出里给的 ⇒ 同源 ✓
             if (ans.refused) { log('voice-chat-stream: 模型判定参考内容里没有答案 ⇒ 答"查不到"'); reply = NO_KB_REPLY; replyMood = null; }
