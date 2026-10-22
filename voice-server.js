@@ -4856,6 +4856,21 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         //      ② 写完立刻做 TTS（当时还是 execSync 阻塞事件循环）⇒ libuv 的 socket write 是异步的，
         //         被同步阻塞挡住 = 头根本没出去 ✗
         //   ⇒ 关 Nagle + flushHeaders + **让出一次事件循环**（setImmediate）把头真发出去，再开始合成
+        // ★★ 2026-10-22 §9 追查：**到底谁先断的** ✗
+        //   设备端（CR-20261022-01 §9）报"对端掐断、只收到 36 MB 级的前 36 KB、无 chunked 结束块" ✗
+        //   而我这边只看到"推完 427 KB 并正常 end" ✓ —— 缺一环证据 ⇒ 这里把 **socket 上的事**记下来 ✗
+        //   ★ 判据：若出现「socket 关闭 … 已推 N 字节」且 N 远小于总推量＋`writableFinished=false`
+        //     ⇒ **客户端先走**（我方还在往里写）✓ 此时"对端掐断"这个判断要反过来 ✓
+        let pushed = 0;         // ★ 已写进 socket 的 PCM 字节（给下面的关闭日志用 ✓）
+        let tFirstPcm = 0;      // ★ 首块时间（看"关闭"离首块多久 ✓）
+        try {
+          const _sock = req.socket;
+          _sock.on('close', () => {
+            log(`voice-chat-stream socket 关闭：已推 ${pushed} 字节 · headersSent=${res.headersSent} ` +
+                `writableFinished=${res.writableFinished} · 自首块 ${tFirstPcm ? (Date.now() - tFirstPcm) + 'ms' : '(还没推首块)'}`);
+          });
+          _sock.on('error', (e) => log(`voice-chat-stream socket error: ${e.code || e.message}（已推 ${pushed} 字节）`));
+        } catch (e) {}
         streamHeaders(res, afmt); headSent = true;
         try { if (res.socket) res.socket.setNoDelay(true); } catch (e) {}
         try { if (typeof res.flushHeaders === 'function') res.flushHeaders(); } catch (e) {}
@@ -4884,7 +4899,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         //   首块 60 字（出声快）→ 队列攒起来后放大到 240 字（语调自然、拼缝少）
         const sents = splitSents(reply);
         const bytesPerSec = afmt === 'ulaw8' ? 16000 : 32000;
-        let pushed = 0, pieceN = 0, si = 0, carry = '';
+        let pieceN = 0, si = 0, carry = '';   // ★ `pushed` 已提前声明（上面那段追查日志要用 ✓）
         // ★★ 2026-10-12 命令回合：reply 空 ⇒ **送 40ms 静音垫** ✗
         //   ★ 为什么不能"什么都不送"：他们 `voice.c` 判成功的条件是 `audio_bytes > 0` ✓
         //     0 字节 ⇒ 判「一个字节都没播 ⇒ 退回老端点」✗（白跑一轮 + action 可能被应用两次 ✗）
@@ -4919,6 +4934,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
             if (pcm && pcm.length) {
               res.write(pcm); pushed += pcm.length;
               // ★ 首块 PCM 的时间要单独记 —— 否则"头与首块只差 1ms"这类问题看不出来（设备端实测反馈）
+              if (!tFirstPcm) tFirstPcm = Date.now();   // ★ 给"关闭"日志算"离首块多久" ✓
               if (pieceN === 1) {
                 log(`voice-chat-stream 首块 PCM 已推 距头 ${Date.now() - tHead}ms（${pcm.length} 字节）`);
               } else {
