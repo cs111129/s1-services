@@ -2453,11 +2453,33 @@ function silenceAudioUrl() {
   }
 }
 
+// ★★ 2026-10-22 P0 兜底：**响应看门狗** ✗（CR-20261022-01 §4.2 设备端要求的"失败即 5xx"✓）
+//   ★ 今天的事故形状：一个 `ReferenceError: device is not defined` ⇒ 整个 voice 组"收了包、永不回"
+//     ⇒ nginx 只能等 120 s 才断 ⇒ 设备那边就是"思考中 80 秒、一个字节没播" ✗✗
+//   ★ 超时都在（KB 8s / LLM 12s / TTS 6s）但**"handler 抛异常"这一层没人兜** ⇒ 连接就一直悬着 ✓
+//   ⇒ 立一条底线：**进了这个 handler，N 秒内必须发出至少一个字节**，否则我自己回 504 ✓
+//   ★★ 只判 `!res.headersSent`：流式端点（chat-stream / chat-text）响应头一发就免疫 ✓
+//      ⇒ **不会把"正常的长时间回答"掐断** ✗（这是这条兜底能不能上线的前提 ✓）
+const RESPONSE_WATCHDOG_MS = parseInt(process.env.RESPONSE_WATCHDOG_MS || '60000', 10);
+
 const server = http.createServer(async (req, res) => {
   // CORS（docs/44 阶段2：允许设备用 X-Device-Secret / X-Device-Id 请求头）
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Device-Secret, X-Device-Id');
+
+  // ★ 看门狗：每个请求一个，正常结束时清掉（`close` 兜客户端中途断开 ✓）
+  const _wdTimer = setTimeout(() => {
+    if (res.headersSent || res.writableEnded) return;   // 已经开始回包 ⇒ 不插手 ✓
+    try {
+      log(`⚠️ 看门狗：${req.method} ${String(req.url).split('?')[0]} ${Math.round(RESPONSE_WATCHDOG_MS / 1000)}s 未发出任何响应 ⇒ 回 504（★ handler 里大概率有未捕获异常 ✗ 看上一行日志）`);
+      res.writeHead(504, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'server_timeout', reason: 'no_response_within_watchdog' }));
+    } catch (_) { /* 连接已经烂了 ⇒ 无能为力 ✓ */ }
+  }, RESPONSE_WATCHDOG_MS);
+  const _wdClear = () => clearTimeout(_wdTimer);
+  res.on('finish', _wdClear);
+  res.on('close', _wdClear);
 
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
