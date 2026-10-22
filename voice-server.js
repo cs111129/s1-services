@@ -2229,6 +2229,17 @@ async function handleASR(audioData) {
     try {
       const se = String((error && (error.stderr || error.message)) || '').trim();
       const tail = se.split('\n').filter(Boolean).slice(-6).join(' | ');
+      // ★★ 2026-10-22（CR-20261022-04 §5 的对账结果）：**"识别结果为空"不是服务器故障** ✗✗
+      //   实测 20:10:54 那条 `server_error` 的真因就是这句：
+      //     `[asr] 第1/1段（0-8s）→ 0 字 … 识别结果为空`
+      //   ⇒ 用户那一下没说话/声音太小/全是环境噪音 ⇒ **这是"没听清"，不是"服务器坏了"** ✓
+      //   ★ 原来把它当成子进程失败 ⇒ 设备收到 `server_error` ⇒ 用户看到"服务器出了点问题" ✗（冤枉自己）
+      //   ⇒ 这里**返回空文本**，让上层走已有的 `asr_empty`（"没听清，再说一遍？"）✓
+      if (/识别结果为空|识别结果为空/.test(se)) {
+        log('ASR: 这段没识别到文字（按"没听清"处理，不算服务器故障 ✓）');
+        [webmPath, pcmPath].forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
+        return { success: true, text: '' };
+      }
       log(`⚠️ ASR 子进程失败${error && error.killed ? '（超时被杀）' : ''}: ${tail.slice(0, 400) || '(无 stderr)'}`);
     } catch (_) {}
     [webmPath, pcmPath].forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
@@ -4721,7 +4732,11 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
          队列里还有多少秒可播 → 决定下一块能放多大（合成速度实测 ≈18 字/秒，取 16 保守）
        ⇒ 首块仍是 60 字（出声不受影响），后面越攒越大（最多 240 字）✓
   */
-  const STREAM_FIRST_CAP = 60;    // 首块上限（出声延迟由它决定，别再调大）
+  // ★★ 2026-10-22（CR-20261022-04 §3.1）：首块 60 → **40 字** ✗
+  //   他们实测首块延迟 9.6~16.5 s，长回答播放里净静音 4.8 s ⇒ 请我们把首块做小、到达曲线更平滑 ✓
+  //   ★ 首块只影响"多久出声"和"第一口气多长" ⇒ 40 字 ≈ 6 s 音频、合成 ≈ 3 s（比 60 字早 1~2 s 出声 ✓）
+  //   ★ 后续块仍 240 字（★ 别一起改小：每块是一次 python TTS，块太小 = 子进程开销占比升高 ✗）
+  const STREAM_FIRST_CAP = 40;    // 首块上限（出声延迟由它决定，别再调大）
   const STREAM_REST_CAP = 240;    // 后续块上限（越大越自然；实测单次 248 字没问题 ✓）
   const STREAM_SYNTH_CPS = 16;    // 合成速度（字/秒）保守值（实测 230 字 12.8s ≈ 18）
   // 只在句末标点断开（保留标点）；没有标点的尾巴也算一句
