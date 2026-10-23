@@ -4668,9 +4668,11 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
           reply: reply,
           audio: audioPath,
           // ★ 实际音频格式（可能被服务端自动降级过 —— 见 AUTO_ULAW8）
-          format: afmt === 'ulaw8' ? 'ulaw8' : 'pcm_s16le',
-          bits: afmt === 'ulaw8' ? 8 : 16,
-          sample_rate: 16000,
+          // ★ 2026-10-23：8k 档的元信息也要对 ✓（原来 ulaw8_8k 会被回成 pcm_s16le / 16000 ✗ 与 WAV 头矛盾）
+          format: isUlawFmt(afmt) ? 'ulaw8' : 'pcm_s16le',
+          bits: isUlawFmt(afmt) ? 8 : 16,
+          sample_rate: fmtRateHz(afmt),
+          ...(afmt === 'ulaw8_8k' ? { fmt_label: 'ulaw8_8k' } : {}),
           channels: 1,
           session: device ? (device + '#' + chatDepthOf(device)) : '',
           // ★ CR-20261012-02：语气（★ 没有就**不带这个字段** ✗ —— 设备端会用自己的两层降级 ✓
