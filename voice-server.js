@@ -4408,8 +4408,12 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
         // ★ audio_fmt 对老路也生效（CR-20260929-03 §16.4）—— fallback 那条路同样能省一半流量
         //   ★ 用 let：下面第 ④ 步可能在"不降级就要截断"时把它改成 ulaw8
-        const fmtPartOld = parts.find(p => p.name === 'audio_fmt');
-        let afmt = (fmtPartOld && String(fmtPartOld.data.toString('utf8')).trim() === 'ulaw8') ? 'ulaw8' : 'pcm16';
+        // ★ 2026-10-23：老路也认 `format` 字段与 8k 档 ✓（这条路的音频是**整段 WAV** ⇒ 头里 rate/byte_rate 由 ffmpeg 按档写对 ✓）
+        const fmtPartOld = parts.find(p => p.name === 'audio_fmt' || p.name === 'format');
+        const _fvo = fmtPartOld ? String(fmtPartOld.data.toString('utf8')).trim().toLowerCase() : '';
+        let afmt = 'pcm16';
+        if (_fvo === 'ulaw8_8k' || _fvo === 'ulaw8k' || _fvo === 'mulaw8k') afmt = 'ulaw8_8k';
+        else if (_fvo === 'ulaw8' || _fvo === 'ulaw' || _fvo === 'mulaw') afmt = 'ulaw8';
 
         if (!audioPart || !audioPart.data || !audioPart.data.length) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
