@@ -2261,12 +2261,28 @@ function globTtsChunks() {
 
 // TTS: 文字 → 音频
 //   ★ audioFmt（CR-20260929-03 §16.4，设备端建议的字段名）：
-//     'pcm16'（缺省）/ 'ulaw8' ⇒ 生成的 .wav 用 8bit μ-law（tag=7, 16k）
+//     'pcm16'（缺省）/ 'ulaw8'（16k μ-law）/ 'ulaw8_8k'（★ 2026-10-23 新增：8k μ-law，体积再砍半）
 //     ⇒ ★ 体积直接减半（16k/16bit=32KB/s → 16k/8bit=16KB/s）
 //     ⇒ 设备端 §16 已验完 μ-law 解码（查表 + 正经遍历 RIFF 块找 fmt/data）✓
 //     ⚠️ 默认必须是 pcm16 —— 浏览器/WebChat 也在用 /api/tts，它们没有 μ-law 解码器 ✗
+/* ══════════ ★★ 2026-10-23：8 kHz μ-law 档（设备端已验 I2S 8000 ✓）══════════
+ * 三档音频格式，只差"采样率 × 编码"：
+ *   · pcm16    = 16k/16bit = 32 KB/s（默认，浏览器/WebChat 也吃它）
+ *   · ulaw8    = 16k/8bit  = 16 KB/s（CR-20261022-02 上线 ✓）
+ *   · ulaw8_8k =  8k/8bit  =  8 KB/s（★ 新档：设备端实测到达 14.6~15.0 KB/s < 16 ⇒ 需求减半才吃得饱 ✓）
+ * ★ 响应头仍写 `format:"ulaw8"`（设备按它选解码表 ✓），真正的区别在 `sample_rate:8000` ✓
+ *   ⇒ 老固件收到 `format:ulaw8` 但 `sample_rate:8000` 会按 16k 播 ⇒ **必须设备端先支持 8k 再用这个档** ✗
+ *   ⚠️ 默认绝不改：所有自动降级路径最多到 `ulaw8`，`ulaw8_8k` **只能由设备显式请求** ✓
+ */
+function isUlawFmt(fmt) { return fmt === 'ulaw8' || fmt === 'ulaw8_8k'; }
+function fmtRateHz(fmt) { return fmt === 'ulaw8_8k' ? 8000 : 16000; }
+function fmtBytesPerSec(fmt) {
+  if (fmt === 'ulaw8_8k') return 8000;
+  if (fmt === 'ulaw8') return 16000;
+  return 32000;   // pcm16
+}
 async function handleTTS(text, audioFmt) {
-  const ulaw = (audioFmt === 'ulaw8');
+  const ulaw = isUlawFmt(audioFmt);
   const timestamp = Date.now();
   const ttsMp3 = `tts-${timestamp}.mp3`;
   const ttsWav = `tts-${timestamp}.wav`;
@@ -2313,7 +2329,7 @@ async function handleTTS(text, audioFmt) {
     //   ★ ulaw8 时改用 pcm_mulaw（8bit，tag=7）—— 设备端按 fmt 块自适应 ✓
     try {
       const ac = ulaw ? 'pcm_mulaw' : 'pcm_s16le';
-      execSync(`ffmpeg -y -i "${mp3Target}" -acodec ${ac} -ar 16000 -ac 1 "${wavTarget}"`, { stdio: 'pipe', timeout: 15000 });
+      execSync(`ffmpeg -y -i "${mp3Target}" -acodec ${ac} -ar ${fmtRateHz(audioFmt)} -ac 1 "${wavTarget}"`, { stdio: 'pipe', timeout: 15000 });
     } catch(e) {
       log(`WAV 转码失败(不影响 MP3): ${e.message}`);
     }
@@ -2326,7 +2342,7 @@ async function handleTTS(text, audioFmt) {
   //     · `format=ulaw8` ⇒ μ-law WAV（★ 设备要的 ✓ 体积约 PCM16 的一半 ✓）
   //     · `format=wav`   ⇒ PCM16 WAV（★ 兼容其它要 WAV 的消费者 ✓）
   //     · 不传           ⇒ .mp3（★ **保持原样** ✓ 浏览器/WebChat 一直在用 ✗ 不能改 ✓）
-  if (audioFmt === 'ulaw8' || audioFmt === 'wav') {
+  if (isUlawFmt(audioFmt) || audioFmt === 'wav') {
     if (!fs.existsSync(wavTarget)) throw new Error('WAV 转码失败（format=' + audioFmt + '）');
     return { success: true, audio: `/api/voice-audio/${ttsWav}`, format: audioFmt };
   }
@@ -2454,10 +2470,10 @@ function handleVoiceWS(ws) {
 const SILENCE_MS = 40;
 /** 生成一段静音 PCM（按当前格式 ✓ 16k/单声道 ⇒ pcm16 = 32000 B/s，ulaw8 = 16000 B/s ✓） */
 function silencePcm(afmt) {
-  const bytes = Math.round((afmt === 'ulaw8' ? 16000 : 32000) * (SILENCE_MS / 1000));
+  const bytes = Math.round(fmtBytesPerSec(afmt) * (SILENCE_MS / 1000));
   // ★ μ-law 的**静音不是 0** ✗✗ —— 0x00 解出来是满幅负值（很响 ✗）
   //   查表：μ-law 里 0xFF 才是"接近 0" ✓（他们解码器照标准表 ✓）⇒ 该填 0xFF ✓
-  return Buffer.alloc(bytes, afmt === 'ulaw8' ? 0xff : 0);
+  return Buffer.alloc(bytes, isUlawFmt(afmt) ? 0xff : 0);
 }
 /** 命令回合给老端点（非流式）用的静音音频文件（懒创建一次 ✓ 之后复用同一个 URL ✓） */
 let _silenceUrl = '';
@@ -4016,7 +4032,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
   //   ★ 实测锚点：247 字 → 1,487KB ⇒ **pcm16 的物理封顶约 243 字**，取 200 留 20% 余量。
   //   ★ 流式那条路**也要看这个预算**（设备端把流式 PCM 收在同一个缓冲里 —— 2026-10-07 实测证实）✓
   function wavCapFor(afmt, want) {
-    return afmt === 'ulaw8' ? Math.min(want, 400) : Math.min(want, 200);
+    return isUlawFmt(afmt) ? Math.min(want, 400) : Math.min(want, 200);
   }
   // ★★ 设备端整段音频缓冲 = `VOICE_WAV_MAX` = 1.5MB ⇒ 服务端自己留 ~100KB 余量
   //   为什么流式也要按它收：2026-10-07 实测日志里 `detail=3` 推过 **2,075,594 字节** PCM，
@@ -4024,12 +4040,12 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
   const DEV_AUDIO_BUDGET = 1.4 * 1024 * 1024;
   // 16k 单声道：pcm16 = 32KB/s、ulaw8 = 16KB/s；中文 TTS ≈5.0 字/秒
   //   ⇒ **每字 ≈6.4KB（pcm16）/ 3.2KB（ulaw8）**（用实测校准过：247 字 → 1,487KB ✓）
-  const BYTES_PER_CHAR = { pcm16: 6400, ulaw8: 3200 };
+  const BYTES_PER_CHAR = { pcm16: 6400, ulaw8: 3200, ulaw8_8k: 1600 };   // ★ 8k 档再减半 ✓
   function audioBytesFor(n, fmt) { return n * (BYTES_PER_CHAR[fmt] || BYTES_PER_CHAR.pcm16); }
   // 流式：按字节预算选格式（pcm16 装得下就用 pcm16，装不下换 μ-law = 正好一半）
   //   ★ 必须在**发 JSON 头之前**定下来，否则头里写的 format 与实际字节流不一致 ✗
   function pickStreamFmt(afmt, n) {
-    if (!AUTO_ULAW8 || afmt === 'ulaw8') return afmt;
+    if (!AUTO_ULAW8 || isUlawFmt(afmt)) return afmt;   // ★ 用户/设备指定的 μ-law 档（含 8k）一律尊重 ✓
     const need = audioBytesFor(n, 'pcm16');
     if (need <= DEV_AUDIO_BUDGET) return 'pcm16';
     log(`voice-chat-stream: ${n} 字 pcm16 ≈ ${(need / 1048576).toFixed(2)}MB > 预算 ` +
@@ -4702,12 +4718,12 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
   //   而 libuv 的 socket write 是异步的 ⇒ 阻塞期间已排队的响应数据发不出去 ✗
   //   （这正是设备端实测"头与首块 PCM 只差 1ms"的成因之一 ✓）
   function ffmpegToPcm(wav, fmt) {
-    const ulaw = (fmt === 'ulaw8');
+    const ulaw = isUlawFmt(fmt);
     return new Promise((resolve, reject) => {
       execFile('ffmpeg', ['-y', '-v', 'error', '-i', wav,
                           '-f', ulaw ? 'mulaw' : 's16le',
                           '-acodec', ulaw ? 'pcm_mulaw' : 'pcm_s16le',
-                          '-ar', '16000', '-ac', '1', '-'],
+                          '-ar', String(fmtRateHz(fmt)), '-ac', '1', '-'],
                { maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' },
                (err, stdout) => err ? reject(err) : resolve(stdout));
     });
@@ -4808,7 +4824,9 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         // ★ 取值：'ulaw8'（也认 'ulaw'/'mulaw'，手写客户端容易少个 8 ✓）；其余/缺失一律 pcm16，不报错
         //   ★ 用 let：下面可能按"体积预算"自动改成 ulaw8（见 pickStreamFmt）
         const _fv = fmtPart ? String(fmtPart.data.toString('utf8')).trim().toLowerCase() : '';
-        let afmt = (_fv === 'ulaw8' || _fv === 'ulaw' || _fv === 'mulaw') ? 'ulaw8' : 'pcm16';
+        let afmt = 'pcm16';
+        if (_fv === 'ulaw8_8k' || _fv === 'ulaw8k' || _fv === 'mulaw8k') afmt = 'ulaw8_8k';   // ★ 2026-10-23：8k 档 ✓
+        else if (_fv === 'ulaw8' || _fv === 'ulaw' || _fv === 'mulaw') afmt = 'ulaw8';
         if (!audioPart || !audioPart.data || !audioPart.data.length) { fail('no_audio'); return; }
 
         const asr = await handleASR(audioPart.data);
@@ -4968,8 +4986,11 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         headLine(res, {
           success: true, text: oneLine(heard), reply: oneLine(reply),
           session: device ? (device + '#' + chatDepthOf(device)) : '',
-          sample_rate: 16000, channels: 1,
-          bits: afmt === 'ulaw8' ? 8 : 16, format: afmt === 'ulaw8' ? 'ulaw8' : 'pcm_s16le',
+          sample_rate: fmtRateHz(afmt), channels: 1,
+          // ★★ 2026-10-23：8k 档头里仍报 ormat:ulaw8（设备按它选解码表 ✓），区别在 sample_rate:8000 ✓
+          //   ★ 另给一个 mt_label 便于两端日志对账（设备可忽略 ✓）
+          bits: isUlawFmt(afmt) ? 8 : 16, format: isUlawFmt(afmt) ? 'ulaw8' : 'pcm_s16le',
+          ...(afmt === 'ulaw8_8k' ? { fmt_label: 'ulaw8_8k' } : {}),
           // ★ CR-20261010-01：命令回合才带这两个字段 ✓（不是命令 ⇒ 一个都不加 ⇒ 老固件 behavior 完全不变 ✓）
           ...(vcS && vcS.action ? { action: vcS.action } : {}),
           ...(vcS && vcS.params ? { params: vcS.params } : {}),
@@ -4989,7 +5010,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         // ★★★ 自适应分块：只在句末断开，块大小按"播放队列还能撑多久"决定
         //   首块 60 字（出声快）→ 队列攒起来后放大到 240 字（语调自然、拼缝少）
         const sents = splitSents(reply);
-        const bytesPerSec = afmt === 'ulaw8' ? 16000 : 32000;
+        const bytesPerSec = fmtBytesPerSec(afmt);
         let pieceN = 0, si = 0, carry = '';   // ★ `pushed` 已提前声明（上面那段追查日志要用 ✓）
         // ★★ 2026-10-12 命令回合：reply 空 ⇒ **送 40ms 静音垫** ✗
         //   ★ 为什么不能"什么都不送"：他们 `voice.c` 判成功的条件是 `audio_bytes > 0` ✓
