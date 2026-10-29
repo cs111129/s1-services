@@ -3807,7 +3807,17 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         // 取出 batch（无则用时间戳）；拼 device_id 前缀使其全局唯一
         const batchPart = parts.find(p => p.name === 'batch');
         const rawBatch = batchPart ? batchPart.data.toString().trim() : '';
-        const batch = (device_id ? device_id + '_' : '') + (rawBatch || ('auto-' + Date.now()));
+        // ★★ 2026-10-29 修（真事故：两条记录"没进分析"其实是**覆盖了历史记录**）✗✗
+        //   现场：FN-0004 今天 13:39 / 13:43 上传的 `batch=1` / `batch=2`，
+        //         在 S2 的 `cam_analysis` 里撞上了 **2026-09-20** 的同名批次（`FN-0004_1` / `FN-0004_2`）
+        //         ⇒ 走的是 `ON CONFLICT(device_id,batch) DO UPDATE` ⇒ **9-20 的两条被就地覆盖**（id 211/212 还在，
+        //           内容变成今天的，`created_at` 仍是 9-20）⇒ 列表里按日期看 = "今天这两条没进分析" ✗
+        //   ★ 根因：**设备重启/重烧后 batch 从 1 重新计数**，而批次名只含 device_id ⇒ **跨天/跨重启必然撞名**
+        //   ⇒ 批次名里加**北京日期**：`<dev>_<yyyymmdd>_<raw>` ⇒ 当天唯一、跨天不会覆盖 ✓
+        //   ★ 不影响：设备侧（不解析响应）· 上传日志页（推给 S2 的是**原始 batch**）· 重分析（按记录自己的 batch 找目录 ✓）
+        //   ⚠️ 历史记录不会被改名（它们已经进去了，不动）✓
+        const _bjDay = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10).replace(/-/g, '');
+        const batch = (device_id ? device_id + '_' : '') + _bjDay + '_' + (rawBatch || ('auto-' + Date.now()));
         const sopPart = parts.find(p => p.name === 'sop_id');
         const sop_id = sopPart ? sopPart.data.toString().trim() : '';
         // 拍照间隔（41号文档，设备端传实际间隔，缺省兜底 5000ms）
