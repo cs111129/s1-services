@@ -4993,8 +4993,8 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
           success: true, text: oneLine(heard), reply: oneLine(reply),
           session: device ? (device + '#' + chatDepthOf(device)) : '',
           sample_rate: fmtRateHz(afmt), channels: 1,
-          // ★★ 2026-10-23：8k 档头里仍报 ormat:ulaw8（设备按它选解码表 ✓），区别在 sample_rate:8000 ✓
-          //   ★ 另给一个 mt_label 便于两端日志对账（设备可忽略 ✓）
+          // ★★ 2026-10-23：8k 档头里仍报 format:ulaw8（设备按它选解码表 ✓），区别在 sample_rate:8000 ✓
+          //   ★ 另给一个 fmt_label 便于两端日志对账（设备可忽略 ✓）
           bits: isUlawFmt(afmt) ? 8 : 16, format: isUlawFmt(afmt) ? 'ulaw8' : 'pcm_s16le',
           ...(afmt === 'ulaw8_8k' ? { fmt_label: 'ulaw8_8k' } : {}),
           // ★ CR-20261010-01：命令回合才带这两个字段 ✓（不是命令 ⇒ 一个都不加 ⇒ 老固件 behavior 完全不变 ✓）
