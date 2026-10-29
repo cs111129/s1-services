@@ -149,6 +149,8 @@ const camDeviceState = {};
 // ⚠️ 绝不能把「键不存在」当成「未绑定」✗✗ —— 员工会以为没绑（实际绑了）→ 去重复绑定甚至绑到别人名下
 // ⚠️ 纯内存：S1 一重启就退回「未知」⇒ 由 S2 每 5 分钟幂等重推兜底（规格书 §6）
 const camBindInfo = {};
+// ★ 2026-10-29：上传批次名幂等记忆（设备重试同一批 ⇒ 沿用同一批次名，见 cam-upload 里那段）
+const _uploadBatchMemo = new Map();
 
 // 给 /api/cam/cmd 的响应挂上 student 字段（规格书 §4.2 参考实现）
 // 返回【新的】对象，不改动传进来的那个 —— 否则 cmd/send 里那份 pending 会被污染
@@ -3816,8 +3818,28 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         //   ⇒ 批次名里加**北京日期**：`<dev>_<yyyymmdd>_<raw>` ⇒ 当天唯一、跨天不会覆盖 ✓
         //   ★ 不影响：设备侧（不解析响应）· 上传日志页（推给 S2 的是**原始 batch**）· 重分析（按记录自己的 batch 找目录 ✓）
         //   ⚠️ 历史记录不会被改名（它们已经进去了，不动）✓
-        const _bjDay = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10).replace(/-/g, '');
-        const batch = (device_id ? device_id + '_' : '') + _bjDay + '_' + (rawBatch || ('auto-' + Date.now()));
+        // ★★ 2026-10-29 二次修（用户拍板）：日期 + **时分秒** ⇒ `<dev>_<yyyymmdd>_<HHMMSS>_<raw>` ✗✗
+        //   ★ 为什么要时分秒：同一天**重烧/重启**后 batch 又从 1 开始 ⇒ 只加日期时**当天仍会撞名** ✓
+        //   ★★ 但**不能无脑加时间** ✗：设备上传失败会**重试同一批**（1s/4s/10s）——
+        //      每次上传都生成新批次名 ⇒ 同一段录像会被**分析多次**（白花钱 + 记录重复）✗✗
+        //   ⇒ 加一张 **60 秒记忆表**：同一 `设备+原始batch` 在 60 秒内再来（= 重试）⇒ **沿用同一个批次名** ✓
+        //      超过 60 秒 ⇒ 视为新事件，给新时间戳 ✓（重试最多十几秒，60 秒够用且不会误并两次真实录制）
+        const _bjISO = new Date(Date.now() + 8 * 3600 * 1000).toISOString();   // 已加 8h，取 ISO 片段即北京时间
+        const _bjDay = _bjISO.slice(0, 10).replace(/-/g, '');
+        const _bjTime = _bjISO.slice(11, 19).replace(/:/g, '');
+        const _batchKey = String(device_id || '?') + '|' + String(rawBatch || '');
+        const _nowMs = Date.now();
+        const _prevB = _uploadBatchMemo.get(_batchKey);
+        let batch;
+        if (_prevB && _nowMs - _prevB.at < 60000) {
+          batch = _prevB.name;                                   // ★ 重试 ⇒ 沿用 ✓（幂等）
+        } else {
+          batch = (device_id ? device_id + '_' : '') + _bjDay + '_' + _bjTime + '_' + (rawBatch || ('auto-' + _nowMs));
+        }
+        _uploadBatchMemo.set(_batchKey, { name: batch, at: _nowMs });
+        if (_uploadBatchMemo.size > 200) {                       // 防无限增长（低频清理 ✓）
+          for (const [k, v] of _uploadBatchMemo) { if (_nowMs - v.at > 600000) _uploadBatchMemo.delete(k); }
+        }
         const sopPart = parts.find(p => p.name === 'sop_id');
         const sop_id = sopPart ? sopPart.data.toString().trim() : '';
         // 拍照间隔（41号文档，设备端传实际间隔，缺省兜底 5000ms）
