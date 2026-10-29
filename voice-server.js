@@ -2552,42 +2552,9 @@ const server = http.createServer(async (req, res) => {
   // 设备鉴权相关函数与状态已挪到**模块作用域**（见文件上方 CAM_SECRET_FILE 那一段）。
   // 原先写在这里会被每个请求重新初始化 → 缓存失效 + 日志刷屏。
 
-  // POST /api/cam/register - 设备联网注册（A 验证期：登记状态，不强制持久化）
-  if (req.method === 'POST' && req.url === '/api/cam/register') {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', () => {
-      try {
-        const o = JSON.parse(body || '{}');
-        const dev = pickDeviceId(req, null, o);
-        if (!checkDeviceSecret(pickSecret(req, null, o), dev)) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: '设备密钥错误' }));
-          return;
-        }
-        if (!dev) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: '缺少 device_id' }));
-          return;
-        }
-        logAuthSource(req, dev, 'register');
-        // ★ 合并写入，不能整个替换 —— 否则注册会把已缓存的电量抹掉
-        if (!camDeviceState[dev]) camDeviceState[dev] = {};
-        camDeviceState[dev].status = o.status || 'idle';
-        camDeviceState[dev].last_seen = Date.now();
-        setCamBattery(dev, o);
-        log(`cam 设备注册: ${dev} (mac=${o.mac || '?'})`);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true }));
-      } catch (e) {
-        log(`cam register 错误: ${e.message}`);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
+  // ★★ 2026-10-29：**/api/cam/register 已下线** ✗（早期"A 验证期设备注册"，早已无人使用）
+  //   判据：① 7 天 cam-access.log 命中 **0 次** ② 固件 main/*.c 与 S2 全仓 **零引用** ✓
+  //   ⇒ 少一个暴露面 ✓（要恢复：git show 1ecd206~1:voice-server.js | sed -n '/POST \/api\/cam\/register/,/^  }$/p'）
   // ══════════════════════════════════════════════════════════════════════
   // ★★ 赋能03 手表「岗位职责追踪」转发（CR-20261019-01 ✓）
   //
