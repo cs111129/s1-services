@@ -3837,7 +3837,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         //         ⇒ 前端拿 `last_shot_batch` 去 `/api/cam/file-list/<batch>` 查 ⇒ **批次不存在** ⇒ 屏上"没能拿到预览画面" ✗
         //   ⇒ 抓拍批次**不加日期前缀、也不走 60 秒记忆**：原样用设备给的名字 ✓
         //   ★ 判据：**"名字由谁生成、谁就得能对上"** —— 抓拍名是设备生成的，前端也拿它查 ⇒ 服务端不能改写 ✗
-        if (/_shot_/.test(String(rawBatch || ''))) {
+        if (/^shot_/i.test(String(rawBatch || ''))) {   // ★ 设备的抓拍批次就是 shot_<ms>_<rand>（无前导下划线）✗ 别写成 /_shot_/
           batch = (device_id ? device_id + '_' : '') + String(rawBatch);
         } else if (_prevB && _nowMs - _prevB.at < 60000) {
           batch = _prevB.name;                                   // ★ 重试 ⇒ 沿用 ✓（幂等）
