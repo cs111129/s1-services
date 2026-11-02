@@ -3831,7 +3831,15 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         const _nowMs = Date.now();
         const _prevB = _uploadBatchMemo.get(_batchKey);
         let batch;
-        if (_prevB && _nowMs - _prevB.at < 60000) {
+        // ★★★ 2026-11-02 修（"远程预览一直取不到画面"）：**抓拍批次名必须与设备上报的 `last_shot_batch` 逐字一致** ✗✗
+        //   现场：设备上报 `FN-0004_shot_1793598059472_175`（它自己拼的、已含 shot_<ms>_<rand> ⇒ 天然唯一 ✓）
+        //         而我 10-29 给所有批次名加了日期时分秒 ⇒ 存成 `FN-0004_20261102_134103_shot_…`
+        //         ⇒ 前端拿 `last_shot_batch` 去 `/api/cam/file-list/<batch>` 查 ⇒ **批次不存在** ⇒ 屏上"没能拿到预览画面" ✗
+        //   ⇒ 抓拍批次**不加日期前缀、也不走 60 秒记忆**：原样用设备给的名字 ✓
+        //   ★ 判据：**"名字由谁生成、谁就得能对上"** —— 抓拍名是设备生成的，前端也拿它查 ⇒ 服务端不能改写 ✗
+        if (/_shot_/.test(String(rawBatch || ''))) {
+          batch = (device_id ? device_id + '_' : '') + String(rawBatch);
+        } else if (_prevB && _nowMs - _prevB.at < 60000) {
           batch = _prevB.name;                                   // ★ 重试 ⇒ 沿用 ✓（幂等）
         } else {
           batch = (device_id ? device_id + '_' : '') + _bjDay + '_' + _bjTime + '_' + (rawBatch || ('auto-' + _nowMs));
