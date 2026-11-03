@@ -2570,10 +2570,19 @@ function observeDeviceAuth(req) {
           legacySecret: c.fallbackSecret || CAM_DEVICE_SECRET,
         });
         if (r.mode === 'sig') {
-          if (r.ok) _hmacStats.sigOk++;
-          else {
+          if (r.ok) {
+            _hmacStats.sigOk++;
+            // ★ 前 5 次成功的**逐条**打日志：部署当天要能立刻看到"签名真的通了" ✓
+            if (_hmacStats.sigOk <= 5) log(`[hmac] ✓ 签名通过: ${r.deviceId} ${req.method} ${String(req.url).split('?')[0]}`);
+          } else {
             _hmacStats.sigFail++;
             _hmacFailReasons.set(r.reason, (_hmacFailReasons.get(r.reason) || 0) + 1);
+            // ★ 失败按"原因"限流打日志（同一原因 60 秒最多一条，防刷屏 ✓ 但绝不静默）
+            const _k = `_hmacLogged_${r.reason}`;
+            if (!observeDeviceAuth[_k] || Date.now() - observeDeviceAuth[_k] > 60000) {
+              observeDeviceAuth[_k] = Date.now();
+              log(`[hmac] ✗ 签名失败: ${r.deviceId || '(无设备号)'} ${req.method} ${String(req.url).split('?')[0]} ⇒ ${r.reason}`);
+            }
           }
         } else if (r.mode === 'legacy') _hmacStats.legacy++;
         else _hmacStats.none++;
