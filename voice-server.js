@@ -3029,6 +3029,70 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  /* ══════════ CR-20261103-01 M2/M3：手表 config / attendance（2026-11-03）══════════
+   * 两个都是"验设备密钥 → 带 ingest token 转发 S2"的同一条路（与 /api/watch/status 一致 ✓）
+   *   GET  /api/watch/config?device_id=  ⇒ 原样透传 S2 的 JSON（employee 三态 + zones + 阈值）
+   *   POST /api/watch/attendance         ⇒ 原样透传 body，回 S2 的 {ok,accepted,duplicated}
+   * ★ 为什么不在这里加工：真源在 S2（绑定表/区域表/事件表）✓ S1 只做鉴权 + 转发 ✓
+   */
+  if (req.method === 'GET' && req.url.split('?')[0] === '/api/watch/config') {
+    const q = getQuery(req.url);
+    const dev = pickDeviceId(req, q, null);
+    const jsonOut = (code2, obj) => { try { res.writeHead(code2, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); } catch (e) {} };
+    if (!checkDeviceSecret(pickSecret(req, q, null), dev)) { jsonOut(401, { ok: false, error: '设备密钥错误' }); return; }
+    if (!dev) { jsonOut(400, { ok: false, error: '缺少 device_id' }); return; }
+    try {
+      const r = await fetch('https://ai.hiiin.com/api/watch/config?device_id=' + encodeURIComponent(dev), {
+        headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` },
+        signal: AbortSignal.timeout(15000),
+      });
+      const txt = await r.text();
+      if (!r.ok) { log(`watch config 转发失败: ${dev} ⇒ S2 HTTP ${r.status}`); jsonOut(502, { ok: false, error: '配置暂取不到，请稍后重试' }); return; }
+      log(`watch 拉配置: ${dev}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(txt);                       // ★ 原样透传（不重新序列化 ⇒ employee 三态不被破坏 ✓）
+    } catch (e) {
+      log(`watch config 异常: ${dev} ⇒ ${e.message}`);
+      jsonOut(502, { ok: false, error: '配置暂取不到，请稍后重试' });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && req.url.split('?')[0] === '/api/watch/attendance') {
+    let abody = '';
+    req.on('data', c => { abody += c; if (abody.length > 65536) { try { req.destroy(); } catch (e) {} } });
+    req.on('end', async () => {
+      let o = {};
+      try { o = JSON.parse(abody || '{}'); } catch (e) { o = {}; }
+      const jsonOut = (code2, obj) => { try { res.writeHead(code2, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); } catch (e) {} };
+      // ★ 契约里批量上报用的键是 `device`（不是 device_id）⇒ 归一化后再取 ✓
+      if (o.device && !o.device_id) o.device_id = o.device;
+      const dev = pickDeviceId(req, null, o);
+      if (!checkDeviceSecret(pickSecret(req, null, o), dev)) { jsonOut(401, { ok: false, error: '设备密钥错误' }); return; }
+      if (!dev) { jsonOut(400, { ok: false, error: '缺少 device' }); return; }
+      const evs = Array.isArray(o.events) ? o.events : [];
+      if (!evs.length) { jsonOut(400, { ok: false, error: 'events 不能为空' }); return; }
+      try {
+        const r = await fetch('https://ai.hiiin.com/api/watch/attendance', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device: dev, fw: o.fw, events: evs.slice(0, 50) }),
+          signal: AbortSignal.timeout(20000),
+        });
+        const txt = await r.text();
+        if (!r.ok) { log(`watch 考勤转发失败: ${dev} ⇒ S2 HTTP ${r.status}`); jsonOut(502, { ok: false, error: '考勤暂存失败，请重试' }); return; }
+        let d = {}; try { d = JSON.parse(txt); } catch (e) { d = {}; }
+        log(`watch 考勤上报: ${dev} ⇒ 新增 ${d.accepted || 0} / 重复 ${d.duplicated || 0}` +
+            (d.invalid ? ` / 非法 ${d.invalid}` : ''));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(txt);                     // ★ 原样透传（accepted/duplicated 手表据此清队列 ✓）
+      } catch (e) {
+        log(`watch 考勤异常: ${dev} ⇒ ${e.message}`);
+        jsonOut(502, { ok: false, error: '考勤暂存失败，请重试' });
+      }
+    });
+    return;
+  }
   /* ══════════ CR-20261103-01 M1：赋能03 手表 心跳/状态（2026-11-03）══════════
    * 设备 → S1 `POST /api/watch/status`（X-Device-Id + X-Device-Secret）
    *   ⇒ S1 验密钥（与 /api/cam/*、/api/duty/* **同一把** checkDeviceSecret ✓ 不另造鉴权）
