@@ -2625,7 +2625,17 @@ function observeDeviceAuth(req) {
             }
           }
         } else if (r.mode === 'legacy') { _hmacStats.legacy++; hmacBumpDev(String(req.headers['x-device-id'] || '').trim() || '(未知)', 'legacy'); }
-        else _hmacStats.none++;
+        else {
+          _hmacStats.none++;
+          // ★ 观测"无凭据"到底是哪些请求（设备端会问：无凭据>0 ⇒ 还有别的调用方吗）
+          //   同一 method+path 每分钟最多记一条 ✓
+          const _nk = '_hmacNone_' + req.method + ' ' + String(req.url).split('?')[0];
+          if (!observeDeviceAuth[_nk] || Date.now() - observeDeviceAuth[_nk] > 60000) {
+            observeDeviceAuth[_nk] = Date.now();
+            log('[hmac] · 无凭据请求: ' + req.method + ' ' + String(req.url).split('?')[0]
+              + ' UA=' + String(req.headers['user-agent'] || '-').slice(0, 40));
+          }
+        }
       }
       if (_hmacStats.total % 200 === 0 || Date.now() - _hmacLastLog > 300000) {
         _hmacLastLog = Date.now();
