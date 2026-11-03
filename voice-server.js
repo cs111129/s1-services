@@ -3265,7 +3265,14 @@ const server = http.createServer(async (req, res) => {
         if (v !== undefined && v !== null && String(v).trim() !== '') payload[k] = v;
       });
       // ★ M4：设备的设置回执（config_ok 是对象，不能走上面的字符串判空）⇒ 单独透传 ✓
-      if (o.config_ok && typeof o.config_ok === 'object') payload.config_ok = o.config_ok;
+      if (o.config_ok && typeof o.config_ok === 'object') {
+        payload.config_ok = o.config_ok;
+        // ★★ 2026-11-03 修（自测抓到）：`cmd_id` 是**逐条对账**的钥匙，必须一起透传 ✗
+        //   原来它不在白名单里 ⇒ 被 S1 丢掉 ⇒ S2 收到"无 cmd_id 的回执" ⇒ 退回旧行为
+        //   ⇒ **一条回执把该设备所有待发命令全标 acked**（实测 #6 确认把 #7 也带走了 ✗）
+        const _cid = Number(o.cmd_id || (o.config_ok && o.config_ok.cmd_id) || 0);
+        if (_cid > 0) payload.cmd_id = _cid;
+      }
       try {
         const r = await fetch('https://ai.hiiin.com/api/watch/status', {
           method: 'POST',
