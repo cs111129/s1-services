@@ -2,6 +2,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');   // ★ CR-20261009-01：设备密钥定长比较（timingSafeEqual）
+// ★ CR-20261103-02（P1）：设备接口 HMAC 签名校验（只观测先不拦）
+const hmacAuth = require('./auth-hmac');
 const { exec, execFile, execSync } = require('child_process');
 const { promisify } = require('util');
 const WebSocket = require('ws');   // 新增：WebSocket（BOX-3 云语音）
@@ -2512,7 +2514,90 @@ function silenceAudioUrl() {
 //      ⇒ **不会把"正常的长时间回答"掐断** ✗（这是这条兜底能不能上线的前提 ✓）
 const RESPONSE_WATCHDOG_MS = parseInt(process.env.RESPONSE_WATCHDOG_MS || '60000', 10);
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★ CR-20261103-02 P1：设备接口签名（HMAC-SHA256）**只观测、不拦截**
+ *
+ *   为什么先观测 ✗：签名校验一旦拦错，**全部设备当场 401**，而且老固件没有签名头
+ *   ⇒ 先用一整轮灰度把"签名成功率"量出来，再决定什么时候把 legacy 关掉 ✓
+ *
+ *   ★ 实现方式：**只加一个额外的 data 监听器**，把原始字节攒下来算 hash，
+ *     请求照旧由后面的业务 handler 处理（不改任何现有行为 ✓ 出问题删这段即可）
+ *   ★ 为什么必须用**原始字节**：multipart 一 parse 再 stringify 就对不上了 ✗
+ *   ★ 大 body（>4MB 的录像上传）直接跳过，不攒（内存优先 ✓ 这类请求计入 `big`）
+ * ══════════════════════════════════════════════════════════════════════════ */
+const HMAC_OBSERVE = (process.env.HMAC_OBSERVE !== '0');   // 环境变量可一键关掉
+const HMAC_MAX_BODY = 4 * 1024 * 1024;
+const _hmacStats = { total: 0, sigOk: 0, sigFail: 0, legacy: 0, none: 0, big: 0 };
+const _hmacFailReasons = new Map();      // reason -> 次数（排查用）
+let _hmacLastLog = Date.now();
+
+/** 哪些路径算"设备接口"（与服务端支持的设备面一致） */
+function isDeviceApiPath(u) {
+  const p = String(u || '').split('?')[0];
+  return p.startsWith('/api/cam/') || p === '/api/cam-upload' || p === '/api/cam-sop'
+      || p.startsWith('/api/watch/') || p.startsWith('/api/duty/')
+      || p.startsWith('/api/voice-chat') || p === '/api/tts';
+}
+
+function hmacReport() {
+  const s = _hmacStats;
+  const sigTotal = s.sigOk + s.sigFail;
+  const rate = sigTotal ? Math.round((s.sigOk * 1000) / sigTotal) / 10 : null;
+  const top = [..._hmacFailReasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
+    .map(([k, v]) => `${k}×${v}`).join(' | ');
+  log(`[hmac] 设备请求 ${s.total} 次：签名 ok ${s.sigOk} / 失败 ${s.sigFail}`
+    + (rate === null ? '' : `（成功率 ${rate}%）`)
+    + ` / legacy ${s.legacy} / 无凭据 ${s.none} / 超大跳过 ${s.big}`
+    + (top ? `　失败原因: ${top}` : ''));
+}
+
+function observeDeviceAuth(req) {
+  if (!HMAC_OBSERVE) return;
+  const chunks = [];
+  let total = 0, big = false, done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    try {
+      _hmacStats.total++;
+      if (big) { _hmacStats.big++; }
+      else {
+        const raw = chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
+        const c = camSecrets();
+        const r = hmacAuth.verifyDeviceAuth(req, raw, {
+          secretOf: deviceSecretOf,
+          allowLegacy: true,
+          legacySecret: c.fallbackSecret || CAM_DEVICE_SECRET,
+        });
+        if (r.mode === 'sig') {
+          if (r.ok) _hmacStats.sigOk++;
+          else {
+            _hmacStats.sigFail++;
+            _hmacFailReasons.set(r.reason, (_hmacFailReasons.get(r.reason) || 0) + 1);
+          }
+        } else if (r.mode === 'legacy') _hmacStats.legacy++;
+        else _hmacStats.none++;
+      }
+      if (_hmacStats.total % 200 === 0 || Date.now() - _hmacLastLog > 300000) {
+        _hmacLastLog = Date.now();
+        hmacReport();
+      }
+    } catch (e) {
+      log(`[hmac] 观测异常（不影响业务）: ${e.message}`);
+    }
+  };
+  req.on('data', c => {
+    if (big) return;
+    total += c.length;
+    if (total > HMAC_MAX_BODY) { big = true; chunks.length = 0; return; }
+    chunks.push(c);
+  });
+  req.on('end', finish);
+  req.on('close', finish);      // 对端中断也要落统计（否则大文件会漏数）
+}
 const server = http.createServer(async (req, res) => {
+  // ★ P1：设备接口签名先"只观测"（不改任何行为；HMAC_OBSERVE=0 可整体关掉）
+  if (HMAC_OBSERVE && isDeviceApiPath(req.url)) { try { observeDeviceAuth(req); } catch (e) {} }
   // CORS（docs/44 阶段2：允许设备用 X-Device-Secret / X-Device-Id 请求头）
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
