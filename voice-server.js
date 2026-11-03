@@ -2532,7 +2532,7 @@ const _hmacFailReasons = new Map();      // reason -> 次数（排查用）
 // ★ 2026-11-03：分设备统计（设备端要求「按设备号分组」）—— 只有分设备才能一眼看出
 //   「哪台在签名、哪台还在 legacy」⇒ 这是决定能不能关 legacy 的唯一依据 ✓
 const _hmacByDev = new Map();            // deviceId -> { ok, fail, legacy, lastFail }
-let _hmacLastLog = Date.now();
+let _hmacLastLog = 0;   // ★ 0 ⇒ 重启后第一条设备请求就打一行统计（部署当天能立刻看到基线 ✓）
 
 /** 哪些路径算"设备接口"（与服务端支持的设备面一致） */
 function isDeviceApiPath(u) {
