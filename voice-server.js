@@ -3361,7 +3361,11 @@ const server = http.createServer(async (req, res) => {
         signal: AbortSignal.timeout(15000),
       }).then(async r => {
         const txt = await r.text();
-        res.writeHead(r.ok ? 200 : 502, { 'Content-Type': 'application/json; charset=utf-8' });
+        // ★★ 2026-11-03 修（设备端 S4）：**上游状态码必须原样透传** ✗
+        //   原来写成 `r.ok ? 200 : 502` ⇒ 上游的 404/409/400 全被压成 502 ✗
+        //   而设备端靠状态码决定动作：200/409=成功删队列 · 404=接口没上线保队列重试 · 400=参数错
+        //   ⇒ 压成 502 会让设备**永远重试**（或永远删掉，取决于它怎么归类），用户点了半天没结果 ✓
+        res.writeHead(r.status, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(txt);
       }).catch(e => {
         log(`⚠️ duty/report 转发失败 ${dev}: ${e.message}`);
