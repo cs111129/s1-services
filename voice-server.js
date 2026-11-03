@@ -3029,6 +3029,56 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  /* ══════════ CR-20261103-01 M1：赋能03 手表 心跳/状态（2026-11-03）══════════
+   * 设备 → S1 `POST /api/watch/status`（X-Device-Id + X-Device-Secret）
+   *   ⇒ S1 验密钥（与 /api/cam/*、/api/duty/* **同一把** checkDeviceSecret ✓ 不另造鉴权）
+   *   ⇒ 带 ingest token 转发 S2 `POST /api/watch/status`（真源库在 S2 ✓ 与 02 同一套路）
+   * ★ 为什么不在 S1 存：S1 是纯内存 + 重启即失；手表状态要能被后台查 ⇒ 必须落库 ✓
+   * ★ 合并语义：`status` 必填且每包覆盖；其余字段"带了才写、缺了不动"（S2 侧实现 ✓）
+   * ★ 响应里先留 `cmd: null` —— M2 的下发通道将来在这里捎带（手表不用改请求 ✓）
+   */
+  if (req.method === 'POST' && req.url.split('?')[0] === '/api/watch/status') {
+    let wbody = '';
+    req.on('data', c => { wbody += c; if (wbody.length > 8192) { try { req.destroy(); } catch (e) {} } });
+    req.on('end', async () => {
+      let o = {};
+      try { o = JSON.parse(wbody || '{}'); } catch (e) { o = {}; }
+      const dev = pickDeviceId(req, null, o);
+      const jsonOut = (code2, obj) => { try { res.writeHead(code2, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); } catch (e) {} };
+      if (!checkDeviceSecret(pickSecret(req, null, o), dev)) { jsonOut(401, { ok: false, error: '设备密钥错误' }); return; }
+      if (!dev) { jsonOut(400, { ok: false, error: '缺少 device_id' }); return; }
+      if (!o.status) { jsonOut(400, { ok: false, error: '缺少 status' }); return; }
+      // ★ 只转发"白名单字段"（不把设备多塞的东西原样透传 ⇒ S2 不被塞垃圾 ✓）
+      const passthrough = ['vbat', 'batt_pct', 'charging', 'zone', 'zone_rssi', 'on_duty_s',
+                           'rssi', 'storage_free_kb', 'pending', 'fw', 'uptime_s', 'last_err'];
+      const payload = { device_id: dev, status: String(o.status).trim() };
+      passthrough.forEach(k => {
+        const v = o[k];
+        if (v !== undefined && v !== null && String(v).trim() !== '') payload[k] = v;
+      });
+      try {
+        const r = await fetch('https://ai.hiiin.com/api/watch/status', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!r.ok) {
+          log(`watch 心跳转发失败: ${dev} ⇒ S2 HTTP ${r.status}`);
+          jsonOut(502, { ok: false, error: '状态暂存失败，请稍后重试' });
+          return;
+        }
+        log(`watch 心跳: ${dev} = ${payload.status}${payload.zone !== undefined ? ' · 区域 ' + payload.zone : ''}` +
+            `${payload.on_duty_s !== undefined ? ' · 在岗 ' + payload.on_duty_s + 's' : ''}` +
+            `${payload.batt_pct !== undefined ? ' · 电量 ' + payload.batt_pct + '%' : ''}`);
+        jsonOut(200, { ok: true, cmd: null });   // ★ M2 的下发通道将来在这里捎带 ✓
+      } catch (e) {
+        log(`watch 心跳异常: ${dev} ⇒ ${e.message}`);
+        jsonOut(502, { ok: false, error: '状态暂存失败，请稍后重试' });
+      }
+    });
+    return;
+  }
   if (req.method === 'GET' && req.url.startsWith('/api/duty/pull')) {
     const q = getQuery(req.url);
     const dev = pickDeviceId(req, q, null);
@@ -3172,7 +3222,9 @@ const server = http.createServer(async (req, res) => {
   //       自己的密钥 / 轮换宽限期的旧密钥（只允许用在这个端点 ✓）/ 公共兜底（首次领取的兼容路径）
   //   ★ 领到后**立刻同步一次密钥表** —— 否则这台设备要等最多 5 分钟才能用上自己的新密钥 ✗
   if ((req.method === 'GET' || req.method === 'POST') &&
-      (req.url === '/api/cam/device/secret' || req.url.startsWith('/api/cam/device/secret?'))) {
+      (req.url === '/api/cam/device/secret' || req.url.startsWith('/api/cam/device/secret?')
+       // ★ 2026-11-03（CR-20261103-01 M1）：赋能03 手表用同名语义的别名 ⇒ **同一套**预登记/rotate/兼容窗口/指纹台账 ✓
+       || req.url === '/api/watch/device/secret' || req.url.startsWith('/api/watch/device/secret?'))) {
     const q = getQuery(req.url);
     const jsonOut = (code, obj) => {
       res.writeHead(code, { 'Content-Type': 'application/json' });
