@@ -2527,7 +2527,7 @@ const RESPONSE_WATCHDOG_MS = parseInt(process.env.RESPONSE_WATCHDOG_MS || '60000
  * ══════════════════════════════════════════════════════════════════════════ */
 const HMAC_OBSERVE = (process.env.HMAC_OBSERVE !== '0');   // 环境变量可一键关掉
 const HMAC_MAX_BODY = 4 * 1024 * 1024;
-const _hmacStats = { total: 0, sigOk: 0, sigFail: 0, legacy: 0, none: 0, big: 0 };
+const _hmacStats = { total: 0, sigOk: 0, sigFail: 0, sigFallback: 0, legacy: 0, none: 0, big: 0 };
 const _hmacFailReasons = new Map();      // reason -> 次数（排查用）
 // ★ 2026-11-03：分设备统计（设备端要求「按设备号分组」）—— 只有分设备才能一眼看出
 //   「哪台在签名、哪台还在 legacy」⇒ 这是决定能不能关 legacy 的唯一依据 ✓
@@ -2548,11 +2548,12 @@ function hmacBumpDev(dev, kind, reason) {
   let e = _hmacByDev.get(k);
   if (!e) {
     if (_hmacByDev.size > 500) _hmacByDev.delete(_hmacByDev.keys().next().value);
-    e = { ok: 0, fail: 0, legacy: 0, lastFail: '' };
+    e = { ok: 0, fail: 0, fallback: 0, legacy: 0, lastFail: '' };
     _hmacByDev.set(k, e);
   }
   if (kind === 'ok') e.ok++;
   else if (kind === 'fail') { e.fail++; e.lastFail = String(reason || '').slice(0, 40); }
+  else if (kind === 'fallback') { e.fallback = (e.fallback || 0) + 1; }
   else e.legacy++;
 }
 
@@ -2564,7 +2565,7 @@ function hmacReport() {
     .map(([k, v]) => `${k}×${v}`).join(' | ');
   log(`[hmac] 设备请求 ${s.total} 次：签名 ok ${s.sigOk} / 失败 ${s.sigFail}`
     + (rate === null ? '' : `（成功率 ${rate}%）`)
-    + ` / legacy ${s.legacy} / 无凭据 ${s.none} / 超大跳过 ${s.big}`
+    + ` / 兜底签名 ${s.sigFallback} / legacy ${s.legacy} / 无凭据 ${s.none} / 超大跳过 ${s.big}`
     + (top ? `　失败原因: ${top}` : ''));
   const devs = [..._hmacByDev.entries()]
     .sort((a, b) => (b[1].ok + b[1].fail + b[1].legacy) - (a[1].ok + a[1].fail + a[1].legacy))
@@ -2598,6 +2599,20 @@ function observeDeviceAuth(req) {
             // ★ 前 5 次成功的**逐条**打日志：部署当天要能立刻看到"签名真的通了" ✓
             if (_hmacStats.sigOk <= 5) log(`[hmac] ✓ 签名通过: ${r.deviceId} ${req.method} ${String(req.url).split('?')[0]}`);
           } else {
+            // 2026-11-03: 区分「算法错」与「密钥不对」—— 只有"签名不匹配"才可能是后者
+            //   实测 FN-0009 用**公共兜底密钥**签名（NVS 里没有自己的密钥），
+            //   服务器按它**自己的**密钥验 => 必然不匹配。这不代表签名算法错 ✓
+            let _fbOk = false;
+            if (/签名不匹配/.test(r.reason)) {
+              try {
+                const _c = camSecrets();
+                const _fb = _c.fallbackSecret || CAM_DEVICE_SECRET;
+                const _r2 = hmacAuth.verifyDeviceAuth(req, raw, { secretOf: () => _fb, allowLegacy: false, legacySecret: _fb });
+                _fbOk = !!_r2.ok;
+              } catch (e2) {}
+            }
+            if (_fbOk) { _hmacStats.sigFallback++; hmacBumpDev(r.deviceId, 'fallback', '兜底密钥签名'); }
+            else {
             _hmacStats.sigFail++;
             hmacBumpDev(r.deviceId, 'fail', r.reason);
             _hmacFailReasons.set(r.reason, (_hmacFailReasons.get(r.reason) || 0) + 1);
@@ -2606,6 +2621,7 @@ function observeDeviceAuth(req) {
             if (!observeDeviceAuth[_k] || Date.now() - observeDeviceAuth[_k] > 60000) {
               observeDeviceAuth[_k] = Date.now();
               log(`[hmac] ✗ 签名失败: ${r.deviceId || '(无设备号)'} ${req.method} ${String(req.url).split('?')[0]} ⇒ ${r.reason}`);
+            }
             }
           }
         } else if (r.mode === 'legacy') { _hmacStats.legacy++; hmacBumpDev(String(req.headers['x-device-id'] || '').trim() || '(未知)', 'legacy'); }
