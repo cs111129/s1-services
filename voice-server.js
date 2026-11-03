@@ -3264,6 +3264,8 @@ const server = http.createServer(async (req, res) => {
         const v = o[k];
         if (v !== undefined && v !== null && String(v).trim() !== '') payload[k] = v;
       });
+      // ★ M4：设备的设置回执（config_ok 是对象，不能走上面的字符串判空）⇒ 单独透传 ✓
+      if (o.config_ok && typeof o.config_ok === 'object') payload.config_ok = o.config_ok;
       try {
         const r = await fetch('https://ai.hiiin.com/api/watch/status', {
           method: 'POST',
@@ -3279,7 +3281,16 @@ const server = http.createServer(async (req, res) => {
         log(`watch 心跳: ${dev} = ${payload.status}${payload.zone !== undefined ? ' · 区域 ' + payload.zone : ''}` +
             `${payload.on_duty_s !== undefined ? ' · 在岗 ' + payload.on_duty_s + 's' : ''}` +
             `${payload.batt_pct !== undefined ? ' · 电量 ' + payload.batt_pct + '%' : ''}`);
-        jsonOut(200, { ok: true, cmd: null });   // ★ M2 的下发通道将来在这里捎带 ✓
+        // ★★ M4：把 S2 塞回来的待下发命令**原样交给设备** ✓
+        //   形状：{ok:true, cmd:{type:'set_config',action:'set_config',bright:60,...}, cmd_id:N}
+        //   设备侧六种形状都认（见它们 16:3x 的回执），所以这里给 ③/④ 那种即可 ✓
+        let out = { ok: true, cmd: null };
+        try {
+          const txt = await r.text();
+          const d = JSON.parse(txt || '{}');
+          if (d && d.cmd) { out.cmd = d.cmd; if (d.cmd_id) out.cmd_id = d.cmd_id; }
+        } catch (e) {}
+        jsonOut(200, out);
       } catch (e) {
         log(`watch 心跳异常: ${dev} ⇒ ${e.message}`);
         jsonOut(502, { ok: false, error: '状态暂存失败，请稍后重试' });
