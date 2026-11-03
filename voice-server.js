@@ -2529,6 +2529,9 @@ const HMAC_OBSERVE = (process.env.HMAC_OBSERVE !== '0');   // 环境变量可一
 const HMAC_MAX_BODY = 4 * 1024 * 1024;
 const _hmacStats = { total: 0, sigOk: 0, sigFail: 0, legacy: 0, none: 0, big: 0 };
 const _hmacFailReasons = new Map();      // reason -> 次数（排查用）
+// ★ 2026-11-03：分设备统计（设备端要求「按设备号分组」）—— 只有分设备才能一眼看出
+//   「哪台在签名、哪台还在 legacy」⇒ 这是决定能不能关 legacy 的唯一依据 ✓
+const _hmacByDev = new Map();            // deviceId -> { ok, fail, legacy, lastFail }
 let _hmacLastLog = Date.now();
 
 /** 哪些路径算"设备接口"（与服务端支持的设备面一致） */
@@ -2537,6 +2540,20 @@ function isDeviceApiPath(u) {
   return p.startsWith('/api/cam/') || p === '/api/cam-upload' || p === '/api/cam-sop'
       || p.startsWith('/api/watch/') || p.startsWith('/api/duty/')
       || p.startsWith('/api/voice-chat') || p === '/api/tts';
+}
+
+/** 分设备累计（★ 有上限，别让异常设备号把内存撑爆） */
+function hmacBumpDev(dev, kind, reason) {
+  const k = String(dev || '').slice(0, 40) || '(无设备号)';
+  let e = _hmacByDev.get(k);
+  if (!e) {
+    if (_hmacByDev.size > 500) _hmacByDev.delete(_hmacByDev.keys().next().value);
+    e = { ok: 0, fail: 0, legacy: 0, lastFail: '' };
+    _hmacByDev.set(k, e);
+  }
+  if (kind === 'ok') e.ok++;
+  else if (kind === 'fail') { e.fail++; e.lastFail = String(reason || '').slice(0, 40); }
+  else e.legacy++;
 }
 
 function hmacReport() {
@@ -2549,6 +2566,11 @@ function hmacReport() {
     + (rate === null ? '' : `（成功率 ${rate}%）`)
     + ` / legacy ${s.legacy} / 无凭据 ${s.none} / 超大跳过 ${s.big}`
     + (top ? `　失败原因: ${top}` : ''));
+  const devs = [..._hmacByDev.entries()]
+    .sort((a, b) => (b[1].ok + b[1].fail + b[1].legacy) - (a[1].ok + a[1].fail + a[1].legacy))
+    .slice(0, 8)
+    .map(([d, e]) => `${d} ok${e.ok}/fail${e.fail}/legacy${e.legacy}${e.lastFail ? `(${e.lastFail})` : ''}`);
+  if (devs.length) log(`[hmac] 分设备: ${devs.join(' · ')}`);
 }
 
 function observeDeviceAuth(req) {
@@ -2572,10 +2594,12 @@ function observeDeviceAuth(req) {
         if (r.mode === 'sig') {
           if (r.ok) {
             _hmacStats.sigOk++;
+            hmacBumpDev(r.deviceId, 'ok');
             // ★ 前 5 次成功的**逐条**打日志：部署当天要能立刻看到"签名真的通了" ✓
             if (_hmacStats.sigOk <= 5) log(`[hmac] ✓ 签名通过: ${r.deviceId} ${req.method} ${String(req.url).split('?')[0]}`);
           } else {
             _hmacStats.sigFail++;
+            hmacBumpDev(r.deviceId, 'fail', r.reason);
             _hmacFailReasons.set(r.reason, (_hmacFailReasons.get(r.reason) || 0) + 1);
             // ★ 失败按"原因"限流打日志（同一原因 60 秒最多一条，防刷屏 ✓ 但绝不静默）
             const _k = `_hmacLogged_${r.reason}`;
@@ -2584,7 +2608,7 @@ function observeDeviceAuth(req) {
               log(`[hmac] ✗ 签名失败: ${r.deviceId || '(无设备号)'} ${req.method} ${String(req.url).split('?')[0]} ⇒ ${r.reason}`);
             }
           }
-        } else if (r.mode === 'legacy') _hmacStats.legacy++;
+        } else if (r.mode === 'legacy') { _hmacStats.legacy++; hmacBumpDev(String(req.headers['x-device-id'] || '').trim() || '(未知)', 'legacy'); }
         else _hmacStats.none++;
       }
       if (_hmacStats.total % 200 === 0 || Date.now() - _hmacLastLog > 300000) {
