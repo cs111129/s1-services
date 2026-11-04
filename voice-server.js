@@ -3375,6 +3375,14 @@ const server = http.createServer(async (req, res) => {
         const v = o[k];
         if (v !== undefined && v !== null && String(v).trim() !== '') payload[k] = v;
       });
+      // ★★ 2026-11-04（CR-20261104-02）：计步走心跳捎带 ⇒ **必须单独放行** ✗
+      //   白名单是"字符串非空才转发"，而 `steps` 可以是 0 ✓（0 步是合法值，不是"没数据"）
+      //   ⇒ 单独判断"字段存在就转发"（undefined/null 才跳过）✓
+      //   ★ 这是同一类坑的第二次：`cmd_id`（M4）也曾被白名单吃掉 ⇒ 判据：
+      //     **凡是新加的字段，先看它会不会被白名单/非空判断过滤掉** ✓
+      ['steps', 'steps_day'].forEach(k => {
+        if (o[k] !== undefined && o[k] !== null && o[k] !== '') payload[k] = Number(o[k]) || 0;
+      });
       // ★ M4：设备的设置回执（config_ok 是对象，不能走上面的字符串判空）⇒ 单独透传 ✓
       if (o.config_ok && typeof o.config_ok === 'object') {
         payload.config_ok = o.config_ok;
