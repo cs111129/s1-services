@@ -5200,6 +5200,13 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         const device = devPart ? String(devPart.data.toString('utf8')).trim() : '';
         const reset = resetPart ? String(resetPart.data.toString('utf8')).trim() : '0';
         const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
+        // ★ 2026-11-04：把"这次按哪档、上限多少字"打进日志 ✗
+        //   目的：设备端能拿日志自证「detail 到底生效没有」（CR-20261104-01 请求 A 的验收点 ✓）
+        try {
+          const _st = detailStyleOf(device, detail);
+          log(`[detail] device=${device || '-'} detail=${detail} ⇒ 上限 ${_st.max} 字`
+            + `（${isTrainerDevice(device) ? '赋能02 档' : '赋能03 档'}）`);
+        } catch (e) {}
         // ★ 取值：'ulaw8'（也认 'ulaw'/'mulaw'，手写客户端容易少个 8 ✓）；其余/缺失一律 pcm16，不报错
         //   ★ 用 let：下面可能按"体积预算"自动改成 ulaw8（见 pickStreamFmt）
         const _fv = fmtPart ? String(fmtPart.data.toString('utf8')).trim().toLowerCase() : '';
