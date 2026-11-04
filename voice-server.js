@@ -4425,6 +4425,22 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
     const n = parseInt(String(v || '').trim(), 10);
     return DETAIL_STYLES[n] ? n : 2;   // 不传/空/非法 ⇒ 中等
   }
+  // ★★★ 2026-11-04（设备端 CR-20261104-01 请求 A）：**分开长度档** ✗
+  //   现象：手表带 detail=1 仍回 60~90 字 ⇒ TTS 14.8~32.4 秒 ⇒ 手腕上听完太久 ✓
+  //   根因：`DETAIL_STYLES` 是按 **02 的"屏幕读"** 定的（150/250/350 字），
+  //         而手表是 **"耳朵听、听完就走"** ⇒ 40 字 ≈ 13 秒已经是上限 ✗
+  //   ★ 口径（设备端给的）：1 ≤40 字 / 2 ≤80 字 / 3 ≤150 字（中文 TTS 实测 ~3 字/秒）
+  //   ★ 02 **不动**（150/250/350 是用户当初为"考核标准要讲全"定的 ✓，改了会丢内容 ✗）
+  const DETAIL_STYLES_03 = {
+    1: { max: 40,  tokens: 200, len: '不超过 35 字，1~2 句话，先说结论，不铺垫不复述问题' },
+    2: { max: 80,  tokens: 320, len: '不超过 70 字，2~3 句，结论 + 一句要点' },
+    3: { max: 150, tokens: 520, len: '不超过 140 字，把要点说到就行' },
+  };
+  /** ★ 按设备取长度档（★ 02/03 各一套 ✗ 别混用） */
+  function detailStyleOf(dev, d) {
+    const tbl = isTrainerDevice(dev) ? DETAIL_STYLES : DETAIL_STYLES_03;
+    return tbl[d] || tbl[2];
+  }
   // ★ 整段 WAV 那条路（老 /api/voice-chat）的**按格式**字数上限 —— 设备端把整个 WAV 收进内存，
   //   VOICE_WAV_MAX = 1.5MB，超了就是**静默截断**（念一半停住，用户以为是 bug）。
   //   实测 ≈5.0 字/秒（4.6~5.3）⇒ pcm16(32KB/s)：200 字 ≈ 38s ≈ 1.23MB（安全）；
@@ -4626,7 +4642,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
   //   下面 `deviceCapsBlock(device)` 要按"哪台设备"分流（02 培训 / 03 手表 ✓）
   //   ⇒ 原来这里没有形参 ⇒ 运行时 `device is not defined` ⇒ 整个请求无响应（见上方那段注释 ✗✗）
   async function voiceChatAnswer(text, kbResults, history, detail, toolData, device) {
-    const style = DETAIL_STYLES[detail] || DETAIL_STYLES[2];
+    const style = detailStyleOf(device, detail);   // ★ 02/03 各一套长度档 ✓
     let kbBlock = '';
     if (kbResults.length) {
       kbBlock = '【知识库参考内容】\n' + kbResults.map((r, i) =>
@@ -4701,6 +4717,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
   }
 
   if (req.method === 'POST' && req.url === '/api/voice-chat') {
+    observeVoiceAuth(req);
     if (voiceRateLimited(req)) { voiceRateReply(res); return; }
     if (voiceTooLargeByHeader(req)) { voiceTooLargeReply(res); return; }
 
@@ -4875,7 +4892,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
           //   ★ 判据：**跨函数抄表达式时，先确认变量在【当前】作用域里** ✗
           // ★★ 2026-10-22：**必须把 device 传进去** ✗ —— webAnswer 里要按设备型号加能力块；
           //   不传 ⇒ device 是 undefined ⇒ isTrainerDevice('') 当 **02** 处理 ⇒ ★ 03 手表会被说成"没有闹钟" ✗
-          const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len, device);
+          const wa = await webAnswer(heard, detailStyleOf(device, detail).len, device);
           if (wa && wa.reply) {
             reply = wa.reply; replyMood = normMood(wa.mood); webHit = true;   // ★ 语气与这句同源 ✓（同一次调用出的 ✓）
             log(`WEB 分支命中 ✓ 来源${(wa.sources || []).length}条 mood=${replyMood || '(不发)'}`);
@@ -4925,7 +4942,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
 
         // ④ ★ 服务端自己截断（别指望设备端，规格书 §4.4 写死了）
         //   ★ 按 audio_fmt 收上限：整段 WAV 要装进设备 1.5MB 缓冲（见 wavCapFor）
-        const want = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
+        const want = detailStyleOf(device, detail).max;
         let cap = wavCapFor(afmt, want);
         // ★★ 自动降级：只要 ulaw8 能**多留字**就换（不要求"ulaw8 一定装得下"——
         //   原来那个条件让 341 字的回复既没降级、又被 pcm16 的 200 字线砍掉 141 字 ✗）
@@ -5109,7 +5126,29 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
     return [head, s.slice(cap)];
   }
 
+  // ── 语音端点的**可选鉴权观测**（CR-20261104-01 请求 B，2026-11-04）──
+  //   ★ 为什么"只记日志不拦" ✗：`/api/voice-chat*` 的消费者不止手表（WebChat 前端也在用），
+  //     直接拦会把网页那个入口打死 ✗ ⇒ 先观测：带了 secret 的验一下记 ok/bad，不带的也照常放行 ✓
+  //   ★ 判据：**"开了鉴权"之前必须先有"谁带了凭据"的数据** —— 否则一开就误杀 ✓
+  const _voiceAuthStats = { ok: 0, bad: 0, none: 0, lastLog: 0 };
+  function observeVoiceAuth(req) {
+    try {
+      const dev = String(req.headers['x-device-id'] || '').trim();
+      const sec = String(req.headers['x-device-secret'] || '').trim();
+      if (!sec) { _voiceAuthStats.none++; return; }
+      const ok = dev && checkDeviceSecret(sec, dev);
+      if (ok) _voiceAuthStats.ok++; else _voiceAuthStats.bad++;
+      const now = Date.now();
+      if (!ok || now - _voiceAuthStats.lastLog > 60000) {
+        _voiceAuthStats.lastLog = now;
+        log(`[voice-auth] ${ok ? '✓ 凭据有效' : '✗ 凭据无效'} device=${dev || '-'} ` +
+            `（累计 ok=${_voiceAuthStats.ok} bad=${_voiceAuthStats.bad} 无凭据=${_voiceAuthStats.none}）` +
+            (ok ? '' : ' ⇒ ★ 只记录不拦（本轮仍按限频放行 ✓）'));
+      }
+    } catch (e) {}
+  }
   if (req.method === 'POST' && req.url === '/api/voice-chat-stream') {
+    observeVoiceAuth(req);
     const ct = req.headers['content-type'] || '';
     const bm = ct.match(/boundary=(.+)/);
     if (voiceRateLimited(req)) {
@@ -5243,7 +5282,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
           // ★ 同非流式端点：长度提示取 `DETAIL_STYLES` ✓（★ 不是 `style.len` ✗ 那个在别的函数里 ✓）
           // ★★ 2026-10-22：**必须把 device 传进去** ✗ —— webAnswer 里要按设备型号加能力块；
           //   不传 ⇒ device 是 undefined ⇒ isTrainerDevice('') 当 **02** 处理 ⇒ ★ 03 手表会被说成"没有闹钟" ✗
-          const wa = await webAnswer(heard, (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).len, device);
+          const wa = await webAnswer(heard, detailStyleOf(device, detail).len, device);
           if (wa && wa.reply) {
             reply = wa.reply; replyMood = normMood(wa.mood); webHit = true;
             log(`WEB 分支命中（流式）✓ 来源${(wa.sources || []).length}条 mood=${replyMood || '(不发)'}`);
@@ -5278,7 +5317,7 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         // ★★ 记账放在分支之外（与 /api/voice-chat 同一处修正 ✓）——
         //   原来在 else 里 ⇒ selfA / 知识库不可用 那两类轮次不进上下文 ✗
         chatRecord(device, heard, reply);
-        const cap = (DETAIL_STYLES[detail] || DETAIL_STYLES[2]).max;
+        const cap = detailStyleOf(device, detail).max;
         if (reply.length > cap) reply = cutNice(reply, cap);   // ★ 2026-10-22：按标点回退，别切在词中间 ✓
         // ★★ 流式也要看**体积预算**（2026-10-07 用户实测"具体档没念完"后定位）
         //   实测日志：`detail=3` 推过 **2,075,594 字节**的 PCM（301 字），
