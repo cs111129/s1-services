@@ -1691,7 +1691,9 @@ function speakable(s) {
  * ★ 返回 `{ web, learning }` —— ★ `learning` 是 `kind` 枚举或 `null` ✓
  *   ★ 枚举**写进工具参数** ✓ ⇒ ★ 模型选不了枚举外的值 ✓（S2 侧还会 400 ✓ 双保险）
  */
-const LEARN_KINDS = ['overview', 'points', 'exams', 'practices', 'courses', 'plan', 'duty'];
+// ★ 2026-11-04：加 attendance —— 赋能03 手表的人设承诺了"查考勤"，工具就必须真存在 ✗
+//   （不然小星只能回"查不到" ⇒ 人设与能力不一致 ⇒ 用户以为手表坏了 ✓）
+const LEARN_KINDS = ['overview', 'points', 'exams', 'practices', 'courses', 'plan', 'duty', 'attendance'];
 async function routeIntent(text) {
   const NONE = { web: false, learning: null, roleplay: false };
   if (!DEEPSEEK_KEY) return NONE;              // ★ 学习数据也要模型判定 ⇒ 没 key 两个都不做 ✓
@@ -1719,6 +1721,7 @@ async function routeIntent(text) {
             '   courses   = 课程进度（"我看了哪些课/还有多少没看"）',
             '   plan      = 学习计划 / 储备人才计划进度',
             '   duty      = 今天的岗位职责任务（"我今天要做什么/还有什么没做"）',
+            '   attendance = 今天的考勤（"我今天到岗了吗/在哪个区域/待了多久"）★ 只有手表问得到 ✓',
             '   ★★ 只能查【本人】✗ —— 问别人的一律**不调**（工具查不到 ✓ 你也别编 ✓）',
             '',
             '③ start_roleplay —— 用户想**练场景 / 做对练 / 角色扮演**时调用（无参数）',
