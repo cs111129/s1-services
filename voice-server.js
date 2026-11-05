@@ -3005,6 +3005,18 @@ const server = http.createServer(async (req, res) => {
         }
       } catch (e) { log(`voice-chat-text ⚠️ 命令拦截异常: ${e.message}（★ 继续走 LLM ✓）`); }
 
+      // ★★ 2026-11-05：**文本路也要有"查真实数据"** ✗ —— 用户问「今天的重点工作是什么」时
+      //   走这条路的小星原来是"凭记忆编"或"说查不到" ✓（设备走的是流式路，那条有工具 ✓）
+      //   ★ 判据同命令拦截：**同一个能力必须挂在所有入口上** ✗（只挂一条 = 另一个入口是假小星 ✓）
+      let txtTool = null;
+      try {
+        const _it = await routeIntent(text);
+        if (_it && _it.learning) {
+          const _ls = await learningSummary(device, _it.learning);
+          if (_ls && _ls.found) txtTool = { kind: _it.learning, data: _ls };
+        }
+      } catch (e) { log(`voice-chat-text ⚠️ 查数据异常: ${e.message}（★ 继续，按没查到 ✓）`); }
+
       // ★ 普通模式：★ 流式 delta ✓
       try {
         // ★★ 2026-10-21：★ 这里**不能**用 `kbSearchForVoice` / `VOICE_CHAT_SYSTEM` ✗
@@ -3035,7 +3047,20 @@ const server = http.createServer(async (req, res) => {
             headers: { 'Authorization': `Bearer ${DEEPSEEK_KEY}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({
               model: 'deepseek-chat', temperature: 0.4, max_tokens: 220, stream: true,
-              messages: [{ role: 'system', content: sys }, { role: 'user', content: text }],
+              // ★ 2026-11-05：有真实数据时**单独一条 system** 喂进去 ✓
+              //   （模型对"离用户最近的那条 system"注意力最高 ✓ 与流式路同一套写法 ✓）
+              messages: (function () {
+                const arr = [{ role: 'system', content: sys }];
+                if (txtTool) {
+                  const p = (txtTool.data.data != null) ? txtTool.data.data : txtTool.data;
+                  arr.push({ role: 'system', content: '【系统查询到的真实数据】（kind=' + txtTool.kind + '）\n'
+                    + JSON.stringify(p)
+                    + '\n★★ 必须据此回答：哪怕知识库没查到，也要把这里的条目/数字说清楚；'
+                    + '严禁说"查不到/没数据"✗；只说用户问的那一项，别整段念 ✓' });
+                }
+                arr.push({ role: 'user', content: text });
+                return arr;
+              })(),
             }),
           });
           if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
