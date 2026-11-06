@@ -1585,7 +1585,55 @@ function voiceChatRulesBlock() {
   ].join('\n');
 }
 /** ★★ 按设备选人设（★ 唯一入口 ✗ 别在别处再写一份） */
-function personaKeyOf(dev) { return isTrainerDevice(dev) ? '02' : '03'; }
+// ★★ 2026-11-06（用户报「问他我是谁，他乱回答」）✗
+//   根因：提示词里**没有"当前使用者是谁"** ⇒ 模型只能瞎猜 / 编一个名字 ✓
+//   ⇒ 每次请求按设备查一次"使用者档案"，塞进 system prompt 的【当前使用者】块 ✓
+//   ★ 10 分钟缓存：人名/门店/岗位不会秒变，语音链路不能再加一次往返 ✓
+const _whoCache = new Map();
+async function deviceWho(dev) {
+  dev = String(dev || '').trim();
+  if (!dev) return null;
+  const hit = _whoCache.get(dev);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.value;
+  let v = null;
+  try {
+    const r = await fetch('https://ai.hiiin.com/api/voice/who?dev_id=' + encodeURIComponent(dev),
+      { headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN }, signal: AbortSignal.timeout(3000) });
+    if (r.ok) {
+      const j = await r.json();
+      if (j && j.ok && j.found && j.user) v = { name: j.user.name || '', store: j.user.store || '', position: j.user.position || '' };
+    }
+  } catch (e) {
+    log('WHO ⚠️ 取使用者失败: ' + e.message + '（★ 退回绑定缓存里的名字 ✓）');
+  }
+  if (!v) {
+    const b = camBindInfo[dev];
+    if (b && b.name) v = { name: b.name, store: '', position: '' };
+  }
+  _whoCache.set(dev, { value: v, at: Date.now() });
+  if (_whoCache.size > 500) { const k = _whoCache.keys().next().value; if (k !== dev) _whoCache.delete(k); }
+  return v;
+}
+/** 【当前使用者】块：有就写清（问"我是谁"必须照这里答），没有就明确说不知道 ✓ */
+function whoBlock(who) {
+  if (!who || !who.name) {
+    return [
+      '',
+      '【当前使用者 · ★ 重要 ✗】',
+      '· 系统**还没拿到**这台设备绑定的是谁 ✓',
+      '· 他问「我是谁 / 我叫什么 / 我在哪个店」时：**直说没拿到你的绑定信息**，让他先在手机端绑定手表 ✓',
+      '  ★★ **绝对不许猜名字、不许编岗位** ✗（编错了比不答更糟 ✓）',
+    ].join('\n');
+  }
+  const bits = [who.store ? ('门店 ' + who.store) : '', who.position ? ('岗位 ' + who.position) : ''].filter(Boolean).join(' · ');
+  return [
+    '',
+    '【当前使用者 · ★ 系统查到的，别猜 ✗】',
+    '· 姓名：' + who.name + (bits ? ('　' + bits) : ''),
+    '· 他问「我是谁 / 我叫什么 / 我在哪个店 / 我是什么岗位」⇒ **直接按这里答** ✓ 一个字都别编 ✗',
+    '· 说他的职责/考勤时，也只说**他的**（查询工具已按他本人过滤 ✓）',
+  ].join('\n');
+}function personaKeyOf(dev) { return isTrainerDevice(dev) ? '02' : '03'; }
 function personaHeaderOf(dev) { return (personaKeyOf(dev) === '02' ? PERSONA_02_HEAD : PERSONA_03_HEAD).join('\n'); }
 function personaCapsOf(dev) { return (personaKeyOf(dev) === '02' ? PERSONA_02_CAPS : PERSONA_03_CAPS); }
 /** 完整 system prompt（★ 人设头 + 能力 + 共用的格式/红线/文化） */
@@ -2194,6 +2242,7 @@ async function webAnswer(heard, lenHint, device) {
       // ★★ 2026-11-04：联网路也必须用**同一份按设备的人设**（否则 03 手表会自称"门店带教助手" ✗）
       personaHeaderOf(device),
       personaCapsOf(device).join('\n'),
+      whoBlock(await deviceWho(device)),
       '★ 用**口语**回答，**不要 markdown、不要星号、不要分点符号、不要 emoji** —— 会被逐字念出来。',
       '★ 搜到就用搜到的 ✓ 说清"这是查到的"✓；**搜不到或不确定就直说，别编** ✗。',
       `★ 长度控制在 ${lenHint || '180 字以内'}。`,
@@ -3037,6 +3086,7 @@ const server = http.createServer(async (req, res) => {
           '   高效：成果导向沟通简单标准明确推进有力 · 专业：精流程定标准练技能严考核 · ',
           '   担当：会放权勇挑战敢行动定决策担责任）✓ 一句话带过 ✗ 别背条文 ✓',
           personaCapsOf(device).join('\n'),
+          whoBlock(await deviceWho(device)),
         ].join('\n');
         const ac = new AbortController();
         const tid = setTimeout(() => ac.abort(), 25000);
@@ -4711,7 +4761,8 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         + '⇒ ★★ **严禁**说「查不到 / 数据是空的 / 没查到你的记录」✗✗（数据就在下面 ✓ 说了就是撒谎 ✓）\n'
         + '⇒ ★ 只说用户问的那一项 ✓ 别把整段数据全念出来 ✗；看不懂的字段就跳过 ✓'
       : '';
-    const msgs = [{ role: 'system', content: voiceChatSystemOf(device).replace('__LEN__', style.len) + '\n\n' + kbBlock + toolRule }];
+    const _who = await deviceWho(device);
+    const msgs = [{ role: 'system', content: voiceChatSystemOf(device).replace('__LEN__', style.len) + whoBlock(_who) + '\n\n' + kbBlock + toolRule }];
     if (history) for (const h of history) msgs.push(h);
     // ★★ 工具数据**也塞进 user 消息** ✗ —— 双保险（★ 模型对"当前这一轮"的注意力最高 ✓）
     msgs.push({ role: 'user', content: toolBlock ? (String(text) + '\n\n' + toolBlock) : String(text) });
