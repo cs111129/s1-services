@@ -1597,7 +1597,9 @@ async function deviceWho(dev) {
   if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.value;
   let v = null;
   try {
-    const r = await fetch('https://ai.hiiin.com/api/voice/who?dev_id=' + encodeURIComponent(dev),
+    // ★ 用 learning-summary（kind=overview）取 —— 它在 nginx 白名单里 ✓
+    //   （我原来的 /api/voice/who 没进白名单 ⇒ 网关 404 ✗；与其改 nginx，不如复用已放行的端点 ✓）
+    const r = await fetch('https://ai.hiiin.com/api/voice/learning-summary?dev_id=' + encodeURIComponent(dev) + '&kind=overview',
       { headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN }, signal: AbortSignal.timeout(3000) });
     if (r.ok) {
       const j = await r.json();
