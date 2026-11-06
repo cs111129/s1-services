@@ -4456,7 +4456,11 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
   const KB_SEARCH_URL = process.env.KB_SEARCH_URL || 'https://ai.hiiin.com/api/kb-search';
   const KB_TIMEOUT_MS = 8000;
   const LLM_TIMEOUT_MS = 12000;
-  const VOICE_CHAT_ROUNDS = 3;          // 保留最近 3 轮上下文（内存；重启即丢，丢了当新会话）
+  // ★ 2026-11-06（用户拍板）：**保留 10 轮**上下文 ✗
+//   原来是 3 轮 —— 连续对话里"再问一句"经常接不上（第 4 句就忘了前面说过什么）✓
+//   ★ 代价：每轮多 1 条 user + 1 条 assistant，10 轮 ≈ 20 条 ⇒ 输入 token 增加，
+//     首声延迟会涨一点点（实测这档还扛得住 ✓ 再大就要压缩历史了 ✗）
+const VOICE_CHAT_ROUNDS = 10;         // 保留最近 10 轮上下文（内存；重启即丢，丢了当新会话）
   const VOICE_REPLY_MAX = 300;          // 兜底上限（实际按 detail 档位走 DETAIL_STYLES）
   // ★★ 回答长度三档（用户可选，2026-09-29）—— 设备在请求里带 detail=1|2|3
   //   缺省/非法值一律按【中等】处理（老固件不带这个字段也能用，和 reset 同一套兼容规则）
@@ -4628,7 +4632,11 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
   //
   // ★ 另一个能力（设备端 §16.3 建议的"双保险"）：**服务端自己按时间过期** ✓
   //   设备端可能重烧/换固件 ⇒ **这边才是唯一真源** ✓
-  const CHAT_CTX_TTL_MS = 5 * 60 * 1000;   // 5 分钟没有新请求 ⇒ 丢上下文（当新会话）
+  // ★ 2026-11-06（用户拍板）：过期时间 5 分钟 → **12 小时** ✗
+//   原来 5 分钟太短：用户上午说过的事，下午再问就"忘了" ✓
+//   ★ 12 小时 ≈ 一个工作日 ⇒ 上班期间的追问都接得上 ✓
+//   ★ 内存：会话按设备存，上限 500 个（下面有兜底淘汰）⇒ 单条几十 KB 级，可接受 ✓
+const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ 丢上下文（当新会话）
   function chatCtx(device, reset) {
     if (!device) return null;
     const now = Date.now();
