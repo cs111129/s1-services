@@ -1110,7 +1110,7 @@ function extraCmdHandle(heard) {
     const secEff = Math.min(DEV_TIMER_MAX_SEC, st.seconds);
     const clipped = secEff < st.seconds;
     const reply = clipped
-      ? ('手表最长只能定 99 分钟，就按 ' + durCn(secEff) + ' 开始')
+      ? ('手表最长只能定 99 分钟，就按' + String(durCn(secEff)).replace(/\\s+/g, '') + '开始')
       : ('好，' + durCn(secEff) + '倒计时开始了' + (st.label ? '，' + st.label : ''));
     log(`语音命令: 「${heard}」⇒ set_timer ${JSON.stringify(Object.assign({}, st, { seconds: secEff }))}`
       + `${clipped ? `（★ 原请求 ${st.seconds}s 超过设备上限 ${DEV_TIMER_MAX_SEC}s ⇒ 已截断并在 reply 里说明 ✓）` : ''}｜reply="${reply}"`);
