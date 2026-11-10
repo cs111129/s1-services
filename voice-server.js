@@ -1102,9 +1102,19 @@ function extraCmdHandle(heard) {
       log(`语音命令: 「${heard}」⇒ set_timer 越界（${st.seconds}s，界限 ${TIMER_MIN_SEC}~${TIMER_MAX_SEC}s）⇒ **不下发** ✗｜reply="${reply}"`);
       return { reply, action: null, params: null };
     }
-    const reply = '好，' + durCn(st.seconds) + '倒计时开始了' + (st.label ? '，' + st.label : '');
-    log(`语音命令: 「${heard}」⇒ set_timer ${JSON.stringify(st)}｜reply="${reply}"`);
-    return { reply, action: 'set_timer', params: st };
+    // ★★ CR-20261110-01：设备倒计时上限 **99 分钟（5940 秒）** ✗
+    //   原来只按我方上限（一天）判 ⇒ 「倒计时两个小时」会说"二小时开始了"，
+    //   而设备实际只跑 99 分钟 ⇒ **说的和做的不一致** ✗（这一族错最坑用户 ✓）
+    //   ⇒ 按设备上限**截断并如实说** ✓ 且 params.seconds 就是真正要跑的值 ✓（同源 ✓）
+    const DEV_TIMER_MAX_SEC = 5940;
+    const secEff = Math.min(DEV_TIMER_MAX_SEC, st.seconds);
+    const clipped = secEff < st.seconds;
+    const reply = clipped
+      ? ('手表最长只能定 99 分钟，就按 ' + durCn(secEff) + ' 开始')
+      : ('好，' + durCn(secEff) + '倒计时开始了' + (st.label ? '，' + st.label : ''));
+    log(`语音命令: 「${heard}」⇒ set_timer ${JSON.stringify(Object.assign({}, st, { seconds: secEff }))}`
+      + `${clipped ? `（★ 原请求 ${st.seconds}s 超过设备上限 ${DEV_TIMER_MAX_SEC}s ⇒ 已截断并在 reply 里说明 ✓）` : ''}｜reply="${reply}"`);
+    return { reply, action: 'set_timer', params: Object.assign({}, st, { seconds: secEff }) };
   }
   // ── ⑤ 定闹钟 / 记备忘（**新增**一律排最后 ✓ 它们只凭名词就能命中 ✗）──
   const a = parseAlarmCmd(heard);
