@@ -763,7 +763,8 @@ function alarmReply(p) {
   const t = clockCn(p.hh, p.mm).replace(/^(凌晨|上午|中午|下午|晚上)/, '');   // ★ 时段只留一处 ✓
   const repCn = p.rep === 'daily' ? '每天' : p.rep === 'workday' ? '每个工作日' : p.rep === 'weekend' ? '周末' : '';
   const when = repCn ? (repCn + part) : (day + part);
-  return '闹钟设在' + when + t + (p.label ? '，提醒你' + p.label : '');
+  // ★ CR-20261110-01 §3.1：reply 必须让人听出「这事办成了」（设备是播完再执行 ✓）
+  return '好，闹钟设好了：' + when + t + (p.label ? '，提醒你' + p.label : '');
 }
 
 /** ★ 意图①：定闹钟（含"提醒我X点做Y" ✓ 也含"N分钟后"✓ 由服务器换算成绝对时刻 ✓）*/
@@ -838,6 +839,35 @@ function parseMemoCmd(heard) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// ★★ CR-20261110-01（设备端递件）：语音指令的**扁平动作字段** ✓
+//   设备端已经写好解析与执行，只等服务器在响应头里多发 4 个字段：
+//     act / act_h / act_m / act_sec  （无动作 ⇒ 一个都不发 ✓ 老固件零变化 ✓）
+//   ★ 只映射 CR 里的四类 ✗：alarm_add / alarm_del / alarm_off / timer
+//     —— 备忘（add_memo/del_memo/read_memo）与录制（start_record）**不映射** ✓ 那些设备端另有通道 ✓
+//   ★ 时间发**绝对时分**（24h）✗ 不发"明天/半小时后" ✓；跨天由设备按"下一个该时刻"处理 ✓
+function actFieldsOf(action, params) {
+  const p = params || {};
+  const hh = Number(p.hh), mm = Number(p.mm);
+  const okH = Number.isInteger(hh) && hh >= 0 && hh <= 23;
+  const okM = Number.isInteger(mm) && mm >= 0 && mm <= 59;
+  switch (action) {
+    case 'add_alarm':
+      return (okH && okM) ? { act: 'alarm_add', act_h: hh, act_m: mm } : null;
+    case 'del_alarm':
+      if (p.all) return { act: 'alarm_off' };                     // 「把闹钟关了」= 全关 ✓
+      return (okH && okM) ? { act: 'alarm_del', act_h: hh, act_m: mm } : null;
+    case 'alarm_off':
+      return { act: 'alarm_off' };
+    case 'set_timer': {
+      const sec = Math.round(Number(p.seconds) || 0);
+      if (!(sec > 0)) return null;
+      return { act: 'timer', act_sec: Math.min(5940, sec) };      // ★ 设备上限 99 分钟 ✓
+    }
+    default: return null;                                          // 聊天/备忘/录制 ⇒ 不发 ✓
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ★★ CR-20261012-01 期2：**删 / 读**（`del_alarm` / `del_memo` / `read_memo`）✓
 //
 //   ★★★ 一条**顺序铁律**（不遵守必错 ✗✗）：
@@ -878,8 +908,9 @@ function parseDelAlarmCmd(heard) {
   if (/(第\s*[0-9零〇一两二三四五六七八九十]+\s*(个|条)|最后|最新|末尾|刚定|刚才那|上一个)/.test(t)) {
     return { needClarify: true };
   }
-  // ③ 其它 ⇒ 不是命令 ✓（交给 LLM ✓）
-  return null;
+  // ③ ★ CR-20261110-01：「把闹钟关了 / 全部关掉」⇒ **全关** ✓（没报钟点、也没说第几个）
+  //   ★ 与"取消九点的闹钟"区分开：报了钟点 ⇒ 上面 ① 已经按精确时刻删了 ✓
+  return { all: true };
 }
 
 /** ★ 意图④：删备忘 ⇒ `del_memo {index:N}`
@@ -1028,6 +1059,12 @@ function extraCmdHandle(heard) {
       return { reply, action: null, params: null };
     }
     // ★ 用共用的 clockCn ✓ —— 第一版直接 `cnStr(hh)+'点'` ⇒ 15 点被念成「十五点」✗（应为"下午三点"✓）
+    // ★ CR-20261110-01：没报钟点 ⇒ 全关（设备 act=alarm_off ✓）
+    if (da.all) {
+      const reply2 = '好，闹钟都关掉了';
+      log(`语音命令: 「${heard}」⇒ alarm_off（未报钟点 ⇒ 全关）｜reply="${reply2}"`);
+      return { reply: reply2, action: 'alarm_off', params: null };
+    }
     const reply = '好，取消' + clockCn(da.hh, da.mm) + '的闹钟';
     log(`语音命令: 「${heard}」⇒ del_alarm ${JSON.stringify(da)}｜reply="${reply}"`);
     return { reply, action: 'del_alarm', params: da };
@@ -3049,7 +3086,8 @@ const server = http.createServer(async (req, res) => {
         if (RP_ON && device) {
           const vc = await voiceCmdHandle(device, text);
           if (vc && vc.reply) {
-            send({ done: true, reply: vc.reply, audio: '', action: vc.action || null, command: true });
+            send({ done: true, reply: vc.reply, audio: '', action: vc.action || null, command: true,
+                   ...(actFieldsOf(vc.action, vc.params) || {}) });
             res.end();
             return;
           }
@@ -5475,6 +5513,8 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
           ...(afmt === 'ulaw8_8k' ? { fmt_label: 'ulaw8_8k' } : {}),
           // ★ CR-20261010-01：命令回合才带这两个字段 ✓（不是命令 ⇒ 一个都不加 ⇒ 老固件 behavior 完全不变 ✓）
           ...(vcS && vcS.action ? { action: vcS.action } : {}),
+          // ★ CR-20261110-01：手表要执行的**扁平动作**（只有四类会有 ✓）
+          ...((vcS && vcS.action && actFieldsOf(vcS.action, vcS.params)) || {}),
           ...(vcS && vcS.params ? { params: vcS.params } : {}),
           // ★ CR-20261012-02：语气（★ 与 reply 同级 ✓ 头字段 ✓；★ 没有就**不带** ✗ ⇒ 设备降级 ✓）
           //   ★★ 同源保证：命令回合取 `action` ✓／联网与知识库回合取**同一次模型输出**里的那行 ✓
