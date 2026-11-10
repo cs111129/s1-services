@@ -899,7 +899,8 @@ function actFieldsOf(action, params) {
 function parseDelAlarmCmd(heard) {
   const t = vcNorm(heard);
   if (!/(闹钟|叫我|叫醒|提醒)/.test(t)) return null;
-  if (!/(取消|删掉|删除|去掉|撤销|关掉|不要了|别响)/.test(t)) return null;   // ★ 必须**有删除动词** ✗
+  // ★ CR-20261110-01 补：「把闹钟关了」「全部关掉」这类口语 —— 原来只认「关掉」⇒ 「关了」漏给 LLM ✗
+  if (!/(取消|删掉|删除|去掉|撤销|关掉|关了|关一下|关闭|不要了|别响|都关|全关)/.test(t)) return null;   // ★ 必须**有删除动词** ✗
   if (VC_ASK_WORDS.test(t)) return null;
   // ① 报了钟点 ⇒ 按 hh:mm 删 ✓（"取消九点的闹钟" ✓ —— ★ 这是我方**唯一**敢发的形态 ✓）
   const w = parseWhen(t);
