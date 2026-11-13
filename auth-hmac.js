@@ -162,7 +162,17 @@ function verifyDeviceAuth(req, rawBody, opt) {
   if (_nonce.has(nonce)) return { ok: false, mode: 'sig', identity: true, code: 401, reason: 'nonce 重复（疑似重放）', deviceId: devHeader };
 
   const secret = o.secretOf ? o.secretOf(devHeader) : '';
-  if (!secret) return { ok: false, mode: 'sig', identity: false, code: 401, reason: `未知设备 ${devHeader}`, deviceId: devHeader };
+  if (!secret) {
+    // ★★ 2026-11-13 红队 P0-3：**没领到专属密钥的设备不能必 401** ✗
+    //   新机装上新固件后"时间已同步 ⇒ 一定带签名头" ⇒ 查不到密钥就 401 ⇒ 上不了云、连 OTA 都查不了 ⇒ 不能自救
+    //   ⇒ 未知设备若**同时带了合法的 legacy 密钥**（公共兜底）⇒ 放行并标 missing_key ✓
+    //     （★ 这只是"过渡期救回通道"，不是长期状态：统计里 missing_key 会单独计数 ✓）
+    const legacy2 = String(h['x-device-secret'] || '').trim();
+    if (!o.ownKeyOnly && o.legacySecret && safeEq(legacy2, o.legacySecret)) {
+      return { ok: true, mode: 'missing_key', identity: false, deviceId: devHeader, tsFlag: 'sig_unknown_key' };
+    }
+    return { ok: false, mode: 'sig', identity: false, code: 401, reason: `未知设备 ${devHeader}（且未带合法 legacy 密钥）`, deviceId: devHeader };
+  }
 
   const bodyHash = sha256Hex(rawBody || Buffer.alloc(0));
   const canon = canonicalString(req.method, req.url, devHeader, ts, nonce, bodyHash);
