@@ -2751,6 +2751,32 @@ function isDeviceApiPath(u) {
 }
 
 /** 分设备累计（★ 有上限，别让异常设备号把内存撑爆） */
+// ★★ 2026-11-13 设备端红队通知：**验收闸门必须按 path 计数** ✗
+//   「总体成功率 100%」和「6 条出口永远签不上」可以同时成立（未签名的路径根本不进失败桶）✓
+const _hmacByPath = new Map();     // path -> {ok, sig_fail, legacy, legacy_no_ts, fallback, missing_key, none}
+function hmacBumpPath(path, kind) {
+  const k = String(path || '-');
+  let e = _hmacByPath.get(k);
+  if (!e) { e = { ok: 0, sig_fail: 0, legacy: 0, legacy_no_ts: 0, fallback: 0, missing_key: 0, none: 0 }; _hmacByPath.set(k, e); }
+  e[kind] = (e[kind] || 0) + 1;
+}
+/** 按 path 的验收闸门：每条"有流量"的出口都要**签名 ok ≥ 1** 才算通 */
+function hmacPathGate() {
+  const rows = [..._hmacByPath.entries()].map(([path, e]) => ({
+    path,
+    ok: e.ok,
+    signed_ok: e.ok,
+    legacy_no_ts: e.legacy_no_ts,
+    fallback: e.fallback,
+    missing_key: e.missing_key,
+    fail: e.sig_fail,
+    none: e.none,
+    pass: e.ok >= 1,           // ★ 闸门判据：这条出口至少成功签名一次 ✓
+  })).sort((a, b) => (b.ok + b.legacy_no_ts + b.fail) - (a.ok + a.legacy_no_ts + a.fail));
+  const red = rows.filter(r => !r.pass && (r.sig_fail + r.none + r.legacy_no_ts) > 0);
+  return { rows, total: rows.length, pass: rows.filter(r => r.pass).length, blocked: red.map(r => r.path) };
+}
+
 function hmacBumpDev(dev, kind, reason) {
   const k = String(dev || '').slice(0, 40) || '(无设备号)';
   let e = _hmacByDev.get(k);
@@ -2780,6 +2806,15 @@ function hmacReport() {
     .slice(0, 8)
     .map(([d, e]) => `${d} ok${e.ok}/fail${e.fail}/legacy${e.legacy}${e.lastFail ? `(${e.lastFail})` : ''}`);
   if (devs.length) log(`[hmac] 分设备: ${devs.join(' · ')}`);
+  // ★ 按 path 的闸门（设备端要求：总体成功率不算验收 ✓）
+  try {
+    const g = hmacPathGate();
+    const line = g.rows.slice(0, 10).map(r =>
+      `${r.path} ok${r.ok}/no_ts${r.legacy_no_ts}/fail${r.fail}/none${r.none}`).join(' · ');
+    log(`[hmac] 按 path: ${g.pass}/${g.total} 条出过"签名 ok"${g.blocked.length ? ('　⚠ 未达标的: ' + g.blocked.join(', ')) : ''}`);
+    if (line) log(`[hmac] path 明细: ${line}`);
+    if ((_hmacStats.legacyNoTs || 0) > 0) log(`[hmac] legacy_no_ts 累计 ${_hmacStats.legacyNoTs} 次（★ 这就是 P3 的存量清单 ✓）`);
+  } catch (e) {}
 }
 
 function observeDeviceAuth(req) {
@@ -2795,14 +2830,21 @@ function observeDeviceAuth(req) {
       else {
         const raw = chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
         const c = camSecrets();
+        // ★ 过渡期语义：给了 CAM_LEGACY_PATHS 就按 path 白名单；没给 = 全放（allowLegacy）✓
+        // ★ dryRun：只判定、不消耗 nonce（统计层同一请求会被判定两次 ✗）
+        const _legacyPaths = (process.env.CAM_LEGACY_PATHS || '').split(',').map(x => x.trim()).filter(Boolean);
         const r = hmacAuth.verifyDeviceAuth(req, raw, {
           secretOf: deviceSecretOf,
           allowLegacy: true,
+          legacyPaths: _legacyPaths.length ? _legacyPaths : undefined,
           legacySecret: c.fallbackSecret || CAM_DEVICE_SECRET,
+          dryRun: true,
         });
+        const _pth = String(req.url).split('?')[0];
         if (r.mode === 'sig') {
           if (r.ok) {
             _hmacStats.sigOk++;
+            hmacBumpPath(_pth, 'ok');
             hmacBumpDev(r.deviceId, 'ok');
             // ★ 前 5 次成功的**逐条**打日志：部署当天要能立刻看到"签名真的通了" ✓
             if (_hmacStats.sigOk <= 5) log(`[hmac] ✓ 签名通过: ${r.deviceId} ${req.method} ${String(req.url).split('?')[0]}`);
@@ -2822,6 +2864,7 @@ function observeDeviceAuth(req) {
             if (_fbOk) { _hmacStats.sigFallback++; hmacBumpDev(r.deviceId, 'fallback', '兜底密钥签名'); }
             else {
             _hmacStats.sigFail++;
+            hmacBumpPath(_pth, 'sig_fail');
             hmacBumpDev(r.deviceId, 'fail', r.reason);
             _hmacFailReasons.set(r.reason, (_hmacFailReasons.get(r.reason) || 0) + 1);
             // ★ 失败按"原因"限流打日志（同一原因 60 秒最多一条，防刷屏 ✓ 但绝不静默）
@@ -2832,9 +2875,17 @@ function observeDeviceAuth(req) {
             }
             }
           }
-        } else if (r.mode === 'legacy') { _hmacStats.legacy++; hmacBumpDev(String(req.headers['x-device-id'] || '').trim() || '(未知)', 'legacy'); }
+        } else if (r.mode === 'legacy' || r.mode === 'legacy_no_ts' || r.mode === 'fallback' || r.mode === 'missing_key') {
+          _hmacStats.legacy++;
+          hmacBumpDev(String(req.headers['x-device-id'] || '').trim() || '(未知)', 'legacy');
+          if (r.mode === 'legacy_no_ts') { _hmacStats.legacyNoTs = (_hmacStats.legacyNoTs || 0) + 1; hmacBumpPath(_pth, 'legacy_no_ts'); }
+          else if (r.mode === 'fallback') hmacBumpPath(_pth, 'fallback');
+          else if (r.mode === 'missing_key') hmacBumpPath(_pth, 'missing_key');
+          else hmacBumpPath(_pth, 'legacy');
+        }
         else {
           _hmacStats.none++;
+          hmacBumpPath(_pth, 'none');
           // ★ 观测"无凭据"到底是哪些请求（设备端会问：无凭据>0 ⇒ 还有别的调用方吗）
           //   同一 method+path 每分钟最多记一条 ✓
           const _nk = '_hmacNone_' + req.method + ' ' + String(req.url).split('?')[0];

@@ -23,7 +23,17 @@
  *     allowLegacy: true,                    // 过渡期允许老固件（明文密钥头）
  *     legacySecret: PUBLIC_SECRET,          // 公共兜底密钥（仅 legacy 用）
  *   });
- *   // r = { ok, mode:'sig'|'legacy'|'none', code, reason, deviceId }
+ *   // r = { ok, mode, identity, code, reason, deviceId, tsFlag }
+ *
+ * ★★ 2026-11-13 按设备端红队复核（通知-CR-20261103-02）对齐四条规则 ✗：
+ *   ① legacy **按 path 白名单**（legacyPaths）—— 不再"一开就全开" ✓
+ *      建议 P3 时只留 ['/api/cam/ota','/api/cam/device/secret'] ⇒ 老固件永远保留"升级/领密钥"的救回通道 ✓
+ *   ② legacy **带了 ts 就校验窗内** —— 挡住"现代固件流量被剥掉签名头后重放" ✓
+ *      老固件不带 ts ⇒ **放行但标 legacy_no_ts** ✓（这一档就是 P3 的存量清单 ✓）
+ *   ③ **未知设备回落 legacy** —— 没预登记的新机只要 legacy 合法就放行，标 missing_key ✓
+ *      （否则它上不了云、连 OTA 都查不了 ⇒ 不能自救 ✗）
+ *   ④ **mode / identity 分开** —— 'fallback'/'missing_key' ⇒ identity:false ✓；ownKeyOnly:true 时直接 401 ✗
+ *   ⑤ dryRun —— 只判定、**不消耗 nonce** ✓（统计层同一请求调两次，第二次不会被自己挡 ✓）
  */
 
 'use strict';
@@ -72,6 +82,18 @@ function safeEq(a, b) {
  * @param {Buffer|null} rawBody  原始请求体（GET 传 null）
  * @param {{secretOf:function, allowLegacy?:boolean, legacySecret?:string}} opt
  */
+/** path 是否命中白名单前缀（'\/api\/cam\/' 这种带尾斜杠的按前缀比；其余按完全相等） */
+function pathAllowed(path, list) {
+  const p = String(path || '').split('?')[0];
+  for (const raw of (list || [])) {
+    const it = String(raw || '').trim();
+    if (!it) continue;
+    if (it.endsWith('/')) { if (p.startsWith(it)) return true; }
+    else if (p === it) return true;
+  }
+  return false;
+}
+
 function verifyDeviceAuth(req, rawBody, opt) {
   const o = opt || {};
   const h = (req && req.headers) || {};
@@ -80,45 +102,79 @@ function verifyDeviceAuth(req, rawBody, opt) {
   const nonce = String(h['x-device-nonce'] || '').trim();
   const sig = String(h['x-device-sign'] || '').trim();
   const hasSig = !!(ts && nonce && sig);
+  const path = String((req && req.url) || '').split('?')[0];
+  const now = Date.now();
+  const nowSec = Math.floor(now / 1000);
 
-  // ── 没有签名头 ⇒ 老固件：走 legacy（明文密钥头 / body 里的 secret） ──
+  // ── ① 没有签名头 ⇒ 老固件 legacy（★ 按 path 白名单 ✓）──────────────
   if (!hasSig) {
-    if (!o.allowLegacy) return { ok: false, mode: 'none', code: 401, reason: '缺少签名头且已禁止 legacy（请升级固件）', deviceId: devHeader };
+    // 白名单优先：给了 legacyPaths 就按它；没给才看 allowLegacy（过渡期全放）
+    const allowed = (Array.isArray(o.legacyPaths)) ? pathAllowed(path, o.legacyPaths) : !!o.allowLegacy;
+    if (!allowed) {
+      return { ok: false, mode: 'none', identity: false, code: 401,
+               reason: '该路径已不接受 legacy（请升级固件）', deviceId: devHeader };
+    }
     const legacy = String(h['x-device-secret'] || '').trim();
-    if (!legacy) return { ok: false, mode: 'none', code: 401, reason: '缺少签名头，也没带 X-Device-Secret', deviceId: devHeader };
-    if (o.legacySecret && safeEq(legacy, o.legacySecret)) return { ok: true, mode: 'legacy', deviceId: devHeader };
-    // 老固件也可能已经拿到了**自己那台**的密钥（一机一密早期版本）
-    const own = devHeader && o.secretOf ? o.secretOf(devHeader) : '';
-    if (own && safeEq(legacy, own)) return { ok: true, mode: 'legacy', deviceId: devHeader };
-    return { ok: false, mode: 'legacy', code: 401, reason: 'legacy 密钥不匹配', deviceId: devHeader };
+    if (!legacy) return { ok: false, mode: 'none', identity: false, code: 401, reason: '缺少签名头，也没带 X-Device-Secret', deviceId: devHeader };
+
+    // ── ② 带了 ts 就校窗（老固件不带 ⇒ 放行但打 legacy_no_ts）──
+    let tsFlag = 'legacy_no_ts';
+    if (ts) {
+      const tsNum = Number(ts);
+      if (!/^\d{10}$/.test(ts) || !isFinite(tsNum)) {
+        return { ok: false, mode: 'legacy', identity: false, code: 401, reason: 'legacy ts 格式不对（要 10 位 Unix 秒）', deviceId: devHeader, tsFlag: 'legacy_bad_ts' };
+      }
+      const skew = nowSec - tsNum;
+      if (Math.abs(skew) > SKEW_SEC) {
+        return { ok: false, mode: 'legacy', identity: false, code: 401, reason: `legacy ts 过期（偏移 ${skew}s，疑似剥签名后重放）`, deviceId: devHeader, tsFlag: 'legacy_bad_ts' };
+      }
+      tsFlag = 'legacy_ts';
+    }
+
+    // ── ③ 一机一密（自己的密钥）优先 ──
+    const own = (devHeader && o.secretOf) ? String(o.secretOf(devHeader) || '') : '';
+    if (own && safeEq(legacy, own)) {
+      return { ok: true, mode: tsFlag === 'legacy_ts' ? 'legacy' : 'legacy_no_ts', identity: true, deviceId: devHeader, tsFlag };
+    }
+    // ── ④ 公共兜底密钥：区分"已知设备用兜底"与"未知设备" ──
+    if (o.legacySecret && safeEq(legacy, o.legacySecret)) {
+      if (o.ownKeyOnly) {
+        return { ok: false, mode: 'fallback', identity: false, code: 401, reason: '该设备必须使用专属密钥', deviceId: devHeader, tsFlag };
+      }
+      if (!own) {
+        // 未知设备（未预登记）⇒ 放行但标 missing_key ✓（否则新机上不了云、OTA 也查不了 ✗）
+        return { ok: true, mode: 'missing_key', identity: false, deviceId: devHeader, tsFlag };
+      }
+      return { ok: true, mode: 'fallback', identity: false, deviceId: devHeader, tsFlag };
+    }
+    return { ok: false, mode: 'legacy', identity: false, code: 401, reason: 'legacy 密钥不匹配', deviceId: devHeader, tsFlag };
   }
 
   // ── 签名路 ──
-  const now = Date.now();
-  const nowSec = Math.floor(now / 1000);
   const tsNum = Number(ts);
-  if (!/^\d{10}$/.test(ts) || !isFinite(tsNum)) return { ok: false, mode: 'sig', code: 401, reason: 'ts 格式不对（要 10 位 Unix 秒）', deviceId: devHeader };
+  if (!/^\d{10}$/.test(ts) || !isFinite(tsNum)) return { ok: false, mode: 'sig', identity: true, code: 401, reason: 'ts 格式不对（要 10 位 Unix 秒）', deviceId: devHeader };
   const skew = nowSec - tsNum;
-  if (Math.abs(skew) > SKEW_SEC) return { ok: false, mode: 'sig', code: 401, reason: `ts 过期（偏移 ${skew}s，检查设备时钟/SNTP）`, deviceId: devHeader };
-  if (!/^[0-9a-f]{16}$/.test(nonce)) return { ok: false, mode: 'sig', code: 401, reason: 'nonce 格式不对（16 位小写 hex）', deviceId: devHeader };
-  if (!devHeader) return { ok: false, mode: 'sig', code: 401, reason: '缺少 X-Device-Id', deviceId: '' };
+  if (Math.abs(skew) > SKEW_SEC) return { ok: false, mode: 'sig', identity: true, code: 401, reason: `ts 过期（偏移 ${skew}s，检查设备时钟/SNTP）`, deviceId: devHeader };
+  if (!/^[0-9a-f]{16}$/.test(nonce)) return { ok: false, mode: 'sig', identity: true, code: 401, reason: 'nonce 格式不对（16 位小写 hex）', deviceId: devHeader };
+  if (!devHeader) return { ok: false, mode: 'sig', identity: false, code: 401, reason: '缺少 X-Device-Id', deviceId: '' };
 
   _sweep(now);
-  if (_nonce.has(nonce)) return { ok: false, mode: 'sig', code: 401, reason: 'nonce 重复（疑似重放）', deviceId: devHeader };
+  if (_nonce.has(nonce)) return { ok: false, mode: 'sig', identity: true, code: 401, reason: 'nonce 重复（疑似重放）', deviceId: devHeader };
 
   const secret = o.secretOf ? o.secretOf(devHeader) : '';
-  if (!secret) return { ok: false, mode: 'sig', code: 401, reason: `未知设备 ${devHeader}`, deviceId: devHeader };
+  if (!secret) return { ok: false, mode: 'sig', identity: false, code: 401, reason: `未知设备 ${devHeader}`, deviceId: devHeader };
 
   const bodyHash = sha256Hex(rawBody || Buffer.alloc(0));
   const canon = canonicalString(req.method, req.url, devHeader, ts, nonce, bodyHash);
   const want = sign(secret, canon);
   if (!safeEq(want, sig.toLowerCase())) {
-    return { ok: false, mode: 'sig', code: 401, reason: '签名不匹配', deviceId: devHeader };
+    return { ok: false, mode: 'sig', identity: true, code: 401, reason: '签名不匹配', deviceId: devHeader };
   }
 
   // ★ 只有**验过**才记 nonce（验失败的请求不许占用 nonce，否则攻击者可拿乱签名把我们缓存打满）
-  _nonce.set(nonce, now + NONCE_TTL_SEC * 1000);
-  return { ok: true, mode: 'sig', deviceId: devHeader, bodyHash };
+  // ★ dryRun：只判定、不消耗 nonce ✓（统计层会调两次，不能自己把自己挡掉 ✗）
+  if (o.dryRun !== true) _nonce.set(nonce, now + NONCE_TTL_SEC * 1000);
+  return { ok: true, mode: 'sig', identity: true, deviceId: devHeader, bodyHash };
 }
 
-module.exports = { verifyDeviceAuth, canonicalString, sign, sha256Hex, safeEq, SHA256_EMPTY, SKEW_SEC, NONCE_TTL_SEC };
+module.exports = { verifyDeviceAuth, pathAllowed, canonicalString, sign, sha256Hex, safeEq, SHA256_EMPTY, SKEW_SEC, NONCE_TTL_SEC };
