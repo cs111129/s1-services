@@ -2781,6 +2781,18 @@ function isDeviceApiPath(u) {
 // ★★ 2026-11-13 设备端红队通知：**验收闸门必须按 path 计数** ✗
 //   「总体成功率 100%」和「6 条出口永远签不上」可以同时成立（未签名的路径根本不进失败桶）✓
 const _hmacByPath = new Map();     // path -> {ok, sig_fail, legacy, legacy_no_ts, fallback, missing_key, none}
+// 2026-11-13（设备端要一行：某台设备某条路径签名通过）
+// 原来只有全局前 5 次打日志 => 早就看不到具体哪台哪条路径成功了
+// => 加 device x path 计数 + 每台每条路径前 3 次成功各打一行
+const _hmacByDevPath = new Map();   // dev|path -> {dev,path,ok,fail,legacy,no_ts}
+const _hmacDevPathLogged = new Map();
+function hmacBumpDevPath(dev, path, kind) {
+  const k = String(dev || '-') + '|' + String(path || '-');
+  let e = _hmacByDevPath.get(k);
+  if (!e) { e = { dev: String(dev || '-'), path: String(path || '-'), ok: 0, fail: 0, legacy: 0, no_ts: 0 }; _hmacByDevPath.set(k, e); }
+  if (kind === 'ok') e.ok++; else if (kind === 'fail') e.fail++; else if (kind === 'no_ts') e.no_ts++; else e.legacy++;
+}
+
 function hmacBumpPath(path, kind) {
   const k = String(path || '-');
   let e = _hmacByPath.get(k);
@@ -2868,6 +2880,7 @@ function hmacSnapshot() {
     legacy: s.legacy, legacyNoTs: s.legacyNoTs || 0, none: s.none, big: s.big,
     failReasons: Object.fromEntries([..._hmacFailReasons.entries()].slice(0, 10)),
     paths, devices,
+    devPaths: [..._hmacByDevPath.values()].slice(0, 60),
   };
 }
 try {
@@ -2904,6 +2917,15 @@ function observeDeviceAuth(req) {
           if (r.ok) {
             _hmacStats.sigOk++;
             hmacBumpPath(_pth, 'ok');
+            hmacBumpDevPath(r.deviceId, _pth, 'ok');
+            {
+              const _k = String(r.deviceId || '-') + '|' + _pth;
+              const seen = _hmacDevPathLogged.get(_k) || 0;
+              if (seen < 3) {
+                _hmacDevPathLogged.set(_k, seen + 1);
+                log('[hmac] ✓ 签名通过: ' + r.deviceId + ' ' + req.method + ' ' + _pth + '（该路径第 ' + (seen + 1) + ' 次）');
+              }
+            }
             hmacBumpDev(r.deviceId, 'ok');
             // ★ 前 5 次成功的**逐条**打日志：部署当天要能立刻看到"签名真的通了" ✓
             if (_hmacStats.sigOk <= 5) log(`[hmac] ✓ 签名通过: ${r.deviceId} ${req.method} ${String(req.url).split('?')[0]}`);
@@ -2924,6 +2946,7 @@ function observeDeviceAuth(req) {
             else {
             _hmacStats.sigFail++;
             hmacBumpPath(_pth, 'sig_fail');
+            hmacBumpDevPath(r.deviceId, _pth, 'fail');
             hmacBumpDev(r.deviceId, 'fail', r.reason);
             _hmacFailReasons.set(r.reason, (_hmacFailReasons.get(r.reason) || 0) + 1);
             // ★ 失败按"原因"限流打日志（同一原因 60 秒最多一条，防刷屏 ✓ 但绝不静默）
@@ -2937,6 +2960,7 @@ function observeDeviceAuth(req) {
         } else if (r.mode === 'legacy' || r.mode === 'legacy_no_ts' || r.mode === 'fallback' || r.mode === 'missing_key') {
           _hmacStats.legacy++;
           hmacBumpDev(String(req.headers['x-device-id'] || '').trim() || '(未知)', 'legacy');
+          hmacBumpDevPath(String(req.headers['x-device-id'] || '').trim(), _pth, r.mode === 'legacy_no_ts' ? 'no_ts' : 'legacy');
           if (r.mode === 'legacy_no_ts') { _hmacStats.legacyNoTs = (_hmacStats.legacyNoTs || 0) + 1; hmacBumpPath(_pth, 'legacy_no_ts'); }
           else if (r.mode === 'fallback') hmacBumpPath(_pth, 'fallback');
           else if (r.mode === 'missing_key') hmacBumpPath(_pth, 'missing_key');
@@ -3895,6 +3919,7 @@ const server = http.createServer(async (req, res) => {
                 legacy: s.legacy, legacy_no_ts: s.legacyNoTs || 0, none: s.none, big: s.big },
       paths: gate.rows, paths_pass: gate.pass, paths_total: gate.total, paths_blocked: gate.blocked,
       devices: devs,
+      dev_paths: [..._hmacByDevPath.values()].sort((a, b) => (b.ok + b.legacy + b.fail) - (a.ok + a.legacy + a.fail)).slice(0, 40),
       fail_reasons: [..._hmacFailReasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)
     }));
     return;
