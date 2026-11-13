@@ -3581,7 +3581,7 @@ const server = http.createServer(async (req, res) => {
     const jsonOut = (code2, obj) => { try { res.writeHead(code2, { 'Content-Type': 'application/json' }); res.end(obj ? JSON.stringify(obj) : ''); } catch (e) {} };
     if (!checkDeviceSecret(pickSecret(req, q, null), dev)) { jsonOut(401, { ok: false, error: '设备密钥错误' }); return; }
     if (!dev) { jsonOut(400, { ok: false, error: '缺少 device_id' }); return; }
-    const fw = String(q.get('fw') || '').trim();
+    const fw = String((q && q.fw) || '').trim();   // getQuery 返回普通对象（没有 .get）
     try {
       const r = await fetch('https://ai.hiiin.com/api/watch/ota/latest?device_id=' + encodeURIComponent(dev) + '&fw=' + encodeURIComponent(fw), {
         headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` },
