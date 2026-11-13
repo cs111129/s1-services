@@ -327,7 +327,8 @@ function syncCamSecrets(force) {
       _secSyncing = false;
     } else return Promise.resolve(false);
   }
-  if (!force && Date.now() - _secSyncAt < SEC_SYNC_MS) return Promise.resolve(false);
+  // ★ 2026-11-13 修：窗口留 5 秒余量 —— 定时器也是 60s，两者相等时 tick 常差几十毫秒 ⇒ 被判"还没到"⇒ 隔一次才跑（有效周期 120s）✗
+  if (!force && Date.now() - _secSyncAt < SEC_SYNC_MS - 5000) return Promise.resolve(false);
   _secSyncing = true;
   _secSyncStartAt = Date.now();
   return fetch(`${CAM_S2_DBAPI}/api/cam-secrets`, {
@@ -384,7 +385,7 @@ setInterval(() => {
   try {
     _secSyncTicks++;
     syncCamSecrets(false).catch(e => log('cam 密钥表同步（定时）异常：' + (e && e.message)));
-    if (_secSyncTicks % 10 === 0) {
+    if (_secSyncTicks <= 3 || _secSyncTicks % 10 === 0) {
       const ago = _secSyncAt ? Math.round((Date.now() - _secSyncAt) / 1000) : -1;
       log('cam 密钥表同步心跳 第 ' + _secSyncTicks + ' 次：状态=' + _secSyncState + '，上次成功' + (ago < 0 ? '（从未）' : (' ' + ago + 's 前')));
     }
