@@ -3573,6 +3573,32 @@ const server = http.createServer(async (req, res) => {
    *   POST /api/watch/attendance         ⇒ 原样透传 body，回 S2 的 {ok,accepted,duplicated}
    * ★ 为什么不在这里加工：真源在 S2（绑定表/区域表/事件表）✓ S1 只做鉴权 + 转发 ✓
    */
+  // ★ CR-20261113-03：手表「检查更新」（只读；验设备密钥后转发 S2，原样透传状态码）
+  //   ★ 200 有新版本 / 204 已是最新 / 403 未登记 —— **状态码必须原样透传**（设备按它分流 ✓）
+  if (req.method === 'GET' && req.url.split('?')[0] === '/api/watch/ota/latest') {
+    const q = getQuery(req.url);
+    const dev = pickDeviceId(req, q, null);
+    const jsonOut = (code2, obj) => { try { res.writeHead(code2, { 'Content-Type': 'application/json' }); res.end(obj ? JSON.stringify(obj) : ''); } catch (e) {} };
+    if (!checkDeviceSecret(pickSecret(req, q, null), dev)) { jsonOut(401, { ok: false, error: '设备密钥错误' }); return; }
+    if (!dev) { jsonOut(400, { ok: false, error: '缺少 device_id' }); return; }
+    const fw = String(q.get('fw') || '').trim();
+    try {
+      const r = await fetch('https://ai.hiiin.com/api/watch/ota/latest?device_id=' + encodeURIComponent(dev) + '&fw=' + encodeURIComponent(fw), {
+        headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` },
+        signal: AbortSignal.timeout(15000),
+      });
+      const txt = await r.text();
+      log(`watch 检查更新: ${dev} fw=${fw} ⇒ S2 HTTP ${r.status}`);
+      if (r.status === 204) { res.writeHead(204); res.end(); return; }
+      res.writeHead(r.status, { 'Content-Type': 'application/json' });
+      res.end(txt);
+    } catch (e) {
+      log(`watch 检查更新异常: ${dev} ⇒ ${e.message}`);
+      jsonOut(502, { ok: false, error: '检查更新暂不可用' });
+    }
+    return;
+  }
+
   if (req.method === 'GET' && req.url.split('?')[0] === '/api/watch/config') {
     const q = getQuery(req.url);
     const dev = pickDeviceId(req, q, null);
