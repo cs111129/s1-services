@@ -2766,6 +2766,7 @@ function hmacPathGate() {
     path,
     ok: e.ok,
     signed_ok: e.ok,
+    legacy: e.legacy,
     legacy_no_ts: e.legacy_no_ts,
     fallback: e.fallback,
     missing_key: e.missing_key,
@@ -2810,7 +2811,7 @@ function hmacReport() {
   try {
     const g = hmacPathGate();
     const line = g.rows.slice(0, 10).map(r =>
-      `${r.path} ok${r.ok}/no_ts${r.legacy_no_ts}/fail${r.fail}/none${r.none}`).join(' · ');
+      `${r.path} ok${r.ok}/legacy${r.legacy}/no_ts${r.legacy_no_ts}/fb${r.fallback}/miss${r.missing_key}/fail${r.fail}/none${r.none}`).join(' · ');
     log(`[hmac] 按 path: ${g.pass}/${g.total} 条出过"签名 ok"${g.blocked.length ? ('　⚠ 未达标的: ' + g.blocked.join(', ')) : ''}`);
     if (line) log(`[hmac] path 明细: ${line}`);
     if ((_hmacStats.legacyNoTs || 0) > 0) log(`[hmac] legacy_no_ts 累计 ${_hmacStats.legacyNoTs} 次（★ 这就是 P3 的存量清单 ✓）`);
