@@ -310,18 +310,29 @@ const SEC_SYNC_MS = 60 * 1000;
 //      而 `let` 在**模块求值到那一行之前**是 TDZ ⇒ 一旦哪天有人在启动早期同步密钥就 ReferenceError ✓
 //      （现在只是"因为模块先求值完"才侥幸成立 ✗ —— 靠巧合的时序不是设计 ✓）
 let VOICE_CMD_ENABLED = false;
-let _secSyncAt = 0, _secSyncing = false;
+let _secSyncAt = 0, _secSyncing = false, _secSyncStartAt = 0, _secSyncTicks = 0;
 // ★★ 为什么要单独记一个"同步状态"：第一版**只在内容变化时打日志**，
 //   结果"同步成功但内容没变"完全看不见 —— 日志里只剩一条失败，
 //   读日志的人（我自己）当场误判成"密钥表从来没同步成功" ✗✗
 //   ⇒ 状态迁移（never→ok / ok→fail / 内容变化）都要留痕，"成功"与"从没跑过"必须分得开 ✓
 let _secSyncState = 'never';
 function syncCamSecrets(force) {
-  if (_secSyncing) return Promise.resolve(false);
+  // == 2026-11-13 事故：周期同步停了 8 分钟没人发现 ==
+  //   根因方向：_secSyncing 一次性置位、只在 finally 复位 => 只要那次 fetch **永远不返回**（没有超时），
+  //   这个标志就永久 true => 后续同步全被挡掉（连失败日志都不会有 => 最难查）
+  //   => 三条加固：① fetch 加 8 秒超时 ② 卡死 >60s 自动解除并留日志 ③ 每 10 次打一行心跳
+  if (_secSyncing) {
+    if (Date.now() - _secSyncStartAt > 60000) {
+      log('cam 密钥表同步 ⚠️ 卡死 ' + Math.round((Date.now() - _secSyncStartAt) / 1000) + 's ⇒ 强制解除（上次请求没返回）');
+      _secSyncing = false;
+    } else return Promise.resolve(false);
+  }
   if (!force && Date.now() - _secSyncAt < SEC_SYNC_MS) return Promise.resolve(false);
   _secSyncing = true;
+  _secSyncStartAt = Date.now();
   return fetch(`${CAM_S2_DBAPI}/api/cam-secrets`, {
-    headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` }
+    headers: { 'Authorization': `Bearer ${CAM_INGEST_TOKEN}` },
+    signal: AbortSignal.timeout(8000)   // 没有超时：一次网络挂住就把同步永久掐死
   }).then(r => {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
@@ -368,7 +379,19 @@ function syncCamSecrets(force) {
     return false;
   }).finally(() => { _secSyncing = false; });
 }
-setInterval(() => { syncCamSecrets(false); }, SEC_SYNC_MS).unref();
+setInterval(() => {
+  // 2026-11-13：包 try/catch + 心跳日志 —— 定时器静默死掉是最难查的一类
+  try {
+    _secSyncTicks++;
+    syncCamSecrets(false).catch(e => log('cam 密钥表同步（定时）异常：' + (e && e.message)));
+    if (_secSyncTicks % 10 === 0) {
+      const ago = _secSyncAt ? Math.round((Date.now() - _secSyncAt) / 1000) : -1;
+      log('cam 密钥表同步心跳 第 ' + _secSyncTicks + ' 次：状态=' + _secSyncState + '，上次成功' + (ago < 0 ? '（从未）' : (' ' + ago + 's 前')));
+    }
+  } catch (e) {
+    log('cam 密钥表定时器异常（不影响业务）：' + (e && e.message));
+  }
+}, SEC_SYNC_MS).unref();
 // ★ 启动后**尽快**同步（2 秒，原来是 20 秒）：
 //   S1 重启后到首次同步之间用的是**本地旧表** —— 那段时间里
 //   "刚被吊销的设备"仍会被放行（fail-open，危险方向 ✗）。
