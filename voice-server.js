@@ -2765,6 +2765,9 @@ const _hmacFailReasons = new Map();      // reason -> 次数（排查用）
 //   「哪台在签名、哪台还在 legacy」⇒ 这是决定能不能关 legacy 的唯一依据 ✓
 const _hmacByDev = new Map();            // deviceId -> { ok, fail, legacy, lastFail }
 let _hmacLastLog = 0;   // ★ 0 ⇒ 重启后第一条设备请求就打一行统计（部署当天能立刻看到基线 ✓）
+// ★★ 2026-11-13：统计**是进程内内存**、日志又是 `nohup >` 会被重启截断 ⇒ 必须落盘（见下方 hmacSnapshot）
+//   背景：CR-20261103-02 §17，FN-0009 升级后那一窗统计被一次部署重启清空，验收方拿不到数
+const _hmacStartedAt = Date.now();
 
 /** 哪些路径算"设备接口"（与服务端支持的设备面一致） */
 function isDeviceApiPath(u) {
@@ -2841,6 +2844,37 @@ function hmacReport() {
     if ((_hmacStats.legacyNoTs || 0) > 0) log(`[hmac] legacy_no_ts 累计 ${_hmacStats.legacyNoTs} 次（★ 这就是 P3 的存量清单 ✓）`);
   } catch (e) {}
 }
+
+/* ── 统计快照落盘（★ 验收性数据不能只活在内存 + 一个会被重启截断的日志里 ✗） ──
+ * 背景：2026-11-13 13:05 一次部署重启把 FN-0009 升级后那一窗统计清空了（CR-20261103-02 §17）
+ *   ⇒ 设备端明确要求"统计要能随时取"，并建议做只读端点
+ * 做法：每 15 秒把同一份统计写 `/tmp/hmac-stats.json`（带 `startedAt`：一眼看出是哪个进程周期的数）
+ * 读法：`ssh root@120.26.114.222 "cat /tmp/hmac-stats.json"`
+ * 语义：**只读聚合数**（path/device 的 ok/legacy/... 计数），不含任何密钥/nonce
+ */
+function hmacSnapshot() {
+  const s = _hmacStats;
+  let paths = [], devices = [];
+  try { paths = hmacPathGate().rows; } catch (e) {}
+  try {
+    devices = [..._hmacByDev.entries()].map(([device, e]) => ({
+      device, ok: e.ok, fail: e.fail, fallback: e.fallback || 0, legacy: e.legacy, lastFail: e.lastFail || '',
+    }));
+  } catch (e) {}
+  return {
+    ts: new Date().toISOString(),
+    startedAt: new Date(_hmacStartedAt).toISOString(),   // ★ 进程周期起点：重启后这个值会变
+    total: s.total, sigOk: s.sigOk, sigFail: s.sigFail, sigFallback: s.sigFallback,
+    legacy: s.legacy, legacyNoTs: s.legacyNoTs || 0, none: s.none, big: s.big,
+    failReasons: Object.fromEntries([..._hmacFailReasons.entries()].slice(0, 10)),
+    paths, devices,
+  };
+}
+try {
+  setInterval(() => {
+    try { fs.writeFileSync('/tmp/hmac-stats.json', JSON.stringify(hmacSnapshot(), null, 1)); } catch (e) {}
+  }, 15000).unref();   // unref：不影响进程正常退出语义
+} catch (e) {}
 
 function observeDeviceAuth(req) {
   if (!HMAC_OBSERVE) return;
