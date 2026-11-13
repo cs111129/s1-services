@@ -3836,6 +3836,36 @@ const server = http.createServer(async (req, res) => {
    * ⇒ 后台改完（预登记/轮换/吊销/删除）**同步调这个端点**，等它回 ok 才算生效 ✓
    *   ★ 鉴权用内部 ingest token（这是"触发一次同步"，滥用最多是让 S1 多拉一次）
    */
+  // ★★ 2026-11-13：**只读统计端点**（设备端要的"四行"直接取，不再等日志窗口）✗
+  //   动因：一次部署重启就把进程内统计清零 + 日志被 nohup 截断 ⇒ 验收窗口说没就没 ✓
+  //   ★ 只读、只认内部 token、**不返回任何密钥**（只有设备号/计数/指纹级信息）✓
+  if (req.method === 'GET' && req.url.split('?')[0] === '/api/cam/hmac-stats') {
+    const tok = String(req.headers['x-ingest-token'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '')).trim();
+    if (!CAM_INGEST_TOKEN || tok !== CAM_INGEST_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    const s = _hmacStats;
+    const gate = hmacPathGate();
+    const devs = [..._hmacByDev.entries()].map(([d, e]) => ({
+      device: d, ok: e.ok, fail: e.fail, legacy: e.legacy, last_fail: e.lastFail || ''
+    })).sort((a, b) => (b.ok + b.fail + b.legacy) - (a.ok + a.fail + a.legacy)).slice(0, 20);
+    const nowMs = Date.now();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      uptime_s: Math.round(process.uptime()),
+      since: new Date(nowMs - process.uptime() * 1000).toISOString(),   // ★ 统计起点（= 进程启动时间）
+      totals: { total: s.total, sig_ok: s.sigOk, sig_fail: s.sigFail, sig_fallback: s.sigFallback,
+                legacy: s.legacy, legacy_no_ts: s.legacyNoTs || 0, none: s.none, big: s.big },
+      paths: gate.rows, paths_pass: gate.pass, paths_total: gate.total, paths_blocked: gate.blocked,
+      devices: devs,
+      fail_reasons: [..._hmacFailReasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)
+    }));
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/api/cam/secrets-reload') {
     const tok = String(req.headers['x-ingest-token'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '')).trim();
     // ★ 2026-10-12：过渡期结束 ⇒ **只认新 token** ✓（旧的 cam-ingest-token-2026 从此 401 ✓）
