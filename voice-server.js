@@ -2768,6 +2768,7 @@ let _hmacLastLog = 0;   // ★ 0 ⇒ 重启后第一条设备请求就打一行�
 // ★★ 2026-11-13：统计**是进程内内存**、日志又是 `nohup >` 会被重启截断 ⇒ 必须落盘（见下方 hmacSnapshot）
 //   背景：CR-20261103-02 §17，FN-0009 升级后那一窗统计被一次部署重启清空，验收方拿不到数
 const _hmacStartedAt = Date.now();
+const _hmacStartedAtIso = new Date(_hmacStartedAt).toISOString();   // 归档判据：是不是同一个进程周期
 
 /** 哪些路径算"设备接口"（与服务端支持的设备面一致） */
 function isDeviceApiPath(u) {
@@ -2864,6 +2865,25 @@ function hmacReport() {
  * 读法：`ssh root@120.26.114.222 "cat /tmp/hmac-stats.json"`
  * 语义：**只读聚合数**（path/device 的 ok/legacy/... 计数），不含任何密钥/nonce
  */
+// ★★ 2026-11-13 补：**重启不再吃掉上一窗口**
+//   设备端明确提过：统计不能"只活在一个会被截断的地方" ✗
+//   而我今天又重启了两次（13:20 / 13:55）把窗口清了 ⇒ 光有快照还不够，**得留历史** ✓
+//   做法：启动时若发现旧快照的 startedAt 不是本次进程的 ⇒ 先归档到 /tmp/hmac-stats-history/<startedAt>.json 再覆盖
+const HMAC_SNAP_FILE = '/tmp/hmac-stats.json';
+const HMAC_HIST_DIR = '/tmp/hmac-stats-history';
+function hmacArchivePrevSnapshot() {
+  try {
+    const raw = fs.readFileSync(HMAC_SNAP_FILE, 'utf8');
+    const j = JSON.parse(raw);
+    const started = String(j.startedAt || 'unknown');
+    if (String(_hmacStartedAtIso) === started) return;          // 同一进程，不用归档
+    fs.mkdirSync(HMAC_HIST_DIR, { recursive: true });
+    const dst = HMAC_HIST_DIR + '/' + started.replace(/[:.]/g, '-') + '.json';
+    if (!fs.existsSync(dst)) fs.writeFileSync(dst, raw);
+    log('[hmac] 已归档上一窗口统计: ' + dst + '（totals=' + (j.total || 0) + ' 次）');
+  } catch (e) { /* 没有旧文件 = 第一次启动，正常 */ }
+}
+
 function hmacSnapshot() {
   const s = _hmacStats;
   let paths = [], devices = [];
@@ -2884,6 +2904,7 @@ function hmacSnapshot() {
   };
 }
 try {
+  hmacArchivePrevSnapshot();          // ★ 先归档上一窗口，再开始写本次快照
   setInterval(() => {
     try { fs.writeFileSync('/tmp/hmac-stats.json', JSON.stringify(hmacSnapshot(), null, 1)); } catch (e) {}
   }, 15000).unref();   // unref：不影响进程正常退出语义
