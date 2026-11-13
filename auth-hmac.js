@@ -33,6 +33,11 @@
  *   ③ **未知设备回落 legacy** —— 没预登记的新机只要 legacy 合法就放行，标 missing_key ✓
  *      （否则它上不了云、连 OTA 都查不了 ⇒ 不能自救 ✗）
  *   ④ **mode / identity 分开** —— 'fallback'/'missing_key' ⇒ identity:false ✓；ownKeyOnly:true 时直接 401 ✗
+ *      ★★ 2026-11-13 设备端复核（CR §14.2）：**legacy / legacy_no_ts 的 identity 也必须是 false** ✗
+ *      判据一句话：**"验得过" ≠ "有资格当身份"** —— legacy 是明文密钥头（不是签名），
+ *      不管密钥是共享的还是设备自己的，都只有"放行"资格、没有"身份"资格 ✓
+ *      只有 `mode:'sig'`（用该设备自己的密钥验过签名）才 `identity:true` ✓
+ *      （否则 P2「验签即身份」按 identity 放行时，legacy 会变成万能冒充口 ✗）
  *   ⑤ dryRun —— 只判定、**不消耗 nonce** ✓（统计层同一请求调两次，第二次不会被自己挡 ✓）
  */
 
@@ -134,7 +139,10 @@ function verifyDeviceAuth(req, rawBody, opt) {
     // ── ③ 一机一密（自己的密钥）优先 ──
     const own = (devHeader && o.secretOf) ? String(o.secretOf(devHeader) || '') : '';
     if (own && safeEq(legacy, own)) {
-      return { ok: true, mode: tsFlag === 'legacy_ts' ? 'legacy' : 'legacy_no_ts', identity: true, deviceId: devHeader, tsFlag };
+      // ★★ identity 必须 false ✗ —— 这条虽是"该设备自己的密钥"，但它走的是**明文密钥头**、不是签名：
+      //   ① 没有完整性保护（密钥对了，请求仍可能被改）② 密钥每次请求都出现在头里（暴露面）
+      //   ⇒ 只能放行、不能当身份；身份只认 mode:'sig'（设备端 CR §14.2 的硬要求）
+      return { ok: true, mode: tsFlag === 'legacy_ts' ? 'legacy' : 'legacy_no_ts', identity: false, deviceId: devHeader, tsFlag };
     }
     // ── ④ 公共兜底密钥：区分"已知设备用兜底"与"未知设备" ──
     if (o.legacySecret && safeEq(legacy, o.legacySecret)) {
