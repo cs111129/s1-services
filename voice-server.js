@@ -300,7 +300,9 @@ function finalizeParts(batchDir, batch, device_id, sop_id, interval_ms, effDev) 
       try {
         if (/\.jpe?g$/i.test(f) && f.toLowerCase() !== 'ref.jpg') {
           photoSeq++;
-          fs.renameSync(src, path.join(batchDir, 'snap_' + String(photoSeq).padStart(5, '0') + '.jpg'));
+          // ★ 3 位补零（snap_001.jpg）—— 与设备原始命名/管理端三处消费方一致 ✗
+          //   （2026-11-26 事故：分片合并写成 5 位 snap_00001.jpg ⇒ cam-records/cam-record/auth-service 都按 3 位拼 URL ⇒ 照片全 404 看不见）
+          fs.renameSync(src, path.join(batchDir, 'snap_' + String(photoSeq).padStart(3, '0') + '.jpg'));
         } else if (/\.wav$/i.test(f)) {
           // ★ 先把录音分片**移出** part 目录再合并 —— 否则下面 rmSync(partDir) 会把还没读的 wav 删掉
           //   （2026-11-26 实测：part2 合并时报 ENOENT .../part_00/rec.wav）
