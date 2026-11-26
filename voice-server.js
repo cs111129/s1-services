@@ -198,6 +198,182 @@ function camRefSweep() {
 }
 try { setInterval(camRefSweep, 5 * 60 * 1000).unref(); } catch (e) {}
 
+// ══════════════════════════════════════════════════════════════════════
+// ★★ CR-20261126-02：cam-upload **分片上传**（10 分钟批次 ≈ 20MB，单请求传不完）
+//
+//   背景：设备 ~45 KB/s，10 分钟录像（主要是未压缩 rec.wav ≈19MB）要传 7~9 分钟
+//        ⇒ 单请求必然撞设备 180s / 服务端 requestTimeout（120s，已放宽 900s）
+//   协议：multipart 额外字段 `part_index`（0 起）+ `part_total`；不带 = 老的单请求 ✓
+//   落盘：cam-uploads/<batch>/part_XX/<该片文件>
+//        全部分片（_part_XX.done 齐了）⇒ 合并到批次根：
+//          - 照片按 分片顺序 重命名 snap_00001.jpg …
+//          - 录音分片（各片 rec.wav）拼成一个 rec.wav（取 data 段首尾相接）
+//          - 复制主角参照照 ref.jpg
+//          - **此时才触发一次分析**（device 不等分析 ✓）
+//   ★ 分批会话（device|rawBatch → batch 名）**落盘**到 cam-uploads/_partmap/：
+//     分片间隔 >60s / 进程重启 也不会把同一批拆成多个目录
+//   ★ 幂等：同一片重传 ⇒ 先清该片目录再写；已合并后再来 ⇒ 回 complete=true 不重跑
+// ══════════════════════════════════════════════════════════════════════
+const PART_MAP_DIR = path.join(CAM_DIR, '_partmap');
+const PART_SESSION_TTL_MS = 6 * 3600 * 1000;
+
+function _partKey(dev, raw) { return String(dev || '?') + '|' + String(raw || '?'); }
+function _partMapPath(dev, raw) {
+  const h = crypto.createHash('sha1').update(_partKey(dev, raw)).digest('hex').slice(0, 20);
+  return path.join(PART_MAP_DIR, h + '.json');
+}
+function getPartSession(dev, raw) {
+  try {
+    const f = _partMapPath(dev, raw);
+    if (!fs.existsSync(f)) return null;
+    const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (!j || !j.batch || Date.now() - (j.created || 0) > PART_SESSION_TTL_MS) return null;
+    return j;
+  } catch (e) { return null; }
+}
+function savePartSession(dev, raw, batch, partTotal) {
+  try {
+    fs.mkdirSync(PART_MAP_DIR, { recursive: true });
+    fs.writeFileSync(_partMapPath(dev, raw), JSON.stringify({ batch: batch, created: Date.now(), part_total: partTotal }));
+  } catch (e) { log('cam partmap 写入失败: ' + e.message); }
+}
+function newBatchName(dev, raw) {
+  const iso = new Date(Date.now() + 8 * 3600 * 1000).toISOString();   // 北京时间
+  return (dev ? dev + '_' : '') + iso.slice(0, 10).replace(/-/g, '') + '_'
+    + iso.slice(11, 19).replace(/:/g, '') + '_' + (raw || ('auto-' + Date.now()));
+}
+// 把多段 PCM WAV 的 data 段首尾相接，重写一个 44 字节头（各段必须同格式）
+function concatWav(files, outPath) {
+  const bufs = files.map(function (f) { return fs.readFileSync(f); });
+  if (!bufs.length) return false;
+  const datas = bufs.map(function (b) {
+    const i = b.indexOf(Buffer.from('data'));
+    if (i < 0 || i + 8 > b.length) return Buffer.alloc(0);
+    const len = b.readUInt32LE(i + 4);
+    return b.slice(i + 8, Math.min(i + 8 + len, b.length));
+  }).filter(function (b) { return b.length; });
+  if (!datas.length) return false;
+  const pcm = Buffer.concat(datas);
+  const first = bufs[0];
+  const hdr = Buffer.alloc(44);
+  hdr.write('RIFF', 0);
+  hdr.writeUInt32LE(36 + pcm.length, 4);
+  hdr.write('WAVE', 8);
+  hdr.write('fmt ', 12);
+  hdr.writeUInt32LE(16, 16);
+  first.copy(hdr, 20, 20, 36);          // fmt 段（audioFormat/channels/sampleRate/byteRate/blockAlign/bits）
+  hdr.write('data', 36);
+  hdr.writeUInt32LE(pcm.length, 40);
+  fs.writeFileSync(outPath, Buffer.concat([hdr, pcm]));
+  return true;
+}
+
+function finalizeParts(batchDir, batch, device_id, sop_id, interval_ms, effDev) {
+  const finMarker = path.join(batchDir, '_finalized');
+  if (fs.existsSync(finMarker)) return { already: true };
+  const partDirs = fs.readdirSync(batchDir).filter(function (d) { return /^part_\d+$/.test(d); })
+    .sort(function (a, b) { return parseInt(a.slice(5), 10) - parseInt(b.slice(5), 10); });
+  const wavFiles = [];
+  let photoSeq = 0;
+  for (const d of partDirs) {
+    const dir = path.join(batchDir, d);
+    const files = fs.readdirSync(dir).filter(function (f) { return !f.startsWith('_'); }).sort();
+    for (const f of files) {
+      const src = path.join(dir, f);
+      try {
+        if (/\.jpe?g$/i.test(f) && f.toLowerCase() !== 'ref.jpg') {
+          photoSeq++;
+          fs.renameSync(src, path.join(batchDir, 'snap_' + String(photoSeq).padStart(5, '0') + '.jpg'));
+        } else if (/\.wav$/i.test(f)) {
+          wavFiles.push(src);
+        } else {
+          const dst = path.join(batchDir, f);
+          fs.renameSync(src, fs.existsSync(dst) ? path.join(batchDir, path.basename(d) + '_' + f) : dst);
+        }
+      } catch (e) { log(`cam 分片合并单文件失败 ${d}/${f}: ${e.message}`); }
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  if (wavFiles.length === 1) {
+    fs.renameSync(wavFiles[0], path.join(batchDir, 'rec.wav'));
+  } else if (wavFiles.length > 1) {
+    const ok = concatWav(wavFiles, path.join(batchDir, 'rec.wav'));
+    if (!ok) log(`cam 分片录音合并失败（保留 ${wavFiles.length} 段原文件）`);
+    if (ok) wavFiles.forEach(function (f) { try { fs.unlinkSync(f); } catch (e) {} });
+  }
+  // 主角参照照（开录前手机自拍的那张）
+  try {
+    const key = String(effDev || device_id || '').trim().toUpperCase();
+    const ref = camRefByDevice[key];
+    if (ref && fs.existsSync(ref.file)) {
+      fs.copyFileSync(ref.file, path.join(batchDir, 'ref.jpg'));
+      log(`cam 主角参照照已关联(分片): batch=${batch}`);
+    }
+    if (ref) { try { fs.unlinkSync(ref.file); } catch (e) {} delete camRefByDevice[key]; }
+  } catch (e) { log(`cam 主角参照照关联失败(分片): ${e.message}`); }
+  // 清掉分片完成标记（_finalized 保留作幂等标记）
+  try {
+    fs.readdirSync(batchDir).filter(function (f) { return /^_part_\d+\.done$/.test(f); })
+      .forEach(function (f) { try { fs.unlinkSync(path.join(batchDir, f)); } catch (e) {} });
+  } catch (e) {}
+  fs.writeFileSync(finMarker, String(Date.now()));
+  if (/_shot_/.test(batch)) {
+    log(`cam 预览抓拍批次(分片)，跳过分析: batch=${batch}`);
+  } else {
+    const analyzer = path.join(__dirname, 'cam_analyze.py');
+    exec(`python3 "${analyzer}" "${batchDir}" "${device_id}" "${sop_id}" "${interval_ms}" >> /tmp/cam-analyze.log 2>&1`, function (err) {
+      if (err) log(`cam 分析启动失败(分片): ${err.message}`);
+      else log(`cam 分析已启动(分片): batch=${batch}, device_id=${device_id || '(无)'}`);
+    });
+  }
+  return { finalized: true, photos: photoSeq, wav_parts: wavFiles.length };
+}
+
+function handlePartUpload(res, parts, opts) {
+  const device_id = opts.device_id, rawBatch = opts.rawBatch, partIdx = opts.partIdx,
+        partTot = opts.partTot, sop_id = opts.sop_id, interval_ms = opts.interval_ms, effDev = opts.effDev;
+  try {
+    let sess = getPartSession(device_id, rawBatch);
+    const batch = sess ? sess.batch : newBatchName(device_id, rawBatch);
+    if (!sess) savePartSession(device_id, rawBatch, batch, partTot);
+    const batchDir = path.join(CAM_DIR, batch);
+    fs.mkdirSync(batchDir, { recursive: true });
+    const finMarker = path.join(batchDir, '_finalized');
+    if (fs.existsSync(finMarker)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, batch, part_index: partIdx, part_total: partTot,
+        complete: true, already_finalized: true }));
+      return;
+    }
+    // 幂等：同一片重传 ⇒ 先清该片目录再写（避免旧帧残留）
+    const partDir = path.join(batchDir, 'part_' + String(partIdx).padStart(2, '0'));
+    fs.rmSync(partDir, { recursive: true, force: true });
+    fs.mkdirSync(partDir, { recursive: true });
+    let n = 0;
+    for (const p of parts) {
+      if (p.name === 'batch' || p.name === 'device_id' || p.name === 'sop_id' || p.name === 'interval_ms'
+        || p.name === 'secret' || p.name === 'part_index' || p.name === 'part_total' || p.name === 'force') continue;
+      if (p.name === 'upload_log') { fs.writeFileSync(path.join(batchDir, '_upload_log.txt'), p.data); continue; }
+      const safe = path.basename(p.name);
+      if (!safe) continue;
+      fs.writeFileSync(path.join(partDir, safe), p.data);
+      n++;
+    }
+    fs.writeFileSync(path.join(batchDir, '_part_' + String(partIdx).padStart(2, '0') + '.done'), String(Date.now()));
+    const done = fs.readdirSync(batchDir).filter(function (f) { return /^_part_\d+\.done$/.test(f); }).length;
+    log(`cam-upload 分片: batch=${batch} part=${partIdx + 1}/${partTot} files=${n} done=${done}`);
+    let complete = false, fin = null;
+    if (done >= partTot) { fin = finalizeParts(batchDir, batch, device_id, sop_id, interval_ms, effDev); complete = true; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, batch, part_index: partIdx, part_total: partTot,
+      received: n, parts_done: done, complete: complete, finalized: fin }));
+  } catch (e) {
+    log('cam-upload 分片错误: ' + e.message);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: e.message }));
+  }
+}
+
 // 给 /api/cam/cmd 的响应挂上 student 字段（规格书 §4.2 参考实现）
 // 返回【新的】对象，不改动传进来的那个 —— 否则 cmd/send 里那份 pending 会被污染
 function withStudent(dev, resp) {
@@ -4730,6 +4906,20 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         // 拍照间隔（41号文档，设备端传实际间隔，缺省兜底 5000ms）
         const intervalPart = parts.find(p => p.name === 'interval_ms');
         const interval_ms = intervalPart ? intervalPart.data.toString().trim() : '';
+
+        // ★ CR-20261126-02：分片上传分支
+        //   ★ 判据：**带了合法的 part_index/part_total 才走**；不带 ⇒ 下面的老路径一行不改 ✓
+        const _piP = parts.find(p => p.name === 'part_index');
+        const _ptP = parts.find(p => p.name === 'part_total');
+        const _pi = _piP ? parseInt(_piP.data.toString().trim(), 10) : NaN;
+        const _pt = _ptP ? parseInt(_ptP.data.toString().trim(), 10) : NaN;
+        if (Number.isInteger(_pi) && Number.isInteger(_pt) && _pt >= 1 && _pt <= 120 && _pi >= 0 && _pi < _pt) {
+          handlePartUpload(res, parts, {
+            device_id: device_id, rawBatch: rawBatch, partIdx: _pi, partTot: _pt,
+            sop_id: sop_id, interval_ms: interval_ms, effDev: effDev,
+          });
+          return;
+        }
 
         // 建目录 CAM_DIR/<batch>/（先清空旧内容，防 batch 复用残留旧帧）
         const batchDir = path.join(CAM_DIR, batch);
