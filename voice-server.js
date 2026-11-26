@@ -285,7 +285,11 @@ function finalizeParts(batchDir, batch, device_id, sop_id, interval_ms, effDev) 
           photoSeq++;
           fs.renameSync(src, path.join(batchDir, 'snap_' + String(photoSeq).padStart(5, '0') + '.jpg'));
         } else if (/\.wav$/i.test(f)) {
-          wavFiles.push(src);
+          // ★ 先把录音分片**移出** part 目录再合并 —— 否则下面 rmSync(partDir) 会把还没读的 wav 删掉
+          //   （2026-11-26 实测：part2 合并时报 ENOENT .../part_00/rec.wav）
+          const tmp = path.join(batchDir, '_wavseg_' + String(wavFiles.length + 1).padStart(2, '0') + '.wav');
+          fs.renameSync(src, tmp);
+          wavFiles.push(tmp);
         } else {
           const dst = path.join(batchDir, f);
           fs.renameSync(src, fs.existsSync(dst) ? path.join(batchDir, path.basename(d) + '_' + f) : dst);
