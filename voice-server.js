@@ -207,7 +207,10 @@ try { setInterval(camRefSweep, 5 * 60 * 1000).unref(); } catch (e) {}
 //   ★ 本次仍拍了自拍（ref.jpg）时**自拍优先**（同一个人、且是本次衣着）
 // ══════════════════════════════════════════════════════════════════════
 const PORTRAIT_DIR = path.join(CAM_DIR, '_portraits');
-const PORTRAIT_SLOTS = ['face_center', 'face_left', 'face_right', 'body_front', 'body_back', 'body_side', 'device_front', 'device_side'];
+// ★ 2026-11-26 优化：全身改半身（正面/左/右）；body_* 保留兼容旧数据
+const PORTRAIT_SLOTS = ['face_center', 'face_left', 'face_right', 'half_front', 'half_left', 'half_right', 'device_front', 'device_side'];
+const PORTRAIT_LEGACY = ['body_front', 'body_back', 'body_side'];
+const PORTRAIT_REQUIRED = ['face_center', 'face_left', 'face_right', 'half_front', 'half_left', 'half_right'];
 const camPortraitForDevice = {};   // device -> { student_id, ts }（本次录像用哪个学员的备案照）
 
 function portraitDirOf(sid) {
@@ -221,6 +224,24 @@ function portraitMetaOf(sid) {
   } catch (e) { return null; }
 }
 /** 把某学员的备案照复制进批次：最多 3 张（face_center → body_front → device_front/side） */
+
+const PORTRAIT_CHECK_SCRIPT = path.join(__dirname, 'portrait_check.py');
+// ★ CR-20261126-03 优化点3：提交前先做 AI 质检（同一批照片，一次调用）
+function runPortraitCheck(dir) {
+  return new Promise(function (resolve) {
+    execFile('python3', [PORTRAIT_CHECK_SCRIPT, dir], { timeout: 150000, maxBuffer: 4 * 1024 * 1024 },
+      function (err, stdout, stderr) {
+        const line = String(stdout || '').trim().split('\n').filter(Boolean).pop() || '';
+        try {
+          const j = JSON.parse(line);
+          if (j && typeof j === 'object') return resolve(j);
+        } catch (e) {}
+        log(`cam 备案质检异常: ${(err && err.message) || ''} ${String(stderr || '').slice(0, 200)}`);
+        resolve({ ok: false, score: 0, issues: [], summary: '质检服务异常，请稍后重试' });
+      });
+  });
+}
+
 function copyPortraitRefs(dev, batchDir) {
   try {
     const key = String(dev || '').trim().toUpperCase();
@@ -232,16 +253,16 @@ function copyPortraitRefs(dev, batchDir) {
     const dir = portraitDirOf(job.student_id);
     const picks = [
       ['face_center.jpg', 'ref_face.jpg'],
+      ['half_front.jpg', 'ref_body.jpg'],
       ['body_front.jpg', 'ref_body.jpg'],
       ['device_front.jpg', 'ref_dev.jpg'],
     ];
     let n = 0;
     for (const [src, dst] of picks) {
       const sp = path.join(dir, src);
-      if (fs.existsSync(sp)) {
+      if (fs.existsSync(sp) && !fs.existsSync(path.join(batchDir, dst))) {
         fs.copyFileSync(sp, path.join(batchDir, dst));
         n++;
-        if (dst === 'ref_dev.jpg') break;
       }
     }
     log(`cam 备案照已关联: batch=${path.basename(batchDir)} student_id=${job.student_id} 共 ${n} 张`);
@@ -4548,13 +4569,15 @@ function validateSetConfig(o) {
   return { ok: true, out };
 }
 
-  // POST /api/cam/portrait — 保存「形象备案」（CR-20261126-03，内部调用：Bearer ingest token）
-  //   body: { student_id, name, store, slots:{slot:b64}, device_batches:[batch,...] }
-  //   ★ 手机 6 张走 slots；设备机位 2 张不传图片，只传 shot 批次名 ⇒ 从 cam-uploads/<batch>/ 复制
+  // POST /api/cam/portrait — 保存「形象备案」（CR-20261126-03）
+  //   ★ 2026-11-26 优化：① 支持"只改一张"（已有照片先复制进 staging 合并）
+  //                     ② **提交前先 AI 质检**，不通过就 422 返回 issues（UI 标红重拍）
+  //                     ③ 全身改半身（half_*），body_* 兼容旧数据
   if (req.method === 'POST' && req.url === '/api/cam/portrait') {
     let body = '';
     req.on('data', c => { body += c; if (body.length > 20 * 1024 * 1024) { try { req.destroy(); } catch (e) {} } });
-    req.on('end', () => {
+    req.on('end', async () => {
+      let staging = '';
       try {
         const auth = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
         if (!CAM_INGEST_TOKEN || auth !== CAM_INGEST_TOKEN) {
@@ -4565,10 +4588,19 @@ function validateSetConfig(o) {
         const sid = String(o.student_id || '').replace(/[^0-9]/g, '');
         if (!sid) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: '缺少 student_id' })); return; }
         const dir = portraitDirOf(sid);
-        fs.mkdirSync(dir, { recursive: true });
+        staging = dir + '__staging';
+        fs.rmSync(staging, { recursive: true, force: true });
+        fs.mkdirSync(staging, { recursive: true });
+        // ① 已有照片先带进来（"只改一张"时其它张不丢）
+        if (fs.existsSync(dir)) {
+          for (const f of fs.readdirSync(dir)) {
+            if (/\.jpe?g$/i.test(f)) { try { fs.copyFileSync(path.join(dir, f), path.join(staging, f)); } catch (e) {} }
+          }
+        }
+        // ② 本次上传的手机照（覆盖同名槽位）
         const slots = o.slots && typeof o.slots === 'object' ? o.slots : {};
-        const saved = [];
-        for (const slot of PORTRAIT_SLOTS) {
+        const accepted = PORTRAIT_SLOTS.concat(PORTRAIT_LEGACY);
+        for (const slot of accepted) {
           const raw = slots[slot];
           if (!raw) continue;
           const b64 = String(raw).replace(/^data:[^,]*,/, '');
@@ -4576,10 +4608,9 @@ function validateSetConfig(o) {
           try { buf = Buffer.from(b64, 'base64'); } catch (e) { buf = Buffer.alloc(0); }
           if (buf.length < 100 || buf.length > 2 * 1024 * 1024) { log(`cam 备案照跳过 ${slot}: 大小异常 ${buf.length}`); continue; }
           if (!(buf[0] === 0xFF && buf[1] === 0xD8)) { log(`cam 备案照跳过 ${slot}: 非 JPEG`); continue; }
-          fs.writeFileSync(path.join(dir, slot + '.jpg'), buf);
-          saved.push(slot);
+          fs.writeFileSync(path.join(staging, slot + '.jpg'), buf);
         }
-        // 设备机位：从 shot 批次复制（正面/侧面各一张）
+        // ③ 设备机位：本次重拍的才传 batch（旧图已在 staging）
         const devBatches = Array.isArray(o.device_batches) ? o.device_batches.slice(0, 2) : [];
         const devSlots = ['device_front', 'device_side'];
         for (let i = 0; i < devBatches.length; i++) {
@@ -4587,19 +4618,41 @@ function validateSetConfig(o) {
           const bd = path.join(CAM_DIR, path.basename(b));
           if (!b || !fs.existsSync(bd)) { log(`cam 备案照设备批次不存在: ${b}`); continue; }
           const jpgs = fs.readdirSync(bd).filter(f => /\.jpe?g$/i.test(f)).sort();
-          if (!jpgs.length) continue;
-          fs.copyFileSync(path.join(bd, jpgs[0]), path.join(dir, devSlots[i] + '.jpg'));
-          saved.push(devSlots[i]);
+          if (jpgs.length) fs.copyFileSync(path.join(bd, jpgs[0]), path.join(staging, devSlots[i] + '.jpg'));
         }
+        // ④ 必填 6 张（半身新版；half_front 允许用旧 body_front 顶）
+        const has = (slot) => fs.existsSync(path.join(staging, slot + '.jpg'))
+          || (slot === 'half_front' && fs.existsSync(path.join(staging, 'body_front.jpg')));
+        const missing = PORTRAIT_REQUIRED.filter(s => !has(s));
+        if (missing.length) {
+          fs.rmSync(staging, { recursive: true, force: true });
+          res.writeHead(422, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `还差 ${missing.length} 张照片`, missing: missing })); return;
+        }
+        // ⑤ AI 质检（不通过则不落库）
+        const q = await runPortraitCheck(staging);
+        if (!q.ok) {
+          fs.rmSync(staging, { recursive: true, force: true });
+          res.writeHead(422, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '照片质检未通过：' + (q.summary || '请按提示重拍'),
+            issues: Array.isArray(q.issues) ? q.issues : [], summary: q.summary || '', score: q.score || 0 })); return;
+        }
+        // ⑥ 通过 ⇒ 替换正式目录
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.renameSync(staging, dir);
+        const saved = fs.readdirSync(dir).filter(f => /\.jpe?g$/i.test(f)).map(f => f.replace(/\.jpe?g$/i, ''));
         const meta = {
           student_id: Number(sid), name: String(o.name || ''), store: String(o.store || ''),
           created_at: new Date().toISOString(), slots: saved,
+          quality: { score: q.score || 0, summary: q.summary || '', checked_at: new Date().toISOString() },
         };
         fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta));
-        log(`cam 形象备案已保存: student_id=${sid} slots=${saved.join(',')}`);
+        log(`cam 形象备案已保存(质检通过): student_id=${sid} slots=${saved.join(',')} score=${q.score}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, student_id: Number(sid), slots: saved, created_at: meta.created_at }));
+        res.end(JSON.stringify({ ok: true, student_id: Number(sid), slots: saved,
+          created_at: meta.created_at, quality: meta.quality }));
       } catch (e) {
+        try { if (staging) fs.rmSync(staging, { recursive: true, force: true }); } catch (e2) {}
         log(`cam 形象备案保存失败: ${e.message}`);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -4607,6 +4660,25 @@ function validateSetConfig(o) {
     });
     return;
   }
+
+  // GET /api/cam/portrait/<sid>/<slot>.jpg — 取备案图（内部；S2 代理给学员端 <img>）
+  if (req.method === 'GET' && /^\/api\/cam\/portrait\/\d+\/[a-z_]+\.jpg$/.test(req.url.split('?')[0])) {
+    try {
+      const auth = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+      if (!CAM_INGEST_TOKEN || auth !== CAM_INGEST_TOKEN) {
+        res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'Unauthorized' })); return;
+      }
+      const m = req.url.split('?')[0].match(/^\/api\/cam\/portrait\/(\d+)\/([a-z_]+\.jpg)$/);
+      const p = path.join(portraitDirOf(m[1]), path.basename(m[2]));
+      if (!fs.existsSync(p)) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: '无此照片' })); return; }
+      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' });
+      fs.createReadStream(p).pipe(res);
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+    return;
+  }
+
   // GET /api/cam/portrait/<sid> — 查备案元信息（内部）
   if (req.method === 'GET' && req.url.startsWith('/api/cam/portrait/')) {
     const sid = req.url.slice('/api/cam/portrait/'.length).split('?')[0].replace(/[^0-9]/g, '');
@@ -4616,6 +4688,7 @@ function validateSetConfig(o) {
     res.end(JSON.stringify({ ok: true, meta: meta }));
     return;
   }
+
   // DELETE /api/cam/portrait/<sid> — 删除备案（隐私：本人/管理端）
   if (req.method === 'DELETE' && req.url.startsWith('/api/cam/portrait/')) {
     const auth = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
