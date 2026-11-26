@@ -16,7 +16,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from cam_analyze import VISION_MODEL, VISION_URL, http_json_post, load_key, log
+    from cam_analyze import (DEEPSEEK_FLASH, DEEPSEEK_URL, http_json_post,
+                             load_deepseek_key, log)
 except Exception as e:  # pragma: no cover
     sys.stderr.write(f"[portrait_check] 导入 cam_analyze 失败: {e}\n")
     sys.exit(1)
@@ -71,9 +72,9 @@ def main():
         print(json.dumps({"ok": False, "score": 0, "issues": [], "summary": "没有找到任何照片"}, ensure_ascii=False))
         return
     missing = [s for s in REQUIRED if not os.path.isfile(os.path.join(d, s + ".jpg"))]
-    key = load_key("DASHSCOPE_API_KEY")
+    key = load_deepseek_key()
     if not key:
-        sys.stderr.write("[portrait_check] 缺少 DASHSCOPE_API_KEY\n")
+        sys.stderr.write("[portrait_check] 缺少 DEEPSEEK_API_KEY\n")
         sys.exit(1)
 
     content = [{"type": "text", "text": PROMPT}]
@@ -81,11 +82,13 @@ def main():
         content.append({"type": "text", "text": f"【{slot}】{SLOT_LABEL.get(slot, slot)}"})
         b64 = base64.b64encode(open(path, "rb").read()).decode()
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-    payload = {"model": VISION_MODEL, "messages": [{"role": "user", "content": content}],
-               "max_tokens": 1200, "temperature": 0.1}
+    payload = {"model": DEEPSEEK_FLASH, "messages": [{"role": "user", "content": content}],
+               "max_tokens": 8000, "temperature": 0.1}
     try:
-        j = http_json_post(VISION_URL, key, payload, timeout=120)
+        j = http_json_post(DEEPSEEK_URL, key, payload, timeout=120)
         text = (j["choices"][0]["message"].get("content") or "").strip()
+        if not text:
+            text = (j["choices"][0]["message"].get("reasoning_content") or "").strip()
     except Exception as e:
         sys.stderr.write(f"[portrait_check] 调用视觉模型失败: {e}\n")
         sys.exit(1)
