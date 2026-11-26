@@ -242,29 +242,41 @@ function newBatchName(dev, raw) {
   return (dev ? dev + '_' : '') + iso.slice(0, 10).replace(/-/g, '') + '_'
     + iso.slice(11, 19).replace(/:/g, '') + '_' + (raw || ('auto-' + Date.now()));
 }
-// 把多段 PCM WAV 的 data 段首尾相接，重写一个 44 字节头（各段必须同格式）
+// 把多段 WAV 的 data 段首尾相接，**照抄第一片的头**（含 fmt/fact —— 设备实际是 μ-law 8bit，不是 PCM16 ✗）
+//   ★ CR-20261126-02 回执16：设备 rec.wav = WAVE_FORMAT_MULAW(7) / 8bit / 16kHz / 单声道 / 头 58B
+//   ⇒ 不能硬写 44 字节 PCM 头（会把 μ-law 标成 16bit ⇒ ASR 静默乱码）
+//   ⇒ 做法：取第一片 [0, data块头+8) 整段头，只改 RIFF size 与 data size 两个字段
 function concatWav(files, outPath) {
   const bufs = files.map(function (f) { return fs.readFileSync(f); });
   if (!bufs.length) return false;
-  const datas = bufs.map(function (b) {
+  const infos = bufs.map(function (b) {
     const i = b.indexOf(Buffer.from('data'));
-    if (i < 0 || i + 8 > b.length) return Buffer.alloc(0);
-    const len = b.readUInt32LE(i + 4);
-    return b.slice(i + 8, Math.min(i + 8 + len, b.length));
-  }).filter(function (b) { return b.length; });
-  if (!datas.length) return false;
-  const pcm = Buffer.concat(datas);
+    if (i < 0 || i + 8 > b.length) return null;
+    return { i: i, len: b.readUInt32LE(i + 4) };
+  });
+  if (infos.some(function (x) { return !x; })) return false;
+  const pcm = Buffer.concat(bufs.map(function (b, k) {
+    return b.slice(infos[k].i + 8, Math.min(infos[k].i + 8 + infos[k].len, b.length));
+  }));
   const first = bufs[0];
-  const hdr = Buffer.alloc(44);
-  hdr.write('RIFF', 0);
-  hdr.writeUInt32LE(36 + pcm.length, 4);
-  hdr.write('WAVE', 8);
-  hdr.write('fmt ', 12);
-  hdr.writeUInt32LE(16, 16);
-  first.copy(hdr, 20, 20, 36);          // fmt 段（audioFormat/channels/sampleRate/byteRate/blockAlign/bits）
-  hdr.write('data', 36);
-  hdr.writeUInt32LE(pcm.length, 40);
+  const d0 = infos[0].i;
+  const hdr = Buffer.from(first.slice(0, d0 + 8));
+  hdr.writeUInt32LE(hdr.length - 8 + pcm.length, 4);   // RIFF chunk size
+  hdr.writeUInt32LE(pcm.length, d0 + 4);               // data chunk size
   fs.writeFileSync(outPath, Buffer.concat([hdr, pcm]));
+  // fmt 一致性粗检：只告警，不改头（ASR 会按第一片的格式解码）
+  try {
+    const fi = first.indexOf(Buffer.from('fmt '));
+    const fsz = first.readUInt32LE(fi + 4);
+    const f0 = first.slice(fi + 8, fi + 8 + fsz).toString('hex');
+    for (let k = 1; k < bufs.length; k++) {
+      const j = bufs[k].indexOf(Buffer.from('fmt '));
+      if (j < 0) continue;
+      const sz = bufs[k].readUInt32LE(j + 4);
+      const hx = bufs[k].slice(j + 8, j + 8 + sz).toString('hex');
+      if (hx !== f0) { log(`⚠️ cam 分片录音格式不一致: part0 fmt=${f0} / part${k} fmt=${hx}（按 part0 头写）`); break; }
+    }
+  } catch (e) {}
   return true;
 }
 
