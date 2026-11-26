@@ -2783,6 +2783,16 @@ function silenceAudioUrl() {
 //      ⇒ **不会把"正常的长时间回答"掐断** ✗（这是这条兜底能不能上线的前提 ✓）
 const RESPONSE_WATCHDOG_MS = parseInt(process.env.RESPONSE_WATCHDOG_MS || '60000', 10);
 
+// ★★ CR-20261126-01（2026-11-26）：**按路径**给看门狗超时 —— 上传不能拿 60s 当"卡死"
+//   事故：设备一批 3,107,892 B / 约 69s 传完；body 还没收完（第 60s）看门狗就回 504 ✗
+//     ⇒ 设备端误判成"nginx 网关超时"（其 CR 的判断）；实测 nginx `proxy_read_timeout` 已是 2400s
+//     ⇒ 真因就是**这条看门狗**（voice-server 日志有对应时间点的"看门狗…回 504"）
+//   ★ 判据：**收 body 期间没有响应字节是正常的**（设备 40~45 KB/s，3MB 就要 ~70s）
+//   ★ 取值：上传 600s（设备侧上传超时 180s，600s 只是服务端兜底）；环境变量可覆盖
+const RESPONSE_WATCHDOG_BY_PATH = {
+  '/api/cam-upload': parseInt(process.env.RESPONSE_WATCHDOG_CAM_UPLOAD_MS || '600000', 10),
+};
+
 /* ══════════════════════════════════════════════════════════════════════════
  * ★★ CR-20261103-02 P1：设备接口签名（HMAC-SHA256）**只观测、不拦截**
  *
@@ -3063,14 +3073,17 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Device-Secret, X-Device-Id');
 
   // ★ 看门狗：每个请求一个，正常结束时清掉（`close` 兜客户端中途断开 ✓）
+  //   ★ 路径可覆盖超时（上传收 body 慢是正常的，见 RESPONSE_WATCHDOG_BY_PATH）
+  const _wdPath = String(req.url).split('?')[0];
+  const _wdMs = RESPONSE_WATCHDOG_BY_PATH[_wdPath] || RESPONSE_WATCHDOG_MS;
   const _wdTimer = setTimeout(() => {
     if (res.headersSent || res.writableEnded) return;   // 已经开始回包 ⇒ 不插手 ✓
     try {
-      log(`⚠️ 看门狗：${req.method} ${String(req.url).split('?')[0]} ${Math.round(RESPONSE_WATCHDOG_MS / 1000)}s 未发出任何响应 ⇒ 回 504（★ handler 里大概率有未捕获异常 ✗ 看上一行日志）`);
+      log(`⚠️ 看门狗：${req.method} ${_wdPath} ${Math.round(_wdMs / 1000)}s 未发出任何响应 ⇒ 回 504（★ handler 里大概率有未捕获异常 ✗ 看上一行日志）`);
       res.writeHead(504, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ error: 'server_timeout', reason: 'no_response_within_watchdog' }));
     } catch (_) { /* 连接已经烂了 ⇒ 无能为力 ✓ */ }
-  }, RESPONSE_WATCHDOG_MS);
+  }, _wdMs);
   const _wdClear = () => clearTimeout(_wdTimer);
   res.on('finish', _wdClear);
   res.on('close', _wdClear);
