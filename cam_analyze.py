@@ -254,6 +254,16 @@ PROTAGONIST_BLOCK = """【主角锚定（本次考核对象）】
 
 """
 
+# ★ CR-20261126-03：形象备案（非本次录制）作为参照 —— 只能认人，绝不能评价仪容
+PORTRAIT_BLOCK = """【主角锚定（本次考核对象 · 形象备案）】
+- 消息里**前 {k} 张图**是主角的「形象备案照」（手机+设备机位，**不是本次录制**）；后续 {n} 张才是设备按时间顺序拍的录制画面。
+- 主角 = 备案照里的那个人。第一步每行请注明主角是否在画面（在 → 画面左/中/右、远/近）；不在 → 写「主角不在画面」；并写明识别依据（发型、体型、衣着等）。
+- 第三步只评判**主角本人**的动作与话术；画面里的其他人（同事/顾客）只作为场景上下文，**不评分、不替代主角**。
+- 若某段画面认不出主角（不在画面 / 背对 / 遮挡 / 光线差），在「无法判断」里如实写明；**禁止把配角当成主角评**。
+- 备案照只用于认人：**绝不能**用备案照评价本次的仪容仪表/服装是否达标（衣着可能已换）；它也不是本次录像的一帧。
+
+"""
+
 
 def render_steps_for_prompt(steps):
     """结构化步骤 → 给模型看的文本。空字段【不输出】= 该步对此项无要求（对应矩阵里的「—」）。
@@ -459,7 +469,7 @@ def http_json_post(url, key, payload, timeout=180):
     raise last_err
 
 
-def call_vision(key, image_paths, interval_sec=5, ref_image=None):
+def call_vision(key, image_paths, interval_sec=5, ref_images=None, ref_kind="selfie"):
     """图片帧一次性给 Qwen-VL-Plus 做时序分析，返回文字。
 
     - 帧数 > MAX_VISION_FRAMES 时等间隔抽帧，控制 token 成本/耗时。
@@ -475,18 +485,22 @@ def call_vision(key, image_paths, interval_sec=5, ref_image=None):
         log(f"抽帧降本: {len(image_paths)} 帧 → {len(sampled)} 帧（等间隔）")
         image_paths = sampled
 
-    # ★ CR-20261126-01：有主角参照照时，把它作为消息里第 1 张图，并在提示词前插「主角锚定」
+    # ★ CR-20261126-01/03：主角锚定前缀（自拍 = 第 1 张；备案 = 前 k 张）
+    ref_images = [p for p in (ref_images or []) if p]
     _txt = vision_prompt.format(n=len(image_paths), interval_sec=interval_sec)
-    if ref_image:
-        _txt = PROTAGONIST_BLOCK.format(n=len(image_paths)) + _txt
-        log(f"启用主角锚定（参照照 {os.path.basename(ref_image)}）")
+    if ref_images:
+        if ref_kind == "portrait":
+            _txt = PORTRAIT_BLOCK.format(k=len(ref_images), n=len(image_paths)) + _txt
+        else:
+            _txt = PROTAGONIST_BLOCK.format(n=len(image_paths)) + _txt
+        log(f"启用主角锚定（{ref_kind}，{len(ref_images)} 张参照）")
     content = [{"type": "text", "text": _txt}]
-    if ref_image:
+    for rp in ref_images:
         try:
-            _rb = base64.b64encode(open(ref_image, "rb").read()).decode()
+            _rb = base64.b64encode(open(rp, "rb").read()).decode()
             content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_rb}"}})
         except Exception as e:
-            log(f"参照照读取失败（忽略，按无锚定跑）: {e}")
+            log(f"参照照读取失败（忽略）: {e}")
     for p in image_paths:
         b64 = base64.b64encode(open(p, "rb").read()).decode()
         content.append({
@@ -525,7 +539,7 @@ def call_chat(key, prompt, max_tokens=500):
     return j["choices"][0]["message"]["content"].strip()
 
 
-def call_merged(key, image_paths, audio_text, sop_doc, interval_sec=5, ref_image=None):
+def call_merged(key, image_paths, audio_text, sop_doc, interval_sec=5, ref_images=None, ref_kind="selfie"):
     """★ 合并分析：一次调用完成「画面时序 + 录音转写 + SOP 逐条比对」，三段都是 Markdown 表格。
 
     返回 dict(image_analysis, summary, sop_compare)。
@@ -577,19 +591,23 @@ def call_merged(key, image_paths, audio_text, sop_doc, interval_sec=5, ref_image
             "**不得据此单独判定不合格**。\n\n"
         ) + prompt
 
-    # ★ CR-20261126-01：主角锚定（代码层前置，不改线上 cam-config.json）
-    #   —— 有 ref 时消息第 1 张 = 参照照；提示词最前面插入「主角锚定」段
-    if ref_image:
-        prompt = PROTAGONIST_BLOCK.format(n=len(image_paths)) + prompt
-        log(f"启用主角锚定（参照照 {os.path.basename(ref_image)}）")
+    # ★ CR-20261126-01/03：主角锚定（代码层前置，不改线上 cam-config.json）
+    #   自拍 ⇒ 第 1 张参照；备案 ⇒ 前 k 张参照（且只用认人）
+    ref_images = [p for p in (ref_images or []) if p]
+    if ref_images:
+        if ref_kind == "portrait":
+            prompt = PORTRAIT_BLOCK.format(k=len(ref_images), n=len(image_paths)) + prompt
+        else:
+            prompt = PROTAGONIST_BLOCK.format(n=len(image_paths)) + prompt
+        log(f"启用主角锚定（{ref_kind}，{len(ref_images)} 张参照）")
 
     content = [{"type": "text", "text": prompt}]
-    if ref_image:
+    for rp in ref_images:
         try:
-            _rb = base64.b64encode(open(ref_image, "rb").read()).decode()
+            _rb = base64.b64encode(open(rp, "rb").read()).decode()
             content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_rb}"}})
         except Exception as e:
-            log(f"参照照读取失败（忽略，按无锚定跑）: {e}")
+            log(f"参照照读取失败（忽略）: {e}")
     for p in image_paths:
         b64 = base64.b64encode(open(p, "rb").read()).decode()
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
@@ -889,12 +907,20 @@ def main():
         str(p) for p in Path(batch_dir).glob("snap_*.jpg")
     )
     wav = os.path.join(batch_dir, "rec.wav")
-    # ★ CR-20261126-01：主角参照照 —— 有则启用「主角锚定」，无则与老行为完全一致
-    ref_image = os.path.join(batch_dir, "ref.jpg")
-    if not os.path.isfile(ref_image):
-        ref_image = None
+    # ★ CR-20261126-01/03：主角参照 —— ① 本次自拍 ref.jpg 优先 ② 否则用形象备案 ref_face/body/dev
+    ref_images, ref_kind = [], "selfie"
+    _selfie = os.path.join(batch_dir, "ref.jpg")
+    if os.path.isfile(_selfie):
+        ref_images, ref_kind = [_selfie], "selfie"
+        log("检测到本次自拍参照照 ref.jpg ⇒ 启用主角锚定（自拍）")
     else:
-        log(f"检测到主角参照照 {ref_image} ⇒ 本次启用主角锚定")
+        for _nm in ("ref_face.jpg", "ref_body.jpg", "ref_dev.jpg"):
+            _p = os.path.join(batch_dir, _nm)
+            if os.path.isfile(_p):
+                ref_images.append(_p)
+        if ref_images:
+            ref_kind = "portrait"
+            log(f"检测到形象备案参照 {len(ref_images)} 张 ⇒ 启用主角锚定（备案）")
     log(f"找到 {len(imgs)} 张图, 录音={'有' if os.path.exists(wav) else '无'}")
 
     # 34号 audio 模式：无图片（只有 rec.wav），跳过视觉分析，仅基于录音
@@ -923,7 +949,7 @@ def main():
     if merged_prompt:
         # ★★ 合并模式（2026-09-14 起）：deepseek-flash 一次调用出「画面时序 + 录音转写 + SOP 比对」
         try:
-            r = call_merged(chat_key, imgs, audio_text, sop_doc, interval_sec, ref_image=ref_image)
+            r = call_merged(chat_key, imgs, audio_text, sop_doc, interval_sec, ref_images=ref_images, ref_kind=ref_kind)
             vision = r["image_analysis"]
             summary = r["summary"]
             sop_compare = r["sop_compare"]
@@ -949,7 +975,7 @@ def main():
             vision_prompt_text = "（本次未采集画面）"      # 综合/SOP prompt 里 {vision} 占位
         else:
             try:
-                vision = call_vision(vision_key, imgs, interval_sec, ref_image=ref_image)
+                vision = call_vision(vision_key, imgs, interval_sec, ref_images=ref_images, ref_kind=ref_kind)
             except Exception as e:
                 log(f"视觉分析失败: {e}")
                 vision = f"视觉分析失败: {e}"

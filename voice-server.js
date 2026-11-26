@@ -199,6 +199,57 @@ function camRefSweep() {
 try { setInterval(camRefSweep, 5 * 60 * 1000).unref(); } catch (e) {}
 
 // ══════════════════════════════════════════════════════════════════════
+// ★★ CR-20261126-03：实操考核「形象备案」（一次建档，90 天有效）
+//   目录：cam-uploads/_portraits/<student_id>/{face_center,face_left,face_right,
+//         body_front,body_back,body_side,device_front,device_side}.jpg + meta.json
+//   用法：录制开始时 S2 传 ref_student_id ⇒ 批次上传时把该学员备案照复制成
+//         ref_face.jpg / ref_body.jpg / ref_dev.jpg ⇒ cam_analyze 用作"主角参照"（认人）
+//   ★ 本次仍拍了自拍（ref.jpg）时**自拍优先**（同一个人、且是本次衣着）
+// ══════════════════════════════════════════════════════════════════════
+const PORTRAIT_DIR = path.join(CAM_DIR, '_portraits');
+const PORTRAIT_SLOTS = ['face_center', 'face_left', 'face_right', 'body_front', 'body_back', 'body_side', 'device_front', 'device_side'];
+const camPortraitForDevice = {};   // device -> { student_id, ts }（本次录像用哪个学员的备案照）
+
+function portraitDirOf(sid) {
+  const s = String(sid || '').replace(/[^0-9]/g, '').slice(0, 12);
+  return s ? path.join(PORTRAIT_DIR, s) : '';
+}
+function portraitMetaOf(sid) {
+  try {
+    const d = portraitDirOf(sid);
+    return d ? JSON.parse(fs.readFileSync(path.join(d, 'meta.json'), 'utf8')) : null;
+  } catch (e) { return null; }
+}
+/** 把某学员的备案照复制进批次：最多 3 张（face_center → body_front → device_front/side） */
+function copyPortraitRefs(dev, batchDir) {
+  try {
+    const key = String(dev || '').trim().toUpperCase();
+    const job = camPortraitForDevice[key];
+    if (!job) return false;
+    delete camPortraitForDevice[key];
+    const meta = portraitMetaOf(job.student_id);
+    if (!meta) { log(`cam 备案照缺失: student_id=${job.student_id}`); return false; }
+    const dir = portraitDirOf(job.student_id);
+    const picks = [
+      ['face_center.jpg', 'ref_face.jpg'],
+      ['body_front.jpg', 'ref_body.jpg'],
+      ['device_front.jpg', 'ref_dev.jpg'],
+    ];
+    let n = 0;
+    for (const [src, dst] of picks) {
+      const sp = path.join(dir, src);
+      if (fs.existsSync(sp)) {
+        fs.copyFileSync(sp, path.join(batchDir, dst));
+        n++;
+        if (dst === 'ref_dev.jpg') break;
+      }
+    }
+    log(`cam 备案照已关联: batch=${path.basename(batchDir)} student_id=${job.student_id} 共 ${n} 张`);
+    return n > 0;
+  } catch (e) { log(`cam 备案照关联失败: ${e.message}`); return false; }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ★★ CR-20261126-02：cam-upload **分片上传**（10 分钟批次 ≈ 20MB，单请求传不完）
 //
 //   背景：设备 ~45 KB/s，10 分钟录像（主要是未压缩 rec.wav ≈19MB）要传 7~9 分钟
@@ -334,6 +385,10 @@ function finalizeParts(batchDir, batch, device_id, sop_id, interval_ms, effDev) 
     }
     if (ref) { try { fs.unlinkSync(ref.file); } catch (e) {} delete camRefByDevice[key]; }
   } catch (e) { log(`cam 主角参照照关联失败(分片): ${e.message}`); }
+  // ★ CR-20261126-03：分片批次同样支持"用备案照"（没有自拍 ref.jpg 时）
+  try {
+    if (!fs.existsSync(path.join(batchDir, 'ref.jpg'))) copyPortraitRefs(effDev || device_id, batchDir);
+  } catch (e) { log(`cam 备案照关联异常(分片): ${e.message}`); }
   // 清掉分片完成标记（_finalized 保留作幂等标记）
   try {
     fs.readdirSync(batchDir).filter(function (f) { return /^_part_\d+\.done$/.test(f); })
@@ -4493,6 +4548,95 @@ function validateSetConfig(o) {
   return { ok: true, out };
 }
 
+  // POST /api/cam/portrait — 保存「形象备案」（CR-20261126-03，内部调用：Bearer ingest token）
+  //   body: { student_id, name, store, slots:{slot:b64}, device_batches:[batch,...] }
+  //   ★ 手机 6 张走 slots；设备机位 2 张不传图片，只传 shot 批次名 ⇒ 从 cam-uploads/<batch>/ 复制
+  if (req.method === 'POST' && req.url === '/api/cam/portrait') {
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 20 * 1024 * 1024) { try { req.destroy(); } catch (e) {} } });
+    req.on('end', () => {
+      try {
+        const auth = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+        if (!CAM_INGEST_TOKEN || auth !== CAM_INGEST_TOKEN) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Unauthorized' })); return;
+        }
+        const o = JSON.parse(body || '{}');
+        const sid = String(o.student_id || '').replace(/[^0-9]/g, '');
+        if (!sid) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: '缺少 student_id' })); return; }
+        const dir = portraitDirOf(sid);
+        fs.mkdirSync(dir, { recursive: true });
+        const slots = o.slots && typeof o.slots === 'object' ? o.slots : {};
+        const saved = [];
+        for (const slot of PORTRAIT_SLOTS) {
+          const raw = slots[slot];
+          if (!raw) continue;
+          const b64 = String(raw).replace(/^data:[^,]*,/, '');
+          let buf = Buffer.alloc(0);
+          try { buf = Buffer.from(b64, 'base64'); } catch (e) { buf = Buffer.alloc(0); }
+          if (buf.length < 100 || buf.length > 2 * 1024 * 1024) { log(`cam 备案照跳过 ${slot}: 大小异常 ${buf.length}`); continue; }
+          if (!(buf[0] === 0xFF && buf[1] === 0xD8)) { log(`cam 备案照跳过 ${slot}: 非 JPEG`); continue; }
+          fs.writeFileSync(path.join(dir, slot + '.jpg'), buf);
+          saved.push(slot);
+        }
+        // 设备机位：从 shot 批次复制（正面/侧面各一张）
+        const devBatches = Array.isArray(o.device_batches) ? o.device_batches.slice(0, 2) : [];
+        const devSlots = ['device_front', 'device_side'];
+        for (let i = 0; i < devBatches.length; i++) {
+          const b = String(devBatches[i] || '').trim();
+          const bd = path.join(CAM_DIR, path.basename(b));
+          if (!b || !fs.existsSync(bd)) { log(`cam 备案照设备批次不存在: ${b}`); continue; }
+          const jpgs = fs.readdirSync(bd).filter(f => /\.jpe?g$/i.test(f)).sort();
+          if (!jpgs.length) continue;
+          fs.copyFileSync(path.join(bd, jpgs[0]), path.join(dir, devSlots[i] + '.jpg'));
+          saved.push(devSlots[i]);
+        }
+        const meta = {
+          student_id: Number(sid), name: String(o.name || ''), store: String(o.store || ''),
+          created_at: new Date().toISOString(), slots: saved,
+        };
+        fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta));
+        log(`cam 形象备案已保存: student_id=${sid} slots=${saved.join(',')}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, student_id: Number(sid), slots: saved, created_at: meta.created_at }));
+      } catch (e) {
+        log(`cam 形象备案保存失败: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+  // GET /api/cam/portrait/<sid> — 查备案元信息（内部）
+  if (req.method === 'GET' && req.url.startsWith('/api/cam/portrait/')) {
+    const sid = req.url.slice('/api/cam/portrait/'.length).split('?')[0].replace(/[^0-9]/g, '');
+    const meta = portraitMetaOf(sid);
+    if (!meta) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: '无备案' })); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, meta: meta }));
+    return;
+  }
+  // DELETE /api/cam/portrait/<sid> — 删除备案（隐私：本人/管理端）
+  if (req.method === 'DELETE' && req.url.startsWith('/api/cam/portrait/')) {
+    const auth = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+    if (!CAM_INGEST_TOKEN || auth !== CAM_INGEST_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Unauthorized' })); return;
+    }
+    const sid = req.url.slice('/api/cam/portrait/'.length).split('?')[0].replace(/[^0-9]/g, '');
+    try {
+      const dir = portraitDirOf(sid);
+      if (dir && fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+      log(`cam 形象备案已删除: student_id=${sid}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+    return;
+  }
+
   // POST /api/cam/ref — 学员端（经 S2 代理）上传「主角参照照」（CR-20261126-01）
   //   ★ 只给内部调用：必须带**共享 ingest token**（S1/S2 同一把 /root/.cam-ingest-token）
   //   ★ 落盘 cam-uploads/_refs/，按 device 记 pending；开录时带 ref_id 才绑定到本次录像
@@ -4630,6 +4774,15 @@ function validateSetConfig(o) {
             log(`cam 主角参照照已绑定本次录像 -> ${key} ref_id=${rid}`);
           } else {
             log(`cam 主角参照照绑定跳过 -> ${key} ref_id=${rid}（pending 不存在/已过期/不匹配）`);
+          }
+        }
+
+        // ★ CR-20261126-03：本次录像用哪个学员的「形象备案」当主角参照（手动换人时≠登录人）
+        if (action === 'start' && o.ref_student_id) {
+          const sid = String(o.ref_student_id).replace(/[^0-9]/g, '');
+          if (sid) {
+            camPortraitForDevice[String(dev).trim().toUpperCase()] = { student_id: Number(sid), ts: Date.now() };
+            log(`cam 本次录像主角备案 -> ${dev} student_id=${sid}`);
           }
         }
 
@@ -4985,6 +5138,11 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         } catch (e) {
           log(`cam 主角参照照关联失败（不影响主流程）: ${e.message}`);
         }
+
+        // ★ CR-20261126-03：没拍自拍（ref.jpg 不存在）⇒ 用该学员的「形象备案」当参照
+        try {
+          if (!fs.existsSync(path.join(batchDir, 'ref.jpg'))) copyPortraitRefs(effDev || device_id, batchDir);
+        } catch (e) { log(`cam 备案照关联异常: ${e.message}`); }
 
         // 落盘后异步触发云端分析（图片视觉时序 + 录音 ASR + 综合分析 → 推送 S2 ingest）
         // 把 device_id 传给分析脚本，供它查 S2 current-binding 拿快照 + 推 ingest。
