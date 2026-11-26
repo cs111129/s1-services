@@ -123,8 +123,15 @@ function tuneKeepAlive(srv) {
   try {
     srv.keepAliveTimeout = 65000;      // ★ 从默认 5s → 65s ✓
     srv.headersTimeout = 66000;        // ★ 必须比 keepAliveTimeout 大 ✓
-    srv.requestTimeout = 120000;       // ★ 对练回合最长也就 ~10s ✓ 给足 ✓
-    log('HTTP keep-alive: keepAliveTimeout=65s headersTimeout=66s requestTimeout=120s ✓（★ 默认 5s 会让设备复用连接时撞死连接 ✗）');
+    // ★★ CR-20261126-01（2026-11-26 二次）：requestTimeout 120s → **900s**
+    //   事故：10 分钟 / 115 文件批次（≈20+ MB）在 45 KB/s 下要传 7~9 分钟
+    //     ⇒ Node 的 requestTimeout（"收完整个请求"的总时限）第 120s 直接把请求打成 **408** ✗
+    //     （nginx 日志：16:26:55 / 16:29:55 两条 POST /api/cam-upload 408，rt≈179s/158s）
+    //   ★ 为什么敢全局放宽：这条只对"收请求体"计时，nginx 侧已有
+    //     `client_body_timeout 300s` + `proxy_read_timeout 2400s` 兜底；正常 API 仍是秒级
+    //   ★ 若以后设备端拆分/压缩音频、单批变小，可再调回（env 可覆盖）
+    srv.requestTimeout = parseInt(process.env.REQUEST_TIMEOUT_MS || '900000', 10);
+    log(`HTTP keep-alive: keepAliveTimeout=65s headersTimeout=66s requestTimeout=${Math.round(srv.requestTimeout / 1000)}s ✓（★ 默认 5s 会让设备复用连接时撞死连接 ✗；上传大 batch 需要 >120s）`);
   } catch (e) { log('keep-alive 调优失败: ' + e.message); }
 }
 process.on('uncaughtException', (e) => {
@@ -2790,7 +2797,7 @@ const RESPONSE_WATCHDOG_MS = parseInt(process.env.RESPONSE_WATCHDOG_MS || '60000
 //   ★ 判据：**收 body 期间没有响应字节是正常的**（设备 40~45 KB/s，3MB 就要 ~70s）
 //   ★ 取值：上传 600s（设备侧上传超时 180s，600s 只是服务端兜底）；环境变量可覆盖
 const RESPONSE_WATCHDOG_BY_PATH = {
-  '/api/cam-upload': parseInt(process.env.RESPONSE_WATCHDOG_CAM_UPLOAD_MS || '600000', 10),
+  '/api/cam-upload': parseInt(process.env.RESPONSE_WATCHDOG_CAM_UPLOAD_MS || '900000', 10),
 };
 
 /* ══════════════════════════════════════════════════════════════════════════
