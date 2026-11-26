@@ -289,7 +289,12 @@ function finalizeParts(batchDir, batch, device_id, sop_id, interval_ms, effDev) 
   let photoSeq = 0;
   for (const d of partDirs) {
     const dir = path.join(batchDir, d);
-    const files = fs.readdirSync(dir).filter(function (f) { return !f.startsWith('_'); }).sort();
+    // ★ 只排除元信息文件；**不能按 "_" 前缀一刀切** ✗
+    //   设备端音频切片文件名是 `_pw.wav`（temp 名）⇒ 一刀切会把录音全丢掉
+    //   （2026-11-26 真事故：批次 100 合并后 56 帧在、rec.wav 没了 ⇒ ASR「录音=无」）
+    const files = fs.readdirSync(dir).filter(function (f) {
+      return f !== '_upload_log.txt' && !/^_part_/.test(f);
+    }).sort();
     for (const f of files) {
       const src = path.join(dir, f);
       try {
