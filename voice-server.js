@@ -154,6 +154,43 @@ const camBindInfo = {};
 // ★ 2026-10-29：上传批次名幂等记忆（设备重试同一批 ⇒ 沿用同一批次名，见 cam-upload 里那段）
 const _uploadBatchMemo = new Map();
 
+// ══════════════════════════════════════════════════════════════════════
+// ★★ CR-20261126-01：实操考核「主角确认」——手机自拍的「主角参照照」
+//   为什么放 S1：分析脚本读的是 **S1 本地批次目录**（cam-uploads/<batch>/）
+//     ⇒ 参照照必须能被复制进批次目录，才能作为"消息里的第 1 张图"喂给视觉模型
+//   生命周期：手机上传（S2 代理）→ 拿 ref_id → 开录请求带 ref_id → 录像批次上传时复制成
+//            <batch>/ref.jpg（cam_analyze 自动识别）→ 删临时文件、清登记
+//   ★ 跳过/未拍/老客户端 ⇒ 全程无 ref ⇒ 分析和今天完全一样（零行为变化）
+// ══════════════════════════════════════════════════════════════════════
+const CAM_REF_DIR = path.join(CAM_DIR, '_refs');        // 临时参照照（不进批次、file-list 不可见）
+const CAM_REF_TTL_MS = 30 * 60 * 1000;                  // 未绑定的参照照 30 分钟过期
+const CAM_REF_MAX_BYTES = 2 * 1024 * 1024;              // 单张 ≤2MB（手机压缩后一般 <300KB）
+const camRefPending = {};       // device -> { ref_id, file, ts }  刚上传、等开录
+const camRefByDevice = {};      // device -> { ref_id, file, ts }  已绑定到"下一次上传的录像批次"
+
+function camRefSweep() {
+  const now = Date.now();
+  for (const m of [camRefPending, camRefByDevice]) {
+    for (const dev of Object.keys(m)) {
+      const it = m[dev];
+      if (!it || now - (it.ts || 0) > CAM_REF_TTL_MS) {
+        try { if (it && it.file && fs.existsSync(it.file)) fs.unlinkSync(it.file); } catch (e) {}
+        delete m[dev];
+      }
+    }
+  }
+  // 目录里的孤儿文件（进程重启后内存丢了）也按 mtime 清
+  try {
+    if (fs.existsSync(CAM_REF_DIR)) {
+      for (const f of fs.readdirSync(CAM_REF_DIR)) {
+        const p = path.join(CAM_REF_DIR, f);
+        try { if (now - fs.statSync(p).mtimeMs > CAM_REF_TTL_MS) fs.unlinkSync(p); } catch (e) {}
+      }
+    }
+  } catch (e) {}
+}
+try { setInterval(camRefSweep, 5 * 60 * 1000).unref(); } catch (e) {}
+
 // 给 /api/cam/cmd 的响应挂上 student 字段（规格书 §4.2 参考实现）
 // 返回【新的】对象，不改动传进来的那个 —— 否则 cmd/send 里那份 pending 会被污染
 function withStudent(dev, resp) {
@@ -4237,6 +4274,70 @@ function validateSetConfig(o) {
   return { ok: true, out };
 }
 
+  // POST /api/cam/ref — 学员端（经 S2 代理）上传「主角参照照」（CR-20261126-01）
+  //   ★ 只给内部调用：必须带**共享 ingest token**（S1/S2 同一把 /root/.cam-ingest-token）
+  //   ★ 落盘 cam-uploads/_refs/，按 device 记 pending；开录时带 ref_id 才绑定到本次录像
+  //   ★ 不改变任何既有接口行为；失败只影响"这次没主角照"，不影响录像/分析主流程
+  if (req.method === 'POST' && req.url === '/api/cam/ref') {
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 4 * 1024 * 1024) { try { req.destroy(); } catch (e) {} } });
+    req.on('end', () => {
+      try {
+        const auth = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+        if (!CAM_INGEST_TOKEN || auth !== CAM_INGEST_TOKEN) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+          return;
+        }
+        const o = JSON.parse(body || '{}');
+        const dev = String(o.device_id || '').trim().toUpperCase();
+        const b64 = String(o.image_b64 || '').replace(/^data:[^,]*,/, '');
+        if (!dev || !/^[A-Z0-9_-]{3,40}$/.test(dev)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '缺少或非法 device_id' }));
+          return;
+        }
+        if (!b64) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '缺少 image_b64' }));
+          return;
+        }
+        let buf = Buffer.alloc(0);
+        try { buf = Buffer.from(b64, 'base64'); } catch (e) { buf = Buffer.alloc(0); }
+        if (!buf || buf.length < 100) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '图片内容为空或不是合法 base64' }));
+          return;
+        }
+        if (buf.length > CAM_REF_MAX_BYTES) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '图片太大（上限 2MB）' }));
+          return;
+        }
+        // ★ 只认 JPEG（手机端统一 canvas → image/jpeg）；magic 不符直接拒（防止把任意文件塞进来）
+        if (!(buf[0] === 0xFF && buf[1] === 0xD8)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '不是 JPEG 图片' }));
+          return;
+        }
+        fs.mkdirSync(CAM_REF_DIR, { recursive: true });
+        camRefSweep();
+        const refId = 'r_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        const file = path.join(CAM_REF_DIR, dev + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6) + '.jpg');
+        fs.writeFileSync(file, buf);
+        camRefPending[dev] = { ref_id: refId, file: file, ts: Date.now() };
+        log(`cam 主角参照照已收: ${dev} ref_id=${refId} ${buf.length}B`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ref_id: refId, bytes: buf.length }));
+      } catch (e) {
+        log(`cam 主角参照照接收失败: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
 // POST /api/cam/cmd/send - S2 前端下发指令给设备（经 S2 后代转发到 S1）
   if (req.method === 'POST' && req.url === '/api/cam/cmd/send') {
     let body = '';
@@ -4297,6 +4398,21 @@ function validateSetConfig(o) {
         // ⚠️ 如实记一条隐患（不改行为，留日志）：走到这里的**未知 action** 会被当成录制 ✗
         //   （现有调用方只有 start/stop/take_photo/set_config/ota_install ✓ 所以现在打不到 ✓）
         if (action !== 'start' && action !== 'stop') log(`⚠️ cam cmd/send 收到未知 action="${action}" ⇒ 按录制处理（沿用旧行为 ✗ 见代码注释）`);
+
+        // ★ CR-20261126-01：开录时把「主角参照照」绑定到本次录像（只有 ref_id 对得上才绑）
+        //   ★ 不绑也不报错 —— 用户跳过了主角确认就完全按老流程走
+        if (action === 'start' && o.ref_id) {
+          const rid = String(o.ref_id).trim();
+          const key = String(dev).trim().toUpperCase();
+          const p = camRefPending[key];
+          if (p && p.ref_id === rid) {
+            camRefByDevice[key] = p;
+            delete camRefPending[key];
+            log(`cam 主角参照照已绑定本次录像 -> ${key} ref_id=${rid}`);
+          } else {
+            log(`cam 主角参照照绑定跳过 -> ${key} ref_id=${rid}（pending 不存在/已过期/不匹配）`);
+          }
+        }
 
         const cmd = action === 'start' ? 'start_record' : 'stop_record';
         // ★★ 2026-10-12 用户改设计后，这两行**删掉了** ✗ ——
@@ -4618,6 +4734,24 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
         log(`cam-upload 成功: batch=${batch}, device_id=${device_id || '(无)'}, 收到 ${fileCount} 个文件`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, batch, device_id, files: fileCount }));
+
+        // ★ CR-20261126-01：若本次录像开始时做过「主角确认」，把参照照复制进批次目录
+        //   cam_analyze.py 自动识别 <batch>/ref.jpg ⇒ 把它作为第 1 张图 + 提示词前置"主角锚定"
+        //   ★ 失败不影响主流程（只打日志）；复制完即删临时文件，避免 _refs 堆积
+        try {
+          const _refKey = String(effDev || device_id || '').trim().toUpperCase();
+          const _ref = camRefByDevice[_refKey];
+          if (_ref && fs.existsSync(_ref.file)) {
+            fs.copyFileSync(_ref.file, path.join(batchDir, 'ref.jpg'));
+            log(`cam 主角参照照已关联: batch=${batch}（ref=${path.basename(_ref.file)}）`);
+          }
+          if (_ref) {
+            try { fs.unlinkSync(_ref.file); } catch (e) {}
+            delete camRefByDevice[_refKey];
+          }
+        } catch (e) {
+          log(`cam 主角参照照关联失败（不影响主流程）: ${e.message}`);
+        }
 
         // 落盘后异步触发云端分析（图片视觉时序 + 录音 ASR + 综合分析 → 推送 S2 ingest）
         // 把 device_id 传给分析脚本，供它查 S2 current-binding 拿快照 + 推 ingest。
