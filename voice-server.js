@@ -5590,6 +5590,20 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
   //   ★ "未知 ≠ 零"：把"服务挂了"和"没这条知识"说成同一句话，会让人查错方向
   // ★ ASR 会把店名听成同音字（萧山艺龙会/印龙汇…）⇒ 检索前把"疑似店名"剥掉：
   //   知识库本来就按门店过滤了，店名对检索是噪声；剥掉后「地址/电话/怎么走」这类词才能命中。
+  // ★★ 2026-11-27（用户第二次反馈）：**别让模型看到错店名** ✗
+  //   上次只清洗了"检索 query"，但真正喂给 LLM 的 user 文本仍是 ASR 原文
+  //   ⇒ 模型看到「萧山艺龙会」就忍不住纠正 ⇒ 用户听到"你说错了"。
+  //   ⇒ 这里把同音/错字店名**替换成本店名**再交给模型；日志/屏幕仍显示原文 ✓
+  function kbNormalizeQuestion(text, store) {
+    let t = String(text || '');
+    if (!store) return t;
+    try {
+      t = t.replace(/萧山[\u4e00-\u9fa5A-Za-z0-9]{1,8}(?:会|汇)/g, store);
+      t = t.replace(/(?:胤隆|艺龙|印龙|银龙|应龙|亿龙|倚龙)(?:会|汇)/g, store);
+    } catch (e) {}
+    return t;
+  }
+
   function kbCleanStoreNoise(q, store) {
     let t = String(q || '');
     try {
@@ -5697,7 +5711,9 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
     const msgs = [{ role: 'system', content: voiceChatSystemOf(device).replace('__LEN__', style.len) + whoBlock(_who) + '\n\n' + kbBlock + toolRule }];
     if (history) for (const h of history) msgs.push(h);
     // ★★ 工具数据**也塞进 user 消息** ✗ —— 双保险（★ 模型对"当前这一轮"的注意力最高 ✓）
-    msgs.push({ role: 'user', content: toolBlock ? (String(text) + '\n\n' + toolBlock) : String(text) });
+    // ★ 交给模型的文本先做店名归一（错字/同音 → 本店名），避免它去纠正用户
+    const _safeText = kbNormalizeQuestion(String(text), storeOfDevice(device));
+    msgs.push({ role: 'user', content: toolBlock ? (_safeText + '\n\n' + toolBlock) : _safeText });
 
     const ac = new AbortController();
     const tid = setTimeout(() => ac.abort(), LLM_TIMEOUT_MS);
@@ -5729,8 +5745,23 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
       const body = raw.replace(/^\s*语气\s*[:：]\s*[A-Za-z]+\s*$/gmi, '').trim();
       const m = /^答\s*[:：]\s*([\s\S]+)$/.exec(body);
       const okAnswer = !!(m && m[1].trim());
-      return { reply: okAnswer ? cleanReply(m[1]) : '', refused: !okAnswer,
-               mood: okAnswer ? mood : null, raw: raw.slice(0, 60), usage: j.usage || null };
+      let _reply = okAnswer ? cleanReply(m[1]) : '';
+      // ★★ 2026-11-27：**硬事实护栏** —— 电话/长数字必须在知识库片段里逐字出现
+      //   实测模型会编 `0571-83388555`（KB 里没有）⇒ 宁可说查不到，也不让它念错号 ✗
+      if (_reply) {
+        const _src = kbResults.map(r => (r.snippet || '')).join(' ').replace(/[\s\-]/g, '');
+        const _nums = _reply.match(/0\d{2,3}[\-\s]?\d{7,8}|\d{11}/g) || [];
+        const _bad = _nums.filter(n => {
+          const k = String(n).replace(/[\s\-]/g, '');
+          return k.length >= 7 && _src.indexOf(k) < 0;
+        });
+        if (_bad.length) {
+          log(`⚠️ 回复含 KB 里没有的号码 ${_bad.join(',')} ⇒ 改成"查不到"（防编造）`);
+          _reply = '这个具体信息我这儿没查到，您可以问一下门店前台。';
+        }
+      }
+      return { reply: _reply, refused: !okAnswer,
+               mood: _reply ? mood : null, raw: raw.slice(0, 60), usage: j.usage || null };
     } finally { clearTimeout(tid); }
   }
 
