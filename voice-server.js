@@ -5420,6 +5420,71 @@ if (req.method === 'POST' && req.url.split('?')[0] === '/api/tts') {
     return;
   }
 
+  // POST /api/cam/sop-reanalyze — 学员端「换个 SOP 重新分析」：**重新看照片**做 L1/L2/L3 研判
+  //   body: { batch, sop_id, audio_text, device_id? }
+  //   ★ 不重新 ASR（转写由 S2 传过来）、不写库；只跑「照片 × SOP」并返回 JSON
+  if (req.method === 'POST' && req.url === '/api/cam/sop-reanalyze') {
+    const _auth = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+    if (!CAM_INGEST_TOKEN || _auth !== CAM_INGEST_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    let _body = '';
+    req.on('data', c => { _body += c; if (_body.length > 2 * 1024 * 1024) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const o = JSON.parse(_body || '{}');
+        const batch = path.basename(String(o.batch || '').trim());
+        const sopId = String(o.sop_id || '').trim();
+        const deviceId = String(o.device_id || '').trim();
+        if (!batch || !sopId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '缺少 batch 或 sop_id' }));
+          return;
+        }
+        const dir = path.join(CAM_DIR, batch);
+        if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '批次目录不存在', batch }));
+          return;
+        }
+        const tmp = '/tmp/sop_audio_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.txt';
+        fs.writeFileSync(tmp, String(o.audio_text || ''), 'utf8');
+        const analyzer = path.join(__dirname, 'cam_analyze.py');
+        log(`SOP 重新研判: batch=${batch} sop=${sopId} device=${deviceId || '-'}`);
+        execFile('python3', [analyzer, dir, deviceId, sopId, '5000'], {
+          env: Object.assign({}, process.env, { CAM_SOP_ONLY: '1', CAM_AUDIO_TEXT_FILE: tmp }),
+          timeout: 300000,
+          maxBuffer: 32 * 1024 * 1024
+        }, (err, stdout, stderr) => {
+          try { fs.unlinkSync(tmp); } catch (e) {}
+          if (stderr) log('SOP 重新研判 stderr: ' + String(stderr).slice(-800));
+          if (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: '研判脚本失败: ' + err.message }));
+            return;
+          }
+          const lines = String(stdout || '').trim().split(/\n/).filter(Boolean);
+          let out = {};
+          try { out = JSON.parse(lines[lines.length - 1] || '{}'); } catch (e) { out = {}; }
+          if (!out.ok || !out.sop_compare) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: out.error || '研判结果为空' }));
+            return;
+          }
+          log(`SOP 重新研判完成: batch=${batch} ${String(out.sop_compare).length} 字`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, sop_compare: out.sop_compare }));
+        });
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
   // GET /api/cam/file-list/<batch> - 列出某批次目录里的文件名（CR-20260921-02）
   //   ★ 用途：前端**不写死文件名**（设备端实测是 snap_001.jpg 三位，但别 trust 位数 ✗）
   //     取图流程：列目录 → 取第一个 .jpg → 再走 /api/cam/file/<batch>/<filename> ✓

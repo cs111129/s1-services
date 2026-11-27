@@ -1052,6 +1052,42 @@ def main():
         interval_sec = int(v) if v == int(v) else v
     log(f"开始分析 batch={batch} 目录 {batch_dir}, device_id={device_id or '(无)'}, interval={interval_sec}s")
 
+    # ★★ 只重跑「照片 × SOP」研判（学员端"换个 SOP 重新分析"用）：
+    #   不重新 ASR、不写库、不推 S2，只把结果打到 stdout（由 voice-server 转给 S2）
+    if os.environ.get("CAM_SOP_ONLY") == "1":
+        _imgs = sorted(str(p) for p in Path(batch_dir).glob("snap_*.jpg"))
+        _audio = ""
+        _tf = os.environ.get("CAM_AUDIO_TEXT_FILE", "")
+        if _tf and os.path.isfile(_tf):
+            _audio = open(_tf, encoding="utf-8").read()
+        _doc = fetch_sop(sop_id, device_id) if sop_id else None
+        if not _doc:
+            print(json.dumps({"ok": False, "error": "sop_not_found"}, ensure_ascii=False))
+            return
+        _key = load_deepseek_key()
+        if not _key:
+            print(json.dumps({"ok": False, "error": "no_deepseek_key"}, ensure_ascii=False))
+            return
+        _refs, _kind = [], "selfie"
+        _selfie = os.path.join(batch_dir, "ref.jpg")
+        if os.path.isfile(_selfie):
+            _refs, _kind = [_selfie], "selfie"
+        else:
+            for _nm in ("ref_face.jpg", "ref_body.jpg", "ref_dev.jpg"):
+                _p = os.path.join(batch_dir, _nm)
+                if os.path.isfile(_p):
+                    _refs.append(_p)
+            if _refs:
+                _kind = "portrait"
+        try:
+            _out = call_sop_judge(_key, _imgs, _audio, _doc, interval_sec,
+                                  ref_images=_refs, ref_kind=_kind, max_tokens=100000)
+            print(json.dumps({"ok": True, "sop_compare": _out}, ensure_ascii=False))
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        return
+
+
     # 37号文档：上传日志入库（读 _upload_log.txt，无论分析成败都先记录）
     save_upload_log(batch_dir, batch, device_id)
 
