@@ -2042,7 +2042,9 @@ function personaHeaderOf(dev) {
       head.splice(1, 0, '',
         `【你服务的门店】「${store}」—— 你是 **${store} 的随身教练**，不是泛泛的"门店教练"。`,
         `★ 自我介绍时必须**明确报出店名**，例如：「我是${store}的随身教练小星，本店的 SOP、制度、应知应会都能帮你查。」（每次说法可以不同，但店名必须说 ✓）`,
-        `★ 你查的知识库就是 **${store} 专属知识库**（含集团通用标准）；问到别家店的事，如实说「我只管${store}的」。`);
+        `★ 你查的知识库就是 **${store} 专属知识库**（含集团通用标准）。`,
+        `★★ 语音转写会把店名听错（如「艺龙会 / 印龙汇 / 银龙会 / 应龙汇」）—— **默认用户说的就是本店 ${store}，不要纠正、不要纠缠店名**，直接按本店回答 ✓`,
+        `★ 只有用户明确说到**别的城市/别的门店**（如「上海游沐日记」「杭州胤隆会」）时，才说「我只管${store}的」。`);
     } else {
       head.splice(1, 0, '', '【你服务的门店】这台设备还没绑定学员/门店 ⇒ 不要编店名；被问就说不清楚，提醒先绑定。');
     }
@@ -5585,13 +5587,30 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
   //   ok=true reliable=false ⇒ 检索到了但【都不靠谱】（弱命中）⇒ 直接说查不到，不叫模型
   //   ok=true reliable=true  ⇒ 有稀有词支撑 ⇒ 才敢让模型组织语言
   //   ★ "未知 ≠ 零"：把"服务挂了"和"没这条知识"说成同一句话，会让人查错方向
+  // ★ ASR 会把店名听成同音字（萧山艺龙会/印龙汇…）⇒ 检索前把"疑似店名"剥掉：
+  //   知识库本来就按门店过滤了，店名对检索是噪声；剥掉后「地址/电话/怎么走」这类词才能命中。
+  function kbCleanStoreNoise(q, store) {
+    let t = String(q || '');
+    try {
+      if (store) t = t.split(store).join(' ');
+      t = t.replace(/萧山[\u4e00-\u9fa5A-Za-z0-9]{1,8}(?:会|汇)/g, ' ');
+      t = t.replace(/(?:胤隆|艺龙|印龙|银龙|应龙|亿龙|倚龙)(?:会|汇)/g, ' ');
+      t = t.replace(/[，。！？、,.!?：:；;]/g, ' ');
+      t = t.replace(/\s+/g, ' ').trim();
+    } catch (e) {}
+    return t || String(q || '').trim();
+  }
+
   async function kbSearchForVoice(query, device) {
     try {
       // ★ 2026-11-27：按设备绑定的门店选知识库（camBindInfo 由 S2 推送，含 store）
       var _kbStore = '';
       try { var _b = camBindInfo[String(device || '').trim().toUpperCase()]; if (_b && _b.store) _kbStore = _b.store; } catch (e) {}
-      const _kbBody = { query: String(query).slice(0, 200) };
+      const _q0 = String(query).slice(0, 200);
+      const _q1 = _kbStore ? kbCleanStoreNoise(_q0, _kbStore) : _q0;
+      const _kbBody = { query: _q1 };
       if (_kbStore) _kbBody.store = _kbStore;
+      if (_q1 !== _q0) log(`知识库查询清洗: 「${_q0.slice(0, 40)}」→ 「${_q1.slice(0, 40)}」`);
       const ac = new AbortController();
       const tid = setTimeout(() => ac.abort(), KB_TIMEOUT_MS);
       try {
