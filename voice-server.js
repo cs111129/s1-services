@@ -6438,7 +6438,11 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
             if (!piece && nx.length > target) {              // 单句比目标还长 ⇒ 从句标点断
               const cut = cutPiece(nx, target);
               piece = cut[0];
-              if (cut[1]) carry = cut[1]; else si++;
+              if (cut[1]) carry = cut[1];
+              // ★★ 2026-11-27 修（用户报"每次回答两遍"）：这里原来 `else si++`
+              //   有剩余时 **si 没前进** ⇒ 下一轮 `piece=carry` 又把**同一整句**接了一遍
+              //   ⇒ 音频里前半句被念两遍（长句越明显）。切过的句子必须**始终算已消费** ✓
+              si++;
               break;
             }
             if (piece && piece.length + nx.length > target) break;   // 装不下就收口
