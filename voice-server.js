@@ -1939,6 +1939,7 @@ function voiceChatRulesBlock() {
     '【回答怎么来 · 严格按这个顺序】',
     '1. 先看下面的【知识库参考内容】—— 里面【有相关内容】时，优先依据它回答（那是我们店的标准）。',
     '   ★★ 电话号码 / 地址 / 价格 / 营业时间 / 人名这类**硬信息**，必须**逐字来自参考内容**；参考里没有就说「这个具体信息我这儿没查到」，**绝不许编** ✗（编错一个电话比说查不到坏得多）。',
+    '   ★★ 介绍门店/公司这类事实（负责人、成立年份、纳税资质、监管部门…）**同样只能讲参考内容里有的**；参考没有的一律不提 ✗（宁可少说，不许补）。',
     '2. 参考内容里【没有、或只有一点沾边】时 —— 不要生硬地说不知道、不要说去问店长；',
     '   凭你的酒店服务与培训经验，给一个【通用、稳妥、可操作】的建议。',
     '   但要讲清楚这是通用做法（例如：咱们店的具体规定我这边没查到，不过一般这么做…），',
@@ -2028,6 +2029,33 @@ function whoBlock(who) {
     '· 说他的职责/考勤时，也只说**他的**（查询工具已按他本人过滤 ✓）',
   ].join('\n');
 }function personaKeyOf(dev) { return isTrainerDevice(dev) ? '02' : '03'; }
+// ★★ 2026-11-27：S1 重启后 camBindInfo 是空的，而 S2 的周期推送要等最多 5 分钟
+//   ⇒ 这期间 store='' ⇒ 店名归一/门店人设全部失效（用户 13:56 那轮就是这么漏的）
+//   ⇒ 主动向 S2 db-api 查一次（60 秒负缓存，避免每轮都打）
+const _storeFetchAt = {};
+async function ensureStoreOfDevice(device) {
+  const key = String(device || '').trim().toUpperCase();
+  if (!key) return '';
+  const b = camBindInfo[key];
+  if (b && b.store) return b.store;
+  const now = Date.now();
+  if (_storeFetchAt[key] && now - _storeFetchAt[key] < 60000) return '';
+  _storeFetchAt[key] = now;
+  try {
+    const r = await fetch(CAM_S2_DBAPI + '/api/cam-devices/current-binding?device_id=' + encodeURIComponent(key), {
+      headers: { 'Authorization': 'Bearer ' + CAM_INGEST_TOKEN },
+      signal: AbortSignal.timeout(3000),
+    });
+    const d = await r.json();
+    if (d && d.store) {
+      camBindInfo[key] = { id: String(d.student_id || ''), name: String(d.name || ''), store: String(d.store).trim() };
+      log(`cam 绑定门店自愈: ${key} -> ${d.store}（${d.name || '-'}）`);
+      return camBindInfo[key].store;
+    }
+  } catch (e) { log(`cam 绑定门店查询失败(${key}): ${e.message}`); }
+  return '';
+}
+
 function storeOfDevice(dev) {
   try {
     const b = camBindInfo[String(dev || '').trim().toUpperCase()];
@@ -3577,6 +3605,7 @@ const server = http.createServer(async (req, res) => {
       let o = {};
       try { o = JSON.parse(tb || '{}'); } catch (e) { o = {}; }
       const device = String(o.device || o.dev_id || '').trim();
+      await ensureStoreOfDevice(device);
       const text = String(o.text || '').trim();
       const reset = String(o.reset || '') === '1';
       const send = (obj) => { try { res.write('data: ' + JSON.stringify(obj) + '\n\n'); } catch (e) {} };
@@ -4908,6 +4937,8 @@ function validateSetConfig(o) {
   // GET /api/cam/persona-preview?device_id= — 调试：看该设备"小星"的完整 system prompt（需 ingest token）
   //   ★ 用途：人设按门店注入后，验收"Prompt 里到底有没有店名"，不必真机问一遍
   if (req.method === 'GET' && req.url.startsWith('/api/cam/persona-preview')) {
+    await ensureStoreOfDevice((String(req.url).split('?')[1] || '').split('&').map(kv => kv.split('='))
+      .reduce((o, kv) => { if (kv[0]) o[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || ''); return o; }, {}).device_id || '');
     const auth = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
     if (!CAM_INGEST_TOKEN || auth !== CAM_INGEST_TOKEN) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -5712,7 +5743,12 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
       : '';
     const _who = await deviceWho(device);
     const msgs = [{ role: 'system', content: voiceChatSystemOf(device).replace('__LEN__', style.len) + whoBlock(_who) + '\n\n' + kbBlock + toolRule }];
-    if (history) for (const h of history) msgs.push(h);
+    if (history) for (const h of history) {
+      // ★ 历史里的用户原话也归一（否则上一轮说过「艺龙会」，这一轮模型照样跟着纠正）
+      if (h && h.role === 'user') {
+        msgs.push({ role: 'user', content: kbNormalizeQuestion(h.content, storeOfDevice(device)) });
+      } else msgs.push(h);
+    }
     // ★★ 工具数据**也塞进 user 消息** ✗ —— 双保险（★ 模型对"当前这一轮"的注意力最高 ✓）
     // ★ 交给模型的文本先做店名归一（错字/同音 → 本店名），避免它去纠正用户
     const _safeText = kbNormalizeQuestion(String(text), storeOfDevice(device));
@@ -5806,6 +5842,7 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
         // ★ "字段不存在" ≠ "值为空"（规格书 §4.4）：老固件不带 device ⇒ 按【无会话】处理，
         //   不许 400。reset 同理，不带 = "0"（续上下文）。
         const device = devPart ? String(devPart.data.toString('utf8')).trim() : '';
+        await ensureStoreOfDevice(device);   // ★ S1 重启后自愈门店（不等 S2 5 分钟推送）
         const reset = resetPart ? String(resetPart.data.toString('utf8')).trim() : '0';
         const detailPart = parts.find(p => p.name === 'detail');
         const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
@@ -6250,6 +6287,7 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
         //   ★ 只认 body 字段 —— **不走 query** ✗（他们 10-21 被 `?format=` 坑过一次 ✓ CR §3 明说）
         const fmtPart = parts.find(p => p.name === 'audio_fmt' || p.name === 'format');
         const device = devPart ? String(devPart.data.toString('utf8')).trim() : '';
+        await ensureStoreOfDevice(device);   // ★ S1 重启后自愈门店（不等 S2 5 分钟推送）
         const reset = resetPart ? String(resetPart.data.toString('utf8')).trim() : '0';
         const detail = detailOf(detailPart ? detailPart.data.toString('utf8') : '');
         // ★ 2026-11-04：把"这次按哪档、上限多少字"打进日志 ✗
