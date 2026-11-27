@@ -4500,6 +4500,13 @@ const server = http.createServer(async (req, res) => {
         //   ⇒ 这是本次缺失的那个"可观测性"：前端超时时能区分
         //      「有 ack = 设备收到了但没出图」vs「无 ack = 设备压根没收到」
         //   ⚠️ 同一套合并写入（不带该字段的包不冲旧值）
+        // ★ CR-20261127-01 ACK B：设备上报 wifi_try=ok / fail_rolled_back
+        if (o.wifi_try !== undefined && o.wifi_try !== null && String(o.wifi_try).trim() !== '') {
+          camDeviceState[dev] = camDeviceState[dev] || {};
+          camDeviceState[dev].wifi_try = String(o.wifi_try).trim();
+          camDeviceState[dev].wifi_try_at = Date.now();
+          log(`cam WiFi 试连结果 -> ${dev}: ${camDeviceState[dev].wifi_try}`);
+        }
         if (o.shot_ack !== undefined && o.shot_ack !== null && String(o.shot_ack).trim() !== '') {
           camDeviceState[dev].shot_ack = String(o.shot_ack).trim();
           camDeviceState[dev].shot_ack_at = Date.now();
@@ -4842,6 +4849,29 @@ function validateSetConfig(o) {
           return;
         }
 
+        // ★★ CR-20261127-01：远程改 WiFi（设备 1.3.23+，30s 连不上自动回滚）
+        //   ★ 这里只**入队**；白名单/二次确认在 S2 管理端 ✓
+        //   ★ 校验：ssid 1~31 字节、pass <64 字节（空 = 开放网络）
+        if (action === 'set_wifi') {
+          const ssid = String(o.ssid || '').trim();
+          const pass = String(o.pass || '');
+          if (!ssid) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: '缺少 ssid' }));
+            return;
+          }
+          if (Buffer.byteLength(ssid, 'utf8') > 31 || Buffer.byteLength(pass, 'utf8') > 64) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'ssid/pass 超长（ssid≤31B, pass≤64B）' }));
+            return;
+          }
+          camCmdQueue[dev] = { cmd: 'set_wifi', ts: Date.now(), ssid: ssid, pass: pass };
+          log(`cam 改 WiFi 入队 -> ${dev} ssid="${ssid}"（设备会试连 30s，失败自动回滚）`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, cmd: 'set_wifi', ssid: ssid }));
+          return;
+        }
+
         // ★ CR-20260921-02：远程抓拍一张（录制前预览确认用）
         //   设备端收到后：拍 1 张 → 单独上传（batch = <dev>_shot_<时间戳>）
         //   → **上传成功后立即上报一次 status**（带 last_shot_batch）⇒ 前端才知道图好了
@@ -4987,6 +5017,8 @@ function validateSetConfig(o) {
         //      `null`（= 明确解绑过）—— 那是有效信息，不能当成"不知道"✗
         bound_student: (camBindInfo[id] && camBindInfo[id].name) ? camBindInfo[id].name : null,
         bound_store: (camBindInfo[id] && camBindInfo[id].store) ? camBindInfo[id].store : null,
+        wifi_try: (camDeviceState[id] && camDeviceState[id].wifi_try) ? camDeviceState[id].wifi_try : null,
+        wifi_try_at: (camDeviceState[id] && camDeviceState[id].wifi_try_at) ? camDeviceState[id].wifi_try_at : null,
         bind_known: camBindInfo[id] !== undefined
       };
     });
