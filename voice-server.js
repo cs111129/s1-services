@@ -4397,7 +4397,7 @@ const server = http.createServer(async (req, res) => {
           camBindInfo[dev] = null;                              // ★ 明确解绑（不是"没推过"✗）
           log(`cam 学员解绑 -> ${dev}`);
         } else {
-          camBindInfo[dev] = { id: String(o.student_id || ''), name: String(o.student_name).trim() };
+          camBindInfo[dev] = { id: String(o.student_id || ''), name: String(o.student_name).trim(), store: String(o.student_store || '').trim() };
           log(`cam 学员绑定 -> ${dev}: ${camBindInfo[dev].name}`);
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -4915,6 +4915,7 @@ function validateSetConfig(o) {
         //   ⚠️ 判据用 `!== undefined` 而不是真值判断：camBindInfo[dev] 可能是
         //      `null`（= 明确解绑过）—— 那是有效信息，不能当成"不知道"✗
         bound_student: (camBindInfo[id] && camBindInfo[id].name) ? camBindInfo[id].name : null,
+        bound_store: (camBindInfo[id] && camBindInfo[id].store) ? camBindInfo[id].store : null,
         bind_known: camBindInfo[id] !== undefined
       };
     });
@@ -5547,15 +5548,20 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
   //   ok=true reliable=false ⇒ 检索到了但【都不靠谱】（弱命中）⇒ 直接说查不到，不叫模型
   //   ok=true reliable=true  ⇒ 有稀有词支撑 ⇒ 才敢让模型组织语言
   //   ★ "未知 ≠ 零"：把"服务挂了"和"没这条知识"说成同一句话，会让人查错方向
-  async function kbSearchForVoice(query) {
+  async function kbSearchForVoice(query, device) {
     try {
+      // ★ 2026-11-27：按设备绑定的门店选知识库（camBindInfo 由 S2 推送，含 store）
+      var _kbStore = '';
+      try { var _b = camBindInfo[String(device || '').trim().toUpperCase()]; if (_b && _b.store) _kbStore = _b.store; } catch (e) {}
+      const _kbBody = { query: String(query).slice(0, 200) };
+      if (_kbStore) _kbBody.store = _kbStore;
       const ac = new AbortController();
       const tid = setTimeout(() => ac.abort(), KB_TIMEOUT_MS);
       try {
         const r = await fetch(KB_SEARCH_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query: String(query).slice(0, 200) }),
+          body: JSON.stringify(_kbBody),
           signal: ac.signal
         });
         if (!r.ok) { log(`⚠️ 知识库检索返回 HTTP ${r.status}`); return { ok: false, results: [], reliable: false }; }
@@ -5806,7 +5812,7 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
             }
           } catch (e) { log('ROLEPLAY ⚠️ 回合异常（★ 退回小星 ✓）: ' + e.message); }
         }        const intentP = routeIntent(heard);
-        const kb = await kbSearchForVoice(heard);
+        const kb = await kbSearchForVoice(heard, device);
         const intent = await intentP;
         // ★★ 路由判定"用户想开始对练" ⇒ **立刻进对练** ✓（★ 不落到小星的能力里 ✗）
         if (RP_ON && device && intent.roleplay && !isTrainerDevice(device) && !_rpSessions.has(device)) {   // ★ CR-20261022-03：02 已下线对练 ⇒ 不许再开场 ✓
@@ -6212,7 +6218,7 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
           } catch (e) { log('ROLEPLAY ⚠️ 回合异常（★ 退回小星 ✓）: ' + e.message); }
         }        const intentP = vcS ? Promise.resolve({ web: false, learning: null, roleplay: false }) : routeIntent(heard);
         const kb = vcS ? { ok: true, results: [], reliable: true, maxScore: 0 }
-                       : await kbSearchForVoice(heard);
+                       : await kbSearchForVoice(heard, device);
         const intent = await intentP;
         // ★★ 路由判定"用户想开始对练" ⇒ **立刻进对练** ✓（★ 不落到小星的能力里 ✗）
         if (RP_ON && device && intent.roleplay && !isTrainerDevice(device) && !_rpSessions.has(device)) {   // ★ CR-20261022-03：02 已下线对练 ⇒ 不许再开场 ✓
