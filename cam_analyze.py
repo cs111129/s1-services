@@ -876,6 +876,166 @@ def push_upload_log(rec):
         log(f"推 S2 上传日志异常: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════
+# ★★ 2026-11-27 SOP v2（用户拍板）：
+#   · 有 SOP：① 录音分析（纪要/关键信息/表达问题）② 照片 × SOP 逐项研判（带转写辅助话术）
+#              —— 不再单独输出"画面时序分析"
+#   · 无 SOP：**只做录音分析**，不调用视觉模型（照片只留档，供日后补做 SOP）
+#   · 研判分三层：L1 有没有做（语义容错）/ L2 做得怎么样（好坏+证据）/ L3 怎么提升（示范）
+#   · 证据来源按 SOP 类型加权：会议→录音为主；服务→画面动作+录音话术；安全/操作→画面为主
+# ══════════════════════════════════════════════════════════════════════
+
+AUDIO_ANALYSIS_PROMPT = """你是门店现场的会议/沟通记录分析员。下面是现场录音的转写文本。
+⚠️ 转写可能有同音字、断句、错字，请按语义理解，不要因为个别字不对就否定整句。
+
+请只基于转写内容，输出三段 Markdown（不要输出 JSON）：
+
+## 一、纪要
+按时间顺序概括这段录音里发生了什么（谁在讲什么、大致流程）。
+
+## 二、关键信息
+列出录音里出现的关键信息：要求、规定、时间节点、人名/地点、数字、待办事项等。
+（逐条列，能引用原话就引用原话）
+
+## 三、表达问题
+从"表达是否清楚、重点是否突出、有没有跑题/重复/含糊"的角度，指出 2~5 条问题；
+每条要引用原话作为依据。若录音质量差/内容太少，如实说明。
+
+硬规则：
+- 不评价 SOP、不打分；
+- 不编造录音里没有的内容；
+- 若没有有效录音，三段都写"本次无有效录音"。"""
+
+SOP_JUDGE_PROMPT = """你是门店 SOP 的教练型研判员。本次材料：
+- ① 按时间顺序连续拍摄的 {{n}} 张现场画面（相邻约 {{interval_sec}} 秒）
+- ② 现场录音转写（可能有同音字/断句错误，按语义理解，不要死抠字眼）
+- ③ SOP 标准（类型：{{sop_type}}）
+
+请对 SOP 的**每一步**做三层研判，输出一个 JSON 对象：{"sop_compare": "按步骤的 Markdown"}
+
+每一步的格式固定为：
+
+### 第 N 步 · 步骤名
+**L1 有没有做**：做到 / 没做到 / 无法判断
+- 证据：画面第 X 帧 / 录音原话「……」
+**L2 做得怎么样**
+- 优点：……
+- 问题：……（对应维度：完整性 / 规范性 / 时机顺序 / 话术专业度 / 服务意识）
+**L3 怎么提升**
+- 下次这样做/这样说：「……」（结合本步问题给具体示范）
+
+研判规则（必须遵守）：
+1. **L1 只有三种结果**：做到 / 没做到 / 无法判断。"做了但不符合标准"必须判**做到**，把不符合的地方写进 L2，绝不能判成"没做到"或"无法判断"。
+2. **语义容错**：只要意思到了就算做到。问候说"你好/您好/欢迎光临"都算；口号只要**有集合、有喊口号的动作**就算做到，口号文字与 SOP 不完全一致只写在 L2；话术只要求"表达了同样的意思"，不要求逐字一致。
+3. **无法判断的门槛**：只有"画面没拍到 + 录音也没提到"才能判无法判断，并且必须写清"缺什么"（例：该步要求出示登记表，画面未拍到桌面、录音未提登记）。
+4. **证据来源按 SOP 类型加权**：
+   - 会议类：以**录音**为主要证据，画面只作佐证（有没有开会/有没有集合）；
+   - 服务类：**动作看画面、话术看录音**；
+   - 安全/操作类：以**画面**为主。
+5. **L2 必须具体**：至少写 1 条优点 + 1 条问题（该步完全没做则写"未执行，无优点"），问题要能对应到画面或录音的证据。
+6. **L3 每步都要给**：具体到"下次这句话怎么说""下一步怎么做"，给示范话术；不要写"加强培训/提高意识"这类空话。
+7. **不许编造**：没看到就写"未拍到"，没听到就写"录音未提"；不要因为 SOP 里写了某个场景就假设现场发生了。
+8. 步骤名原样照抄，不要合并/漏步；SOP 没有步骤时按条目逐条研判。
+
+SOP 标准如下：
+{{sop_block}}"""
+
+
+def sop_category(sop_doc):
+    """按名称/内容猜 SOP 类型（会议 / 服务 / 安全 / 操作）——只用于给研判定证据权重。"""
+    text = ((sop_doc.get("name") or "") + " " + (sop_doc.get("content") or ""))
+    if any(k in text for k in ("班前会", "班后会", "例会", "晨会", "会议", "开会", "传达")):
+        return "会议"
+    if any(k in text for k in ("安全", "消防", "应急", "演练", "点检")):
+        return "安全"
+    if any(k in text for k in ("操作", "设备", "清洁", "打扫", "收银", "开单", "登记")):
+        return "操作"
+    return "服务"
+
+
+def sop_steps_text(sop_doc):
+    """把 SOP 的 steps 摊平成给模型看的文本（不掺旧矩阵格式）。"""
+    steps = sop_doc.get("steps") or []
+    if not steps:
+        return (sop_doc.get("content") or "").strip() or "（SOP 内容为空）"
+    out = []
+    for i, st in enumerate(steps, 1):
+        name = st.get("name") or st.get("step") or ("第 %d 步" % i)
+        parts = ["### 第 %d 步 · %s" % (i, name)]
+        for k, label in (("action", "动作"), ("speech", "话术"), ("tool", "工具"),
+                         ("note", "注意事项"), ("duration", "完成时间")):
+            v = (st.get(k) or "").strip()
+            if v:
+                parts.append("- %s：%s" % (label, v))
+        out.append("\n".join(parts))
+    return "\n\n".join(out)
+
+
+def call_audio_analysis(key, audio_text, max_tokens=4000):
+    """录音分析（纪要 / 关键信息 / 表达问题）——文本模型，不涉及画面。"""
+    prompt = AUDIO_ANALYSIS_PROMPT + "\n\n【录音转写】\n" + (audio_text or "(无有效录音)")
+    return call_chat(key, prompt, max_tokens=min(max_tokens or 4000, 8000))
+
+
+def call_sop_judge(key, image_paths, audio_text, sop_doc, interval_sec=5,
+                   ref_images=None, ref_kind="selfie", max_tokens=100000):
+    """照片 × SOP 三层研判（L1/L2/L3）——视觉模型，带录音转写辅助话术判定。"""
+    # 超 600 张必须抽帧（平台硬上限）
+    if len(image_paths) > MAX_MERGED_FRAMES:
+        step = (len(image_paths) + MAX_MERGED_FRAMES - 1) // MAX_MERGED_FRAMES
+        sampled = image_paths[::step]
+        if sampled[-1] != image_paths[-1]:
+            sampled.append(image_paths[-1])
+        log("SOP 研判抽帧: %d → %d 帧（上限 %d）" % (len(image_paths), len(sampled), MAX_MERGED_FRAMES))
+        image_paths = sampled
+
+    content = []
+    # 主角参照照放最前（不是现场画面，只用于识别主角）
+    if ref_images:
+        for rp in ref_images:
+            try:
+                b64 = base64.b64encode(open(rp, "rb").read()).decode()
+                content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}})
+            except Exception:
+                pass
+    for ip in image_paths:
+        b64 = base64.b64encode(open(ip, "rb").read()).decode()
+        content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}})
+
+    prompt = fill_prompt(
+        SOP_JUDGE_PROMPT,
+        n=len(image_paths),
+        interval_sec=interval_sec,
+        sop_type=sop_category(sop_doc),
+        sop_block=sop_steps_text(sop_doc),
+    )
+    if ref_images:
+        prompt = ("【说明】最前面 %d 张是「主角参照照」（%s），只用于识别画面里的主角是谁，"
+                  "不是现场画面；其后 %d 张才是现场画面。\n\n" % (len(ref_images), ref_kind, len(image_paths))) + prompt
+    prompt += "\n\n【现场录音转写】\n" + (audio_text or "(无有效录音)")
+    content.append({"type": "text", "text": prompt})
+
+    payload = {
+        "model": DEEPSEEK_FLASH,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": int(max_tokens or 100000),
+        "temperature": 0.2,
+    }
+    log("调用 %s 做 SOP 三层研判：%d 张图 / SOP 类型=%s ..." % (DEEPSEEK_FLASH, len(image_paths), sop_category(sop_doc)))
+    j = http_json_post(DEEPSEEK_URL, key, payload, timeout=MERGED_TIMEOUT)
+    msg = j["choices"][0]["message"]
+    text = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
+    body = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
+    try:
+        d = json.loads(body)
+        out = (d.get("sop_compare") or "").strip()
+        if out:
+            return out
+    except Exception as e:
+        log("SOP 研判 JSON 解析失败(%s)，原文直接返回" % e)
+    return text
+
+
 def main():
     if len(sys.argv) < 2:
         log("缺少 batch 目录参数")
@@ -946,82 +1106,122 @@ def main():
         log("缺少 DEEPSEEK_API_KEY")
         sys.exit(1)
 
-    if merged_prompt:
-        # ★★ 合并模式（2026-09-14 起）：deepseek-flash 一次调用出「画面时序 + 录音转写 + SOP 比对」
-        try:
-            r = call_merged(chat_key, imgs, audio_text, sop_doc, interval_sec, ref_images=ref_images, ref_kind=ref_kind)
-            vision = r["image_analysis"]
-            summary = r["summary"]
-            sop_compare = r["sop_compare"]
-            log(f"合并分析完成：画面 {len(vision)} 字 / 录音分析 {len(summary)} 字 / SOP 比对 {len(sop_compare)} 字")
-        except Exception as e:
-            log(f"合并分析失败: {e}")
-            vision = f"合并分析失败: {e}"
-            summary = ""
-            sop_compare = ""
-    else:
-        # ===== 老流程（3 次调用：qwen 画面 + deepseek 综合 + deepseek SOP）=====
-        # 保留此路径作为回滚：把 S2 cam-config.json 的 mergedPrompt 清空即回到这里
-        vision_key = ""
-        if not no_image:
-            vision_key = load_key("DASHSCOPE_API_KEY")
-            if not vision_key:
-                log("缺少 DASHSCOPE_API_KEY")
-                sys.exit(1)
-
-        # 2. 图片视觉时序分析（Qwen-VL-Plus）；audio 模式无图跳过
-        if no_image:
-            vision = ""                                  # image_analysis 字段置空（无图片）
-            vision_prompt_text = "（本次未采集画面）"      # 综合/SOP prompt 里 {vision} 占位
+    if os.environ.get("SOP_V2", "1") != "0":
+        # ★★ SOP v2：有 SOP 才看画面；无 SOP 只分析录音
+        summary = ""
+        vision = ""
+        sop_compare = ""
+        if sop_id and sop_doc and not no_image:
+            from concurrent.futures import ThreadPoolExecutor
+            def _audio_job():
+                return call_audio_analysis(chat_key, audio_text, max_tokens)
+            def _sop_job():
+                return call_sop_judge(chat_key, imgs, audio_text, sop_doc, interval_sec,
+                                      ref_images=ref_images, ref_kind=ref_kind, max_tokens=max_tokens)
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fa, fs = ex.submit(_audio_job), ex.submit(_sop_job)
+                try:
+                    summary = fa.result()
+                except Exception as e:
+                    log("录音分析失败: %s" % e)
+                    summary = "录音分析失败: %s" % e
+                try:
+                    sop_compare = fs.result()
+                except Exception as e:
+                    log("SOP 研判失败: %s" % e)
+                    sop_compare = "SOP 研判失败: %s" % e
+            log("v2 完成：录音分析 %d 字 / SOP 研判 %d 字（画面时序不再单独输出）"
+                % (len(summary), len(sop_compare)))
         else:
             try:
-                vision = call_vision(vision_key, imgs, interval_sec, ref_images=ref_images, ref_kind=ref_kind)
+                summary = call_audio_analysis(chat_key, audio_text, max_tokens)
             except Exception as e:
-                log(f"视觉分析失败: {e}")
-                vision = f"视觉分析失败: {e}"
-            vision_prompt_text = vision
-            log(f"视觉分析结果:\n{vision}")
-
-        # 4. 综合分析（DeepSeek）
-        try:
-            summary = call_chat(chat_key, summary_prompt.format(
-                vision=vision_prompt_text,
-                audio=audio_text or "(无有效录音内容)",
-            ), max_tokens=max_tokens)
-        except Exception as e:
-            log(f"综合分析失败: {e}")
-            # 降级：有视觉结论用视觉，无视觉（audio 模式）用录音文字兜底
-            summary = vision if vision else (audio_text or "（无有效内容）")
-        log(f"综合分析:\n{summary}")
-
-        # 4b. SOP 标准比对（33号：选了 SOP 后，用 deepseek 比对画面+话术是否符合 SOP 标准）
-        sop_compare = ""
-        if sop_id:
-            if sop_doc:
-                try:
-                    # ★ 2026-10-08：配了 sopCompareStepsPrompt（只含人格/框架）时，
-                    #   把「标准 + 输出格式」整块塞进 {sop_content} —— 格式只在代码里维护一份 ✓
-                    #   没配 ⇒ 老行为（原文-content 进 {sop_content}），零窗口回退 ✓
-                    if sop_compare_steps_prompt:
-                        tpl = sop_compare_steps_prompt
-                        sop_content_val = sop_content_with_spec(sop_doc)
-                    else:
-                        tpl = sop_compare_prompt
-                        sop_content_val = sop_doc.get("content") or ""
-                    sop_compare = call_chat(chat_key, tpl.format(
-                        sop_name=sop_doc.get("name") or sop_id,
-                        sop_content=sop_content_val,
-                        vision=vision_prompt_text,
-                        audio=audio_text or "(无有效录音内容)",
-                    ), max_tokens=max_tokens)
-                    log(f"SOP 比对:\n{sop_compare}")
-                except Exception as e:
-                    log(f"SOP 比对失败: {e}")
-                    sop_compare = f"SOP 比对失败: {e}"
+                log("录音分析失败: %s" % e)
+                summary = "录音分析失败: %s" % e
+            if sop_id and sop_doc and no_image:
+                sop_compare = "本次未采集画面（audio 模式），无法按画面做 SOP 研判。"
+            elif sop_id and not sop_doc:
+                sop_compare = "(未找到 SOP，sop_id=%s)" % sop_id
             else:
-                sop_compare = f"(未找到 SOP，sop_id={sop_id})"
+                sop_compare = "本次未选择 SOP 流程，未做标准比对。"
+            log("v2 完成（无画面 / 无 SOP）：录音分析 %d 字" % len(summary))
+    else:
+        if merged_prompt:
+            # ★★ 合并模式（2026-09-14 起）：deepseek-flash 一次调用出「画面时序 + 录音转写 + SOP 比对」
+            try:
+                r = call_merged(chat_key, imgs, audio_text, sop_doc, interval_sec, ref_images=ref_images, ref_kind=ref_kind)
+                vision = r["image_analysis"]
+                summary = r["summary"]
+                sop_compare = r["sop_compare"]
+                log(f"合并分析完成：画面 {len(vision)} 字 / 录音分析 {len(summary)} 字 / SOP 比对 {len(sop_compare)} 字")
+            except Exception as e:
+                log(f"合并分析失败: {e}")
+                vision = f"合并分析失败: {e}"
+                summary = ""
+                sop_compare = ""
         else:
-            log("本次无 SOP（未选流程标准），不做比对")
+            # ===== 老流程（3 次调用：qwen 画面 + deepseek 综合 + deepseek SOP）=====
+            # 保留此路径作为回滚：把 S2 cam-config.json 的 mergedPrompt 清空即回到这里
+            vision_key = ""
+            if not no_image:
+                vision_key = load_key("DASHSCOPE_API_KEY")
+                if not vision_key:
+                    log("缺少 DASHSCOPE_API_KEY")
+                    sys.exit(1)
+
+            # 2. 图片视觉时序分析（Qwen-VL-Plus）；audio 模式无图跳过
+            if no_image:
+                vision = ""                                  # image_analysis 字段置空（无图片）
+                vision_prompt_text = "（本次未采集画面）"      # 综合/SOP prompt 里 {vision} 占位
+            else:
+                try:
+                    vision = call_vision(vision_key, imgs, interval_sec, ref_images=ref_images, ref_kind=ref_kind)
+                except Exception as e:
+                    log(f"视觉分析失败: {e}")
+                    vision = f"视觉分析失败: {e}"
+                vision_prompt_text = vision
+                log(f"视觉分析结果:\n{vision}")
+
+            # 4. 综合分析（DeepSeek）
+            try:
+                summary = call_chat(chat_key, summary_prompt.format(
+                    vision=vision_prompt_text,
+                    audio=audio_text or "(无有效录音内容)",
+                ), max_tokens=max_tokens)
+            except Exception as e:
+                log(f"综合分析失败: {e}")
+                # 降级：有视觉结论用视觉，无视觉（audio 模式）用录音文字兜底
+                summary = vision if vision else (audio_text or "（无有效内容）")
+            log(f"综合分析:\n{summary}")
+
+            # 4b. SOP 标准比对（33号：选了 SOP 后，用 deepseek 比对画面+话术是否符合 SOP 标准）
+            sop_compare = ""
+            if sop_id:
+                if sop_doc:
+                    try:
+                        # ★ 2026-10-08：配了 sopCompareStepsPrompt（只含人格/框架）时，
+                        #   把「标准 + 输出格式」整块塞进 {sop_content} —— 格式只在代码里维护一份 ✓
+                        #   没配 ⇒ 老行为（原文-content 进 {sop_content}），零窗口回退 ✓
+                        if sop_compare_steps_prompt:
+                            tpl = sop_compare_steps_prompt
+                            sop_content_val = sop_content_with_spec(sop_doc)
+                        else:
+                            tpl = sop_compare_prompt
+                            sop_content_val = sop_doc.get("content") or ""
+                        sop_compare = call_chat(chat_key, tpl.format(
+                            sop_name=sop_doc.get("name") or sop_id,
+                            sop_content=sop_content_val,
+                            vision=vision_prompt_text,
+                            audio=audio_text or "(无有效录音内容)",
+                        ), max_tokens=max_tokens)
+                        log(f"SOP 比对:\n{sop_compare}")
+                    except Exception as e:
+                        log(f"SOP 比对失败: {e}")
+                        sop_compare = f"SOP 比对失败: {e}"
+                else:
+                    sop_compare = f"(未找到 SOP，sop_id={sop_id})"
+            else:
+                log("本次无 SOP（未选流程标准），不做比对")
 
     # 5. 组装完整 record（含设备码、帧数、状态、绑定快照）
     binding = get_binding(device_id)   # 查 S2 当前绑定快照
