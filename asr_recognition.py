@@ -360,7 +360,7 @@ def recognize_audio(audio_path):
     try:
         key = load_key("DASHSCOPE_API_KEY")
         # ★ 优先：说话人分离（可用 ASR_DIARIZE=0 关掉回退旧引擎）
-        if key and os.environ.get("ASR_DIARIZE", "1") != "0":
+        if key and os.environ.get("ASR_DIARIZE", "0") == "1":
             try:
                 d = call_paraformer_diarized(audio_path, key)
                 if d.get("text"):
