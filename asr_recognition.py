@@ -235,6 +235,91 @@ def call_paraformer(wav_path):
     return ""
 
 
+# ============ 引擎3：paraformer 录音文件识别 + 说话人分离（CR-20261127-02）============
+#   ★ 为什么要走 OSS：DashScope 文件识别只吃公网 URL；S1 本地音频要先传上去
+#   ★ 只拿到"说话人 A/B"（不是姓名）；角色由后续提示词按语境推断（主持人/参会人/客人）
+DASHSCOPE_TASK_URL = "https://dashscope.aliyuncs.com/api/v1/tasks/"
+DASHSCOPE_ASR_URL = "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription"
+CAM_S2_BASE = os.environ.get("CAM_S2_BASE", "https://ai.hiiin.com")
+
+
+def _presign_and_upload(wav_path):
+    """向 S2 要预签名 URL → 直接 PUT 到 OSS → 返回 get_url（供 DashScope 拉取）。"""
+    tok = os.environ.get("CAM_INGEST_TOKEN", "")
+    batch = os.path.basename(os.path.dirname(wav_path)) or "audio"
+    r = requests.post(CAM_S2_BASE + "/api/cam/asr-presign",
+                      headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"},
+                      json={"batch": batch}, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError("presign HTTP %d: %s" % (r.status_code, r.text[:200]))
+    j = r.json()
+    if not j.get("ok"):
+        raise RuntimeError("presign 失败: " + str(j.get("error")))
+    data = open(wav_path, "rb").read()
+    pr = requests.put(j["put_url"], data=data, timeout=300)
+    if pr.status_code not in (200, 201):
+        raise RuntimeError("OSS PUT HTTP %d: %s" % (pr.status_code, pr.text[:200]))
+    log("音频已上传 OSS: %s（%.1f MB）" % (j.get("key"), len(data) / 1048576.0))
+    return j["get_url"]
+
+
+def call_paraformer_diarized(wav_path, key):
+    """paraformer-v2 文件识别 + diarization；返回 {text, engine, segments, annotations, diarized}。
+    text 里每句带 [说话人X 分:秒] 前缀，供后续"谁说的"分析。"""
+    get_url = _presign_and_upload(wav_path)
+    body = {
+        "model": "paraformer-v2",
+        "input": {"file_urls": [get_url]},
+        "parameters": {"language_hints": ["zh"], "diarization_enabled": True},
+    }
+    r = requests.post(DASHSCOPE_ASR_URL,
+                      headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
+                               "X-DashScope-Async": "enable"},
+                      json=body, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError("提交识别任务 HTTP %d: %s" % (r.status_code, r.text[:300]))
+    task_id = (r.json().get("output") or {}).get("task_id")
+    if not task_id:
+        raise RuntimeError("没有拿到 task_id: " + r.text[:300])
+    log("说话人分离任务已提交: %s（等待结果…）" % task_id)
+
+    deadline = time.time() + 420
+    while time.time() < deadline:
+        time.sleep(5)
+        tr = requests.get(DASHSCOPE_TASK_URL + task_id,
+                          headers={"Authorization": "Bearer " + key}, timeout=30)
+        tj = tr.json()
+        st = ((tj.get("output") or {}).get("task_status") or "").upper()
+        if st in ("SUCCEEDED", "SUCCESS"):
+            results = (tj.get("output") or {}).get("results") or []
+            if not results:
+                raise RuntimeError("任务成功但没有 results")
+            turl = results[0].get("transcription_url")
+            if not turl:
+                raise RuntimeError("没有 transcription_url: " + json.dumps(tj, ensure_ascii=False)[:300])
+            tj2 = requests.get(turl, timeout=120).json()
+            sents = []
+            for t in (tj2.get("transcripts") or []):
+                sents.extend(t.get("sentences") or [])
+            lines, anns = [], []
+            for s in sents:
+                txt = (s.get("text") or "").strip()
+                if not txt:
+                    continue
+                spk = s.get("speaker_id")
+                label = ("说话人" + str(spk)) if spk is not None else "说话人?"
+                ms = s.get("begin_time") or 0
+                sec = int(ms / 1000) if ms > 1000 else int(ms)
+                lines.append("[%s %d:%02d] %s" % (label, sec // 60, sec % 60, txt))
+            text = "\n".join(lines).strip()
+            log("说话人分离完成：%d 句 / %d 字" % (len(sents), len(text)))
+            return {"text": text, "engine": "paraformer-v2-diarized", "segments": len(sents),
+                    "annotations": anns, "diarized": True}
+        if st in ("FAILED", "FAILURE", "CANCELED"):
+            raise RuntimeError("识别任务失败: " + json.dumps(tj, ensure_ascii=False)[:400])
+    raise RuntimeError("识别任务超时（>420s）")
+
+
 # ============ 主流程 ============
 def recognize_audio(audio_path):
     """返回 dict: {text, engine, segments, annotations}"""
@@ -242,6 +327,15 @@ def recognize_audio(audio_path):
     tmpdir = tempfile.mkdtemp(prefix="asr_")
     try:
         key = load_key("DASHSCOPE_API_KEY")
+        # ★ 优先：说话人分离（可用 ASR_DIARIZE=0 关掉回退旧引擎）
+        if key and os.environ.get("ASR_DIARIZE", "1") != "0":
+            try:
+                d = call_paraformer_diarized(audio_path, key)
+                if d.get("text"):
+                    return d
+                log("说话人分离结果为空，回退旧引擎")
+            except Exception as e:
+                log("说话人分离失败（回退旧引擎）: %s" % e)
         if ASR_ENGINE == "qwen3" and not key:
             log("缺少 DASHSCOPE_API_KEY，回退 paraformer")
             engine = "paraformer"
