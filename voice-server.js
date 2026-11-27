@@ -5600,6 +5600,9 @@ const CHAT_CTX_TTL_MS = 12 * 60 * 60 * 1000;   // 12 小时没有新请求 ⇒ �
     try {
       t = t.replace(/萧山[\u4e00-\u9fa5A-Za-z0-9]{1,8}(?:会|汇)/g, store);
       t = t.replace(/(?:胤隆|艺龙|印龙|银龙|应龙|亿龙|倚龙)(?:会|汇)/g, store);
+      // ★ 替换后可能变成「萧山萧山胤隆会」⇒ 折叠重复
+      t = t.replace(/萧山(?=萧山)/g, '');
+      t = t.split(store + store).join(store);
     } catch (e) {}
     return t;
   }
