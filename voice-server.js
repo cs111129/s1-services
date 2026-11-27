@@ -2027,7 +2027,28 @@ function whoBlock(who) {
     '· 说他的职责/考勤时，也只说**他的**（查询工具已按他本人过滤 ✓）',
   ].join('\n');
 }function personaKeyOf(dev) { return isTrainerDevice(dev) ? '02' : '03'; }
-function personaHeaderOf(dev) { return (personaKeyOf(dev) === '02' ? PERSONA_02_HEAD : PERSONA_03_HEAD).join('\n'); }
+function storeOfDevice(dev) {
+  try {
+    const b = camBindInfo[String(dev || '').trim().toUpperCase()];
+    return (b && b.store) ? String(b.store).trim() : '';
+  } catch (e) { return ''; }
+}
+function personaHeaderOf(dev) {
+  const is02 = (personaKeyOf(dev) === '02');
+  const head = (is02 ? PERSONA_02_HEAD : PERSONA_03_HEAD).slice();
+  if (is02) {
+    const store = storeOfDevice(dev);
+    if (store) {
+      head.splice(1, 0, '',
+        `【你服务的门店】「${store}」—— 你是 **${store} 的随身教练**，不是泛泛的"门店教练"。`,
+        `★ 自我介绍时必须**明确报出店名**，例如：「我是${store}的随身教练小星，本店的 SOP、制度、应知应会都能帮你查。」（每次说法可以不同，但店名必须说 ✓）`,
+        `★ 你查的知识库就是 **${store} 专属知识库**（含集团通用标准）；问到别家店的事，如实说「我只管${store}的」。`);
+    } else {
+      head.splice(1, 0, '', '【你服务的门店】这台设备还没绑定学员/门店 ⇒ 不要编店名；被问就说不清楚，提醒先绑定。');
+    }
+  }
+  return head.join('\n');
+}
 function personaCapsOf(dev) { return (personaKeyOf(dev) === '02' ? PERSONA_02_CAPS : PERSONA_03_CAPS); }
 /** 完整 system prompt（★ 人设头 + 能力 + 共用的格式/红线/文化） */
 function voiceChatSystemOf(dev) {
@@ -4881,6 +4902,22 @@ function validateSetConfig(o) {
     return;
   }
 
+  // GET /api/cam/persona-preview?device_id= — 调试：看该设备"小星"的完整 system prompt（需 ingest token）
+  //   ★ 用途：人设按门店注入后，验收"Prompt 里到底有没有店名"，不必真机问一遍
+  if (req.method === 'GET' && req.url.startsWith('/api/cam/persona-preview')) {
+    const auth = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+    if (!CAM_INGEST_TOKEN || auth !== CAM_INGEST_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+      return;
+    }
+    const dev = (String(req.url).split('?')[1] || '').split('&').map(function (kv) { return kv.split('='); })
+      .reduce(function (o, kv) { if (kv[0]) o[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || ''); return o; }, {}).device_id || '';
+    const d = String(dev).trim().toUpperCase();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ device: d, store: storeOfDevice(d), persona: voiceChatSystemOf(d) }));
+    return;
+  }
   // GET /api/cam/device/list - 设备列表 + 在线状态（前端管理后台用，A 验证期在 S1 直接提供）
   if (req.method === 'GET' && req.url === '/api/cam/device/list') {
     const devices = Object.entries(camDeviceState).map(([id, st]) => {
