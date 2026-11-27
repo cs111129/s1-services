@@ -344,6 +344,7 @@ def call_paraformer_diarized(wav_path, key):
                 shutil.rmtree(tmpdir2, ignore_errors=True)
             text = "\n".join(lines).strip()
             log("说话人分离+重识别完成：%d 段 / %d 字" % (len(lines), len(text)))
+            anns = []
             return {"text": text, "engine": "paraformer-v2-diarized+qwen3", "segments": len(lines),
                     "annotations": anns, "diarized": True}
         if st in ("FAILED", "FAILURE", "CANCELED"):
