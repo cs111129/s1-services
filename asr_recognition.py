@@ -302,19 +302,49 @@ def call_paraformer_diarized(wav_path, key):
             sents = []
             for t in (tj2.get("transcripts") or []):
                 sents.extend(t.get("sentences") or [])
-            lines, anns = [], []
+            # ★★ 混合方案（2026-11-27 实测）：paraformer-v2 负责**分段/说话人**，
+            #   每段文字再用 qwen3-asr-flash 重识别 —— paraformer 在远场/方言下错字太多，
+            #   而 qwen3 文字准但不给说话人 ⇒ 两者各取所长。
+            turns = []
             for s in sents:
                 txt = (s.get("text") or "").strip()
                 if not txt:
                     continue
                 spk = s.get("speaker_id")
-                label = ("说话人" + str(spk)) if spk is not None else "说话人?"
-                ms = s.get("begin_time") or 0
-                sec = int(ms / 1000) if ms > 1000 else int(ms)
-                lines.append("[%s %d:%02d] %s" % (label, sec // 60, sec % 60, txt))
+                b = int(s.get("begin_time") or 0)
+                e = int(s.get("end_time") or 0)
+                if turns and turns[-1]["spk"] == spk and b - turns[-1]["end"] <= 800:
+                    turns[-1]["end"] = e
+                    turns[-1]["raw"] += txt
+                else:
+                    turns.append({"spk": spk, "begin": b, "end": e, "raw": txt})
+            log("说话人分离：%d 句 → 合并成 %d 段，逐段用 qwen3 重识别…" % (len(sents), len(turns)))
+
+            tmpdir2 = tempfile.mkdtemp(prefix="diar_")
+            lines = []
+            try:
+                for i, t in enumerate(turns):
+                    segp = os.path.join(tmpdir2, "t%02d.wav" % i)
+                    ok = extract_segment(wav_path,
+                                         max(0, t["begin"] / 1000.0),
+                                         min(int(probe_duration(wav_path) or 0), t["end"] / 1000.0),
+                                         segp)
+                    txt = ""
+                    if ok:
+                        try:
+                            txt = (call_qwen3(segp, key)[0] or "").strip()
+                        except Exception as e:
+                            log("  第%d段 qwen3 失败: %s" % (i + 1, e))
+                    if not txt:
+                        txt = t["raw"]          # 兜底：用 paraformer 原文
+                    label = ("说话人" + str(t["spk"])) if t["spk"] is not None else "说话人?"
+                    sec = int(t["begin"] / 1000)
+                    lines.append("[%s %d:%02d] %s" % (label, sec // 60, sec % 60, txt))
+            finally:
+                shutil.rmtree(tmpdir2, ignore_errors=True)
             text = "\n".join(lines).strip()
-            log("说话人分离完成：%d 句 / %d 字" % (len(sents), len(text)))
-            return {"text": text, "engine": "paraformer-v2-diarized", "segments": len(sents),
+            log("说话人分离+重识别完成：%d 段 / %d 字" % (len(lines), len(text)))
+            return {"text": text, "engine": "paraformer-v2-diarized+qwen3", "segments": len(lines),
                     "annotations": anns, "diarized": True}
         if st in ("FAILED", "FAILURE", "CANCELED"):
             raise RuntimeError("识别任务失败: " + json.dumps(tj, ensure_ascii=False)[:400])
