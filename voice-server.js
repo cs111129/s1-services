@@ -4501,6 +4501,36 @@ const server = http.createServer(async (req, res) => {
         //      「有 ack = 设备收到了但没出图」vs「无 ack = 设备压根没收到」
         //   ⚠️ 同一套合并写入（不带该字段的包不冲旧值）
         // ★ CR-20261127-01 ACK B：设备上报 wifi_try=ok / fail_rolled_back
+        // ★ CR-20261127-02：WiFi 相关状态（全部只存不加工；密码类字段永远不存在）
+        try {
+          if (o.wifi_current !== undefined && o.wifi_current !== null) {
+            camDeviceState[dev] = camDeviceState[dev] || {};
+            camDeviceState[dev].wifi_current = String(o.wifi_current).slice(0, 64);
+          }
+          if (Array.isArray(o.wifi_saved)) {
+            camDeviceState[dev] = camDeviceState[dev] || {};
+            camDeviceState[dev].wifi_saved = o.wifi_saved.slice(0, 8).map(function (x) {
+              return { ssid: String((x && x.ssid) || '').slice(0, 64) };
+            }).filter(function (x) { return x.ssid; });
+          }
+          if (Array.isArray(o.wifi_scan)) {
+            camDeviceState[dev] = camDeviceState[dev] || {};
+            camDeviceState[dev].wifi_scan = o.wifi_scan.slice(0, 20).map(function (x) {
+              return { ssid: String((x && x.ssid) || '').slice(0, 64),
+                       rssi: parseInt(x && x.rssi, 10) || 0,
+                       auth: parseInt(x && x.auth, 10) || 0 };
+            }).filter(function (x) { return x.ssid; });
+            camDeviceState[dev].wifi_scan_at = parseInt(o.wifi_scan_at, 10) || 0;
+          }
+          if (o.wifi_scan_err !== undefined && o.wifi_scan_err !== null) {
+            camDeviceState[dev] = camDeviceState[dev] || {};
+            camDeviceState[dev].wifi_scan_err = String(o.wifi_scan_err).slice(0, 32) || '';
+          }
+          if (o.wifi_saved_err !== undefined && o.wifi_saved_err !== null) {
+            camDeviceState[dev] = camDeviceState[dev] || {};
+            camDeviceState[dev].wifi_saved_err = String(o.wifi_saved_err).slice(0, 32) || '';
+          }
+        } catch (e) { log('⚠️ WiFi 状态解析失败: ' + e.message); }
         if (o.wifi_try !== undefined && o.wifi_try !== null && String(o.wifi_try).trim() !== '') {
           camDeviceState[dev] = camDeviceState[dev] || {};
           camDeviceState[dev].wifi_try = String(o.wifi_try).trim();
@@ -4872,6 +4902,29 @@ function validateSetConfig(o) {
           return;
         }
 
+        // ★★ CR-20261127-02：设备扫 WiFi（3~5s，扫完自动重连；只在待机执行）
+        if (action === 'scan_wifi') {
+          camCmdQueue[dev] = { cmd: 'scan_wifi', ts: Date.now() };
+          log(`cam 扫描 WiFi 入队 -> ${dev}`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, cmd: 'scan_wifi' }));
+          return;
+        }
+        // ★★ CR-20261127-02：切到设备已保存的第 N 组（免密，复用 30s 回滚）
+        if (action === 'set_wifi_saved') {
+          const idx = parseInt(o.index, 10);
+          if (!(idx >= 0 && idx <= 4)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'index 必须是 0~4' }));
+            return;
+          }
+          camCmdQueue[dev] = { cmd: 'set_wifi_saved', ts: Date.now(), index: idx };
+          log(`cam 切已保存 WiFi 入队 -> ${dev} index=${idx}`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, cmd: 'set_wifi_saved', index: idx }));
+          return;
+        }
+
         // ★ CR-20260921-02：远程抓拍一张（录制前预览确认用）
         //   设备端收到后：拍 1 张 → 单独上传（batch = <dev>_shot_<时间戳>）
         //   → **上传成功后立即上报一次 status**（带 last_shot_batch）⇒ 前端才知道图好了
@@ -5019,6 +5072,12 @@ function validateSetConfig(o) {
         bound_store: (camBindInfo[id] && camBindInfo[id].store) ? camBindInfo[id].store : null,
         wifi_try: (camDeviceState[id] && camDeviceState[id].wifi_try) ? camDeviceState[id].wifi_try : null,
         wifi_try_at: (camDeviceState[id] && camDeviceState[id].wifi_try_at) ? camDeviceState[id].wifi_try_at : null,
+        wifi_current: (camDeviceState[id] && camDeviceState[id].wifi_current !== undefined) ? camDeviceState[id].wifi_current : null,
+        wifi_saved: (camDeviceState[id] && camDeviceState[id].wifi_saved) ? camDeviceState[id].wifi_saved : null,
+        wifi_scan: (camDeviceState[id] && camDeviceState[id].wifi_scan) ? camDeviceState[id].wifi_scan : null,
+        wifi_scan_at: (camDeviceState[id] && camDeviceState[id].wifi_scan_at) ? camDeviceState[id].wifi_scan_at : null,
+        wifi_scan_err: (camDeviceState[id] && camDeviceState[id].wifi_scan_err !== undefined) ? camDeviceState[id].wifi_scan_err : null,
+        wifi_saved_err: (camDeviceState[id] && camDeviceState[id].wifi_saved_err !== undefined) ? camDeviceState[id].wifi_saved_err : null,
         bind_known: camBindInfo[id] !== undefined
       };
     });
