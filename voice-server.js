@@ -4419,6 +4419,15 @@ const server = http.createServer(async (req, res) => {
       }
       // ★ CR-20260921-02：take_photo 要把 shot_id 带给设备（设备可据此命名 batch）
       if (pending.cmd === 'take_photo' && pending.shot_id) cfgExtra.shot_id = pending.shot_id;
+      // ★★ CR-20261127-02 修：set_wifi / set_wifi_saved 的参数必须带出去 ✗✗
+      //   原来 GET /api/cam/cmd 只透传 cmd + set_config/take_photo 的字段 ⇒
+      //   设备收到 {"cmd":"set_wifi"}（**没有 ssid/pass**）⇒ 按协议"空 ssid = 命令无效"直接忽略 ✗
+      //   实测症状：scan_wifi 正常（无参数），但 set_wifi / set_wifi_saved 完全不动、wifi_try 一直空。
+      if (pending.cmd === 'set_wifi') {
+        if (pending.ssid !== undefined) cfgExtra.ssid = pending.ssid;
+        if (pending.pass !== undefined) cfgExtra.pass = pending.pass;
+      }
+      if (pending.cmd === 'set_wifi_saved' && pending.index !== undefined) cfgExtra.index = pending.index;
       delete camCmdQueue[dev];
       log(`cam 下发指令 ${cmd} -> ${dev}${Object.keys(cfgExtra).length ? ' ' + JSON.stringify(cfgExtra) : ''}`);
     }
