@@ -28,6 +28,7 @@ asr_recognition.py — 语音转文字（实操考核用）
 """
 import sys
 import os
+import time
 import json
 import base64
 import math
