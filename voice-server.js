@@ -4510,6 +4510,14 @@ const server = http.createServer(async (req, res) => {
         //      「有 ack = 设备收到了但没出图」vs「无 ack = 设备压根没收到」
         //   ⚠️ 同一套合并写入（不带该字段的包不冲旧值）
         // ★ CR-20261127-01 ACK B：设备上报 wifi_try=ok / fail_rolled_back
+        // ★ 临时诊断（2026-11-27）：看设备到底有没有发 wifi_scan / wifi_try、类型对不对
+        if (o.wifi_scan !== undefined || o.wifi_try !== undefined || o.wifi_scan_err !== undefined) {
+          log('cam status wifi 原始: scan_type=' + (Array.isArray(o.wifi_scan) ? 'array' : typeof o.wifi_scan)
+            + ' scan_len=' + (Array.isArray(o.wifi_scan) ? o.wifi_scan.length : '-')
+            + ' scan_at=' + JSON.stringify(o.wifi_scan_at)
+            + ' try=' + JSON.stringify(o.wifi_try)
+            + ' scan_err=' + JSON.stringify(o.wifi_scan_err));
+        }
         // ★ CR-20261127-02：WiFi 相关状态（全部只存不加工；密码类字段永远不存在）
         try {
           if (o.wifi_current !== undefined && o.wifi_current !== null) {
